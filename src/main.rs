@@ -1,5 +1,6 @@
 mod crate_downloader;
 mod crate_specifier;
+mod logging;
 mod request;
 mod response;
 
@@ -14,7 +15,6 @@ use response::CrateResponse;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tracing::{info, error, debug};
-use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 use crate::crate_downloader::CrateDownloader;
 
@@ -92,14 +92,9 @@ async fn shutdown_signal() {
 
 #[tokio::main]
 async fn main() {
-    // Initialize tracing
-    tracing_subscriber::registry()
-        .with(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "crately=debug,tower_http=off,axum=off".into()),
-        )
-        .with(tracing_subscriber::fmt::layer())
-        .init();
+    // Initialize XDG-compliant file logging
+    let _guard = logging::init().expect("Failed to initialize logging");
+    info!("Logging initialized successfully");
 
     // Launch the acton-reactive runtime
     info!("Launching acton-reactive runtime");
