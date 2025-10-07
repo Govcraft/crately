@@ -2,6 +2,7 @@
 name = "crately"
 version = "0.1.0"
 edition = "2024"
+authors = ["Govcraft <roland@govcraft.ai>"]
 
 [dependencies]
 acton-reactive = "5.0.0"

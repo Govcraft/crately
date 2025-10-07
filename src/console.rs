@@ -34,9 +34,9 @@ pub fn print_banner(version: &str) {
     eprintln!();
     eprintln!("╔═══════════════════════════════════════════════════════════╗");
     eprintln!("║                        CRATELY                            ║");
-    eprintln!("║          Crate Documentation & Search Service            ║");
+    eprintln!("║          Crate Documentation & Search Service             ║");
     eprintln!(
-        "║                     Version {}                        ║",
+        "║                     Version {}                         ║",
         version
     );
     eprintln!("╚═══════════════════════════════════════════════════════════╝");
