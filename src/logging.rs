@@ -82,22 +82,17 @@ fn ensure_log_directory_exists(log_dir: &PathBuf) -> Result<(), LoggingError> {
     Ok(())
 }
 
-/// Initializes the tracing subscriber with dual-stream logging (console + file)
+/// Initializes the tracing subscriber with file-only logging
 ///
-/// This function sets up two logging layers:
-/// - Console layer: INFO-level messages to stdout with ANSI colors
-/// - File layer: DEBUG-level messages to XDG-compliant log files with daily rotation
+/// This function sets up file-based logging for all tracing macros (info!, debug!, error!, etc.).
+/// Console output is handled separately by the console module using eprintln!.
 ///
-/// File logging:
-/// - Writes logs to `$XDG_DATA_HOME/crately/logs/`
+/// File logging configuration:
+/// - Writes logs to `$XDG_DATA_HOME/crately/logs/` (typically ~/.local/share/crately/logs/)
 /// - Rotates log files daily
 /// - Uses the filename prefix "crately"
-/// - Filter: "crately=debug,tower_http=off,axum=off"
-///
-/// Console logging:
-/// - Writes INFO and above to stdout
-/// - Filter: "crately=info"
-/// - Compact formatting with ANSI colors
+/// - Filter: "crately=debug,tower_http=off,axum=off" (overridable with RUST_LOG env var)
+/// - Non-blocking appender to prevent I/O blocking
 ///
 /// The function returns a `WorkerGuard` that must be kept alive for the duration
 /// of the application. When the guard is dropped, the logging worker thread will
@@ -135,20 +130,10 @@ pub fn init() -> Result<(WorkerGuard, PathBuf), LoggingError> {
     // Wrap in non-blocking appender to prevent blocking the application on log writes
     let (non_blocking_appender, guard) = tracing_appender::non_blocking(file_appender);
 
-    // Configure console filter: INFO and above for crately crate only
-    let console_filter = EnvFilter::new("crately=info");
-
     // Configure file filter: DEBUG and above, with framework noise filtered out
     // Can be overridden with RUST_LOG environment variable
     let file_filter = EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| "crately=debug,tower_http=off,axum=off".into());
-
-    // Create console layer: INFO+ to stdout with colors
-    let console_layer = tracing_subscriber::fmt::layer()
-        .with_writer(std::io::stdout)
-        .with_ansi(true)
-        .compact()
-        .with_filter(console_filter);
 
     // Create file layer: DEBUG+ to rotating files without colors
     let file_layer = tracing_subscriber::fmt::layer()
@@ -156,9 +141,9 @@ pub fn init() -> Result<(WorkerGuard, PathBuf), LoggingError> {
         .with_ansi(false)
         .with_filter(file_filter);
 
-    // Initialize the tracing subscriber with both layers
+    // Initialize the tracing subscriber with file layer only
+    // Console output is handled by the console module using eprintln!
     tracing_subscriber::registry()
-        .with(console_layer)
         .with(file_layer)
         .try_init()
         .map_err(|e| LoggingError::SubscriberInit(e.to_string()))?;
