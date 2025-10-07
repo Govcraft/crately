@@ -7,6 +7,7 @@ edition = "2024"
 acton-reactive = "5.0.0"
 axum = { version = "0.8.6", features = ["tokio", "tracing", "tower-log", "macros", "json", "http2"] }
 cargo-util-schemas = "0.7"
+chrono = "0.4"
 mti = { version = "1.0.0", features = ["serde", "instrument"] }
 semver = { version = "1.0", features = ["serde"] }
 serde = { version = "1.0", features = ["derive"] }

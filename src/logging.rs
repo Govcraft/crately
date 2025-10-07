@@ -7,7 +7,7 @@
 use std::fs;
 use std::path::PathBuf;
 use tracing_appender::non_blocking::WorkerGuard;
-use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
+use tracing_subscriber::{EnvFilter, Layer, layer::SubscriberExt, util::SubscriberInitExt};
 use xdg::BaseDirectories;
 
 /// Error types that can occur during logging initialization
@@ -25,7 +25,10 @@ impl std::fmt::Display for LoggingError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::HomeDirectoryNotFound => {
-                write!(f, "HOME directory not found - cannot determine XDG data directory")
+                write!(
+                    f,
+                    "HOME directory not found - cannot determine XDG data directory"
+                )
             }
             Self::DirectoryCreation(e) => write!(f, "Failed to create log directory: {}", e),
             Self::SubscriberInit(e) => write!(f, "Failed to initialize tracing subscriber: {}", e),
@@ -79,13 +82,22 @@ fn ensure_log_directory_exists(log_dir: &PathBuf) -> Result<(), LoggingError> {
     Ok(())
 }
 
-/// Initializes the tracing subscriber with XDG-compliant file logging
+/// Initializes the tracing subscriber with dual-stream logging (console + file)
 ///
-/// This function sets up a rolling file appender that:
+/// This function sets up two logging layers:
+/// - Console layer: INFO-level messages to stdout with ANSI colors
+/// - File layer: DEBUG-level messages to XDG-compliant log files with daily rotation
+///
+/// File logging:
 /// - Writes logs to `$XDG_DATA_HOME/crately/logs/`
 /// - Rotates log files daily
 /// - Uses the filename prefix "crately"
-/// - Applies the filter: "crately=debug,tower_http=off,axum=off"
+/// - Filter: "crately=debug,tower_http=off,axum=off"
+///
+/// Console logging:
+/// - Writes INFO and above to stdout
+/// - Filter: "crately=info"
+/// - Compact formatting with ANSI colors
 ///
 /// The function returns a `WorkerGuard` that must be kept alive for the duration
 /// of the application. When the guard is dropped, the logging worker thread will
@@ -93,7 +105,9 @@ fn ensure_log_directory_exists(log_dir: &PathBuf) -> Result<(), LoggingError> {
 ///
 /// # Returns
 ///
-/// Returns a `WorkerGuard` that should be stored for the application lifetime
+/// Returns a tuple of `(WorkerGuard, PathBuf)` containing:
+/// - The `WorkerGuard` that should be stored for the application lifetime
+/// - The `PathBuf` to the log directory for informational purposes
 ///
 /// # Errors
 ///
@@ -105,10 +119,10 @@ fn ensure_log_directory_exists(log_dir: &PathBuf) -> Result<(), LoggingError> {
 /// # Example
 ///
 /// ```no_run
-/// let _guard = logging::init().expect("Failed to initialize logging");
+/// let (_guard, log_dir) = logging::init().expect("Failed to initialize logging");
 /// // _guard must be kept alive for logging to work
 /// ```
-pub fn init() -> Result<WorkerGuard, LoggingError> {
+pub fn init() -> Result<(WorkerGuard, PathBuf), LoggingError> {
     // Get XDG-compliant log directory
     let log_dir = get_log_directory()?;
 
@@ -121,24 +135,35 @@ pub fn init() -> Result<WorkerGuard, LoggingError> {
     // Wrap in non-blocking appender to prevent blocking the application on log writes
     let (non_blocking_appender, guard) = tracing_appender::non_blocking(file_appender);
 
-    // Configure the environment filter
-    // Default: crately=debug,tower_http=off,axum=off
+    // Configure console filter: INFO and above for crately crate only
+    let console_filter = EnvFilter::new("crately=info");
+
+    // Configure file filter: DEBUG and above, with framework noise filtered out
     // Can be overridden with RUST_LOG environment variable
-    let env_filter = EnvFilter::try_from_default_env()
+    let file_filter = EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| "crately=debug,tower_http=off,axum=off".into());
 
-    // Initialize the tracing subscriber with file output
+    // Create console layer: INFO+ to stdout with colors
+    let console_layer = tracing_subscriber::fmt::layer()
+        .with_writer(std::io::stdout)
+        .with_ansi(true)
+        .compact()
+        .with_filter(console_filter);
+
+    // Create file layer: DEBUG+ to rotating files without colors
+    let file_layer = tracing_subscriber::fmt::layer()
+        .with_writer(non_blocking_appender)
+        .with_ansi(false)
+        .with_filter(file_filter);
+
+    // Initialize the tracing subscriber with both layers
     tracing_subscriber::registry()
-        .with(env_filter)
-        .with(
-            tracing_subscriber::fmt::layer()
-                .with_writer(non_blocking_appender)
-                .with_ansi(false), // Disable ANSI color codes in log files
-        )
+        .with(console_layer)
+        .with(file_layer)
         .try_init()
         .map_err(|e| LoggingError::SubscriberInit(e.to_string()))?;
 
-    Ok(guard)
+    Ok((guard, log_dir))
 }
 
 #[cfg(test)]

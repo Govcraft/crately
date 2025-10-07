@@ -1,3 +1,4 @@
+mod console;
 mod crate_downloader;
 mod crate_specifier;
 mod logging;
@@ -10,11 +11,12 @@ use axum::{
     extract::{Json, State},
     routing::post,
 };
+use chrono::Local;
 use request::CrateRequest;
 use response::CrateResponse;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use tracing::{info, error, debug};
+use tracing::{debug, error, info};
 
 use crate::crate_downloader::CrateDownloader;
 
@@ -93,13 +95,25 @@ async fn shutdown_signal() {
 #[tokio::main]
 async fn main() {
     // Initialize XDG-compliant file logging
-    let _guard = logging::init().expect("Failed to initialize logging");
+    let (_guard, log_dir) = logging::init().expect("Failed to initialize logging");
+
+    // Print startup banner and logging confirmation
+    console::print_banner(env!("CARGO_PKG_VERSION"));
+    console::print_separator();
+    console::print_success(&format!("Logging initialized → {}", log_dir.display()));
+
+    // Log session separator for clarity in log files
+    info!("========================================");
+    info!("= APPLICATION STARTUP");
+    info!("= Crately v{}", env!("CARGO_PKG_VERSION"));
+    info!("========================================");
     info!("Logging initialized successfully");
 
     // Launch the acton-reactive runtime
     info!("Launching acton-reactive runtime");
     let mut acton_runtime = ActonApp::launch();
     info!("Acton-reactive runtime launched successfully");
+    console::print_success("Runtime started");
 
     // Create and start the CrateDownloader actor
     debug!("Creating CrateDownloader actor");
@@ -108,6 +122,7 @@ async fn main() {
     debug!("Starting CrateDownloader actor");
     let crate_downloader_handle = crate_downloader.start().await;
     info!("CrateDownloader actor started successfully");
+    console::print_success("Actor system ready (1 agent)");
 
     // Create shared application state
     let app_state = AppState {
@@ -123,16 +138,46 @@ async fn main() {
     let addr = SocketAddr::from(([127, 0, 0, 1], 3000));
     info!("Starting server on {}", addr);
 
-    let listener = tokio::net::TcpListener::bind(addr)
-        .await
-        .expect("Failed to bind to address");
+    let listener = match tokio::net::TcpListener::bind(addr).await {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!();
+            console::print_error("Failed to start server");
+            eprintln!("  Reason: {}", e);
+            eprintln!("  Action: Check if port {} is already in use", addr.port());
+            eprintln!(
+                "  Logs: {}/crately.{}",
+                log_dir.display(),
+                Local::now().format("%Y-%m-%d")
+            );
+            std::process::exit(1);
+        }
+    };
 
-    axum::serve(listener, app)
+    console::print_success(&format!("Server listening → http://{}", addr));
+    eprintln!();
+    eprintln!("Press Ctrl+C to shutdown gracefully");
+    eprintln!();
+
+    if let Err(e) = axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())
         .await
-        .expect("Server failed during execution");
+    {
+        eprintln!();
+        console::print_error("Server error during execution");
+        eprintln!("  Reason: {}", e);
+        eprintln!(
+            "  Logs: {}/crately.{}",
+            log_dir.display(),
+            Local::now().format("%Y-%m-%d")
+        );
+        std::process::exit(1);
+    }
 
     info!("Server shut down gracefully");
+    eprintln!();
+    console::print_progress("Shutting down gracefully...");
+    console::print_success("Server stopped");
 
     // Shutdown sequence: stop individual actors first, then shutdown runtime
     info!("Initiating graceful shutdown sequence");
@@ -142,6 +187,7 @@ async fn main() {
     match crate_downloader_handle.stop().await {
         Ok(()) => {
             info!("CrateDownloader actor stopped successfully");
+            console::print_success("CrateDownloader actor stopped");
         }
         Err(e) => {
             error!("Failed to stop CrateDownloader actor: {:?}", e);
@@ -151,16 +197,15 @@ async fn main() {
     // Step 2: Shutdown the acton-reactive runtime
     debug!("Shutting down acton-reactive runtime");
     match Arc::try_unwrap(app_state.acton_runtime) {
-        Ok(mut runtime) => {
-            match runtime.shutdown_all().await {
-                Ok(()) => {
-                    info!("Acton-reactive runtime shut down successfully");
-                }
-                Err(e) => {
-                    error!("Failed to shut down acton-reactive runtime: {:?}", e);
-                }
+        Ok(mut runtime) => match runtime.shutdown_all().await {
+            Ok(()) => {
+                info!("Acton-reactive runtime shut down successfully");
+                console::print_success("Runtime terminated");
             }
-        }
+            Err(e) => {
+                error!("Failed to shut down acton-reactive runtime: {:?}", e);
+            }
+        },
         Err(_arc) => {
             error!(
                 "Failed to unwrap acton runtime Arc - multiple references still exist. \
@@ -169,5 +214,8 @@ async fn main() {
         }
     }
 
-    info!("Application shutdown complete");
+    // Log session end separator
+    info!("========================================");
+    info!("= APPLICATION SHUTDOWN COMPLETE");
+    info!("========================================");
 }

@@ -43,8 +43,7 @@ impl FromStr for CrateSpecifier {
         }
 
         let name = parts[0].to_string();
-        let version =
-            Version::parse(parts[1]).map_err(CrateSpecifierError::InvalidVersion)?;
+        let version = Version::parse(parts[1]).map_err(CrateSpecifierError::InvalidVersion)?;
 
         Self::new(name, version)
     }
