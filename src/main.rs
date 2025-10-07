@@ -20,7 +20,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use tracing::{debug, error, info};
 
-use crate::crate_downloader::CrateDownloader;
+use crate::{console::Console, crate_downloader::CrateDownloader, messages::Init};
 
 /// Shared application state containing the acton-reactive app instance
 #[derive(Clone)]
@@ -99,6 +99,29 @@ async fn main() {
     // Initialize XDG-compliant file logging
     let (_guard, log_dir) = logging::init().expect("Failed to initialize logging");
 
+    // Launch the acton-reactive runtime
+    info!("Launching acton-reactive runtime");
+    let mut acton_runtime = ActonApp::launch();
+    info!("Acton-reactive runtime launched successfully");
+    let console = match Console::Init(&mut acton_runtime).await {
+        Ok(c) => c,
+        Err(e) => {
+            error!("Failed to initialize Console actor: {:?}", e);
+            eprintln!();
+            console::print_error("Failed to initialize Console actor");
+            eprintln!("  Reason: {}", e);
+            eprintln!("  Action: Check runtime initialization and actor system");
+            eprintln!(
+                "  Logs: {}/crately.{}",
+                log_dir.display(),
+                Local::now().format("%Y-%m-%d")
+            );
+            std::process::exit(1);
+        }
+    };
+    console.send(Init).await;
+
+    console::print_success("Runtime started");
     // Print startup banner and logging confirmation
     console::print_banner(env!("CARGO_PKG_VERSION"));
     console::print_separator();
@@ -132,12 +155,6 @@ async fn main() {
     info!("Logging initialized successfully");
     info!("Configuration loaded from: {}", config_path.display());
     info!("Server port configured: {}", config.port);
-
-    // Launch the acton-reactive runtime
-    info!("Launching acton-reactive runtime");
-    let mut acton_runtime = ActonApp::launch();
-    info!("Acton-reactive runtime launched successfully");
-    console::print_success("Runtime started");
 
     // Create and start the CrateDownloader actor
     debug!("Creating CrateDownloader actor");

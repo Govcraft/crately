@@ -9,6 +9,8 @@
 
 use acton_reactive::prelude::*;
 
+use crate::messages::Init;
+
 /// Success symbol (✓)
 pub const SUCCESS: &str = "✓";
 
@@ -43,13 +45,18 @@ pub const BANNER_TEMPLATE: &str = "\
 
 #[acton_actor]
 pub struct Console;
-pub async fn init(runtime: &mut AgentRuntime) -> anyhow::Result<AgentHandle> {
-    let builder = runtime
-        .new_agent_with_name::<Console>("console".to_string())
-        .await;
-    //    builder.act_on(|actor, context| AgentReply::immediate());
+impl Console {
+    pub async fn Init(runtime: &mut AgentRuntime) -> anyhow::Result<AgentHandle> {
+        let mut builder = runtime
+            .new_agent_with_name::<Console>("console".to_string())
+            .await;
+        builder.act_on::<Init>(|_actor, _context| {
+            print_banner(env!("CARGO_PKG_VERSION"));
+            AgentReply::immediate()
+        });
 
-    Ok(builder.start().await)
+        Ok(builder.start().await)
+    }
 }
 /// Prints the startup banner with version information.
 ///
