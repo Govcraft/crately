@@ -175,7 +175,9 @@ async fn main() {
     }
 
     info!("Server shut down gracefully");
-    eprintln!();
+
+    // Clear the ^C that the terminal printed and move to start of line
+    eprint!("\r");
     console::print_progress("Shutting down gracefully...");
     console::print_success("Server stopped");
 
