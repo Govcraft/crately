@@ -1,7 +1,9 @@
+mod config;
 mod console;
 mod crate_downloader;
 mod crate_specifier;
 mod logging;
+mod messages;
 mod request;
 mod response;
 
@@ -102,12 +104,34 @@ async fn main() {
     console::print_separator();
     console::print_success(&format!("Logging initialized → {}", log_dir.display()));
 
+    // Load configuration
+    let (config, config_path) = match config::load() {
+        Ok((cfg, path)) => {
+            console::print_success(&format!("Configuration loaded → {}", path.display()));
+            (cfg, path)
+        }
+        Err(e) => {
+            eprintln!();
+            console::print_error("Failed to load configuration");
+            eprintln!("  Reason: {}", e);
+            eprintln!("  Action: Check XDG_CONFIG_HOME and file permissions");
+            eprintln!(
+                "  Logs: {}/crately.{}",
+                log_dir.display(),
+                Local::now().format("%Y-%m-%d")
+            );
+            std::process::exit(1);
+        }
+    };
+
     // Log session separator for clarity in log files
     info!("========================================");
     info!("= APPLICATION STARTUP");
     info!("= Crately v{}", env!("CARGO_PKG_VERSION"));
     info!("========================================");
     info!("Logging initialized successfully");
+    info!("Configuration loaded from: {}", config_path.display());
+    info!("Server port configured: {}", config.port);
 
     // Launch the acton-reactive runtime
     info!("Launching acton-reactive runtime");
@@ -135,7 +159,7 @@ async fn main() {
         .with_state(app_state.clone());
 
     // Run the server
-    let addr = SocketAddr::from(([127, 0, 0, 1], 3000));
+    let addr = SocketAddr::from(([127, 0, 0, 1], config.port));
     info!("Starting server on {}", addr);
 
     let listener = match tokio::net::TcpListener::bind(addr).await {

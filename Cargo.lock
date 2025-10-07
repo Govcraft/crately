@@ -856,6 +856,7 @@ name = "crately"
 version = "0.1.0"
 dependencies = [
  "acton-reactive",
+ "anyhow",
  "axum",
  "cargo-util-schemas",
  "chrono",
@@ -864,7 +865,9 @@ dependencies = [
  "serde",
  "serde_json",
  "surrealdb",
+ "thiserror 2.0.17",
  "tokio",
+ "toml",
  "tower",
  "tracing",
  "tracing-appender",

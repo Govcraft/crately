@@ -7,6 +7,8 @@
 // Allow dead code since this is a utility module that will be used in the future
 #![allow(dead_code)]
 
+use acton_reactive::prelude::*;
+
 /// Success symbol (✓)
 pub const SUCCESS: &str = "✓";
 
@@ -19,11 +21,45 @@ pub const PROGRESS: &str = "→";
 /// Warning symbol (⚠)
 pub const WARNING: &str = "⚠";
 
+/// Banner template for the application startup banner.
+///
+/// This const contains the ASCII art box drawing for the Crately startup banner.
+/// The banner includes placeholders that must be filled in at runtime:
+/// - `{version}` placeholder for the version string (7 chars max for proper alignment)
+///
+/// # Example
+///
+/// ```
+/// let banner = crately::console::BANNER_TEMPLATE;
+/// assert!(banner.contains("{version}"));
+/// ```
+pub const BANNER_TEMPLATE: &str = "\
+╔═══════════════════════════════════════════════════════════╗
+║                        CRATELY                            ║
+║          Crate Documentation & Search Service             ║
+║                  License: AGPL-3.0-or-later               ║
+║                     Version {version:<7}                       ║
+╚═══════════════════════════════════════════════════════════╝";
+
+#[acton_actor]
+pub struct Console;
+pub async fn init(runtime: &mut AgentRuntime) -> anyhow::Result<AgentHandle> {
+    let builder = runtime
+        .new_agent_with_name::<Console>("console".to_string())
+        .await;
+    //    builder.act_on(|actor, context| AgentReply::immediate());
+
+    Ok(builder.start().await)
+}
 /// Prints the startup banner with version information.
+///
+/// This function uses [`BANNER_TEMPLATE`] to generate a consistent startup banner
+/// with the provided version string. The version is left-aligned within a 7-character
+/// field to maintain proper box alignment.
 ///
 /// # Arguments
 ///
-/// * `version` - The application version string
+/// * `version` - The application version string (max 7 chars for proper alignment)
 ///
 /// # Example
 ///
@@ -32,15 +68,10 @@ pub const WARNING: &str = "⚠";
 /// ```
 pub fn print_banner(version: &str) {
     eprintln!();
-    eprintln!("╔═══════════════════════════════════════════════════════════╗");
-    eprintln!("║                        CRATELY                            ║");
-    eprintln!("║          Crate Documentation & Search Service             ║");
-    eprintln!("║                  License: AGPL-3.0-or-later               ║");
     eprintln!(
-        "║                     Version {}                         ║",
-        version
+        "{}",
+        BANNER_TEMPLATE.replace("{version:<7}", &format!("{version:<7}"))
     );
-    eprintln!("╚═══════════════════════════════════════════════════════════╝");
     eprintln!();
 }
 
@@ -128,9 +159,60 @@ mod tests {
     }
 
     #[test]
+    fn test_banner_template_contains_placeholder() {
+        assert!(
+            BANNER_TEMPLATE.contains("{version:<7}"),
+            "BANNER_TEMPLATE should contain version placeholder"
+        );
+    }
+
+    #[test]
+    fn test_banner_template_has_box_drawing_characters() {
+        // Verify the banner contains box-drawing characters
+        assert!(BANNER_TEMPLATE.contains("╔"));
+        assert!(BANNER_TEMPLATE.contains("╗"));
+        assert!(BANNER_TEMPLATE.contains("╚"));
+        assert!(BANNER_TEMPLATE.contains("╝"));
+        assert!(BANNER_TEMPLATE.contains("═"));
+        assert!(BANNER_TEMPLATE.contains("║"));
+    }
+
+    #[test]
+    fn test_banner_template_has_expected_content() {
+        assert!(BANNER_TEMPLATE.contains("CRATELY"));
+        assert!(BANNER_TEMPLATE.contains("Crate Documentation & Search Service"));
+        assert!(BANNER_TEMPLATE.contains("License: AGPL-3.0-or-later"));
+        assert!(BANNER_TEMPLATE.contains("Version"));
+    }
+
+    #[test]
     fn test_print_banner_executes_without_panic() {
         // This test verifies the function executes successfully
         print_banner("0.1.0");
+    }
+
+    #[test]
+    fn test_print_banner_with_short_version() {
+        // Short versions should work fine
+        print_banner("0.1");
+    }
+
+    #[test]
+    fn test_print_banner_with_max_length_version() {
+        // 7 character version should work properly
+        print_banner("10.20.3");
+    }
+
+    #[test]
+    fn test_print_banner_with_long_version() {
+        // Longer versions may break alignment but should not panic
+        print_banner("1.0.0-rc.1");
+    }
+
+    #[test]
+    fn test_print_banner_with_empty_version() {
+        // Empty version should not panic
+        print_banner("");
     }
 
     #[test]

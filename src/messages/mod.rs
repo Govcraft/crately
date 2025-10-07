@@ -1,0 +1,92 @@
+//! Message types for the Crately actor system.
+//!
+//! # Organization Pattern
+//!
+//! This module follows a **one-file-per-message-type** pattern where each message struct
+//! is defined in its own file and re-exported from this module root. This organizational
+//! strategy provides several critical benefits:
+//!
+//! ## Benefits of File-Per-Message Organization
+//!
+//! ### 1. Discoverability
+//! - Each message type has a clear, dedicated location in the codebase
+//! - New developers can quickly find message definitions without navigating large files
+//! - IDE navigation and search tools work more effectively with focused files
+//! - File structure mirrors the logical structure of the message system
+//!
+//! ### 2. Maintainability
+//! - Changes to one message type don't affect others
+//! - Easier to review changes in pull requests (isolated diffs)
+//! - Message-specific documentation stays with its definition
+//! - Reduces cognitive load when working on individual message types
+//!
+//! ### 3. Merge Conflict Reduction
+//! - Multiple developers can work on different messages simultaneously
+//! - Git merges are cleaner when changes are in separate files
+//! - Less risk of accidental modifications to unrelated messages
+//! - Parallel development is safer and more efficient
+//!
+//! ### 4. Testing and Documentation
+//! - Tests can be colocated with message definitions using `#[cfg(test)]` modules
+//! - Documentation examples are easier to maintain when focused on single types
+//! - Message-specific edge cases and invariants are clearly documented
+//!
+//! ## Message Passing Architecture
+//!
+//! Crately uses the acton-reactive framework for actor-based concurrency. Messages are
+//! the fundamental unit of communication between actors. Each message type:
+//!
+//! - Is decorated with the `#[acton_message]` macro
+//! - Automatically implements `Clone`, `Debug`, and `ActonMessage` traits
+//! - Should contain only the data necessary for the operation (keep messages small)
+//! - Should use clear, descriptive names that express intent
+//! - Should prefer immutable fields for safety in concurrent scenarios
+//!
+//! ## Usage Example
+//!
+//! ```rust,no_run
+//! use crately::messages::Init;
+//! use acton_reactive::prelude::*;
+//!
+//! // Messages are sent to actors via the actor runtime
+//! async fn send_init_message(actor_handle: ActorHandle<MyActor>) {
+//!     let init_msg = Init;
+//!     // Send message to actor (actual sending mechanism depends on actor implementation)
+//!     // actor_handle.send(init_msg).await;
+//! }
+//! ```
+//!
+//! ## Adding New Messages
+//!
+//! To add a new message type:
+//!
+//! 1. Create a new file in `src/messages/` named after the message (e.g., `download.rs`)
+//! 2. Define the message struct with `#[acton_message]` macro
+//! 3. Add comprehensive documentation explaining the message's purpose and usage
+//! 4. Re-export the message from this module using `pub use`
+//! 5. Ensure the message type is small and contains only essential data
+//!
+//! Example:
+//! ```rust,ignore
+//! // In src/messages/download.rs
+//! use acton_reactive::prelude::*;
+//!
+//! /// Message requesting download of a specific crate version.
+//! #[acton_message]
+//! pub struct Download {
+//!     /// The crate name to download
+//!     pub name: String,
+//!     /// The version to download
+//!     pub version: String,
+//! }
+//! ```
+//!
+//! Then in this file:
+//! ```rust,ignore
+//! mod download;
+//! pub use download::Download;
+//! ```
+
+mod init;
+
+pub use init::Init;
