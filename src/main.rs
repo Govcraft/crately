@@ -1,3 +1,4 @@
+mod crate_downloader;
 mod crate_specifier;
 mod request;
 mod response;
@@ -12,8 +13,10 @@ use request::CrateRequest;
 use response::CrateResponse;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use tracing::info;
+use tracing::{info, error, debug};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
+
+use crate::crate_downloader::CrateDownloader;
 
 /// Shared application state containing the acton-reactive app instance
 #[derive(Clone)]
@@ -37,13 +40,13 @@ async fn handle_crate_request(
     // CrateSpecifier is already validated during deserialization
     let specifier = &payload.specifier;
 
-    info!(
+    debug!(
         "Processing crate: {} (version: {})",
         specifier.name(),
         specifier.version()
     );
 
-    // TODO: Do something useful with the crate specifier and features
+    // TODO: Send download request to CrateDownloader actor via runtime
     // For now, just echo back with a success message
     let response = CrateResponse {
         name: specifier.name().to_string(),
@@ -93,15 +96,23 @@ async fn main() {
     tracing_subscriber::registry()
         .with(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "crately=debug,tower_http=debug,axum=trace".into()),
+                .unwrap_or_else(|_| "crately=debug,tower_http=off,axum=off".into()),
         )
         .with(tracing_subscriber::fmt::layer())
         .init();
 
-    // Launch the acton-reactive app instance
+    // Launch the acton-reactive runtime
     info!("Launching acton-reactive runtime");
-    let acton_runtime = ActonApp::launch();
+    let mut acton_runtime = ActonApp::launch();
     info!("Acton-reactive runtime launched successfully");
+
+    // Create and start the CrateDownloader actor
+    debug!("Creating CrateDownloader actor");
+    let crate_downloader = acton_runtime.new_agent::<CrateDownloader>().await;
+
+    debug!("Starting CrateDownloader actor");
+    let crate_downloader_handle = crate_downloader.start().await;
+    info!("CrateDownloader actor started successfully");
 
     // Create shared application state
     let app_state = AppState {
@@ -117,20 +128,33 @@ async fn main() {
     let addr = SocketAddr::from(([127, 0, 0, 1], 3000));
     info!("Starting server on {}", addr);
 
-    let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
+    let listener = tokio::net::TcpListener::bind(addr)
+        .await
+        .expect("Failed to bind to address");
 
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())
         .await
-        .unwrap();
+        .expect("Server failed during execution");
 
     info!("Server shut down gracefully");
 
-    // Shutdown the acton-reactive runtime after server shutdown
-    info!("Initiating acton-reactive runtime shutdown");
+    // Shutdown sequence: stop individual actors first, then shutdown runtime
+    info!("Initiating graceful shutdown sequence");
 
-    // Extract the runtime from the Arc. Since we cloned app_state for the router,
-    // we still have one reference here. We need to get mutable access.
+    // Step 1: Stop the CrateDownloader actor
+    debug!("Stopping CrateDownloader actor");
+    match crate_downloader_handle.stop().await {
+        Ok(()) => {
+            info!("CrateDownloader actor stopped successfully");
+        }
+        Err(e) => {
+            error!("Failed to stop CrateDownloader actor: {:?}", e);
+        }
+    }
+
+    // Step 2: Shutdown the acton-reactive runtime
+    debug!("Shutting down acton-reactive runtime");
     match Arc::try_unwrap(app_state.acton_runtime) {
         Ok(mut runtime) => {
             match runtime.shutdown_all().await {
@@ -138,13 +162,14 @@ async fn main() {
                     info!("Acton-reactive runtime shut down successfully");
                 }
                 Err(e) => {
-                    tracing::error!("Failed to shut down acton-reactive runtime: {:?}", e);
+                    error!("Failed to shut down acton-reactive runtime: {:?}", e);
                 }
             }
         }
-        Err(_) => {
-            tracing::error!(
-                "Failed to unwrap acton runtime Arc - multiple references still exist"
+        Err(_arc) => {
+            error!(
+                "Failed to unwrap acton runtime Arc - multiple references still exist. \
+                 This indicates the runtime may not be properly cleaned up."
             );
         }
     }

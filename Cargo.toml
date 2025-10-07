@@ -15,4 +15,6 @@ surrealdb = { version = "2.3.10", features = ["rustls", "protocol-ws"] }
 tokio = { version = "1.41", features = ["full"] }
 tower = { version = "0.5.2", features = ["full"] }
 tracing = "0.1"
+tracing-appender = "0.2"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+xdg = { version = "3.0.0", features = ["serde"] }
