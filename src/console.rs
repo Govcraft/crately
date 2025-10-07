@@ -35,6 +35,7 @@ pub fn print_banner(version: &str) {
     eprintln!("╔═══════════════════════════════════════════════════════════╗");
     eprintln!("║                        CRATELY                            ║");
     eprintln!("║          Crate Documentation & Search Service             ║");
+    eprintln!("║                  License: AGPL-3.0-or-later               ║");
     eprintln!(
         "║                     Version {}                         ║",
         version
