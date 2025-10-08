@@ -47,8 +47,56 @@ pub const BANNER_TEMPLATE: &str = "\
 
 #[acton_actor]
 pub struct Console;
+
 impl Console {
-    pub async fn init(runtime: &mut AgentRuntime) -> anyhow::Result<AgentHandle> {
+    /// Spawns, configures, and starts a new Console actor
+    ///
+    /// This is the standard factory method for creating Console actors.
+    /// The Console actor handles visual output formatting for application
+    /// events including startup banner, configuration loading, and status messages.
+    ///
+    /// This follows the simple actor pattern where only the handle is returned,
+    /// as the Console actor has no startup data to provide to the application.
+    ///
+    /// # Arguments
+    ///
+    /// * `runtime` - Mutable reference to the acton-reactive runtime
+    ///
+    /// # Returns
+    ///
+    /// Returns `AgentHandle` to the started Console actor for message passing.
+    ///
+    /// # When to Use
+    ///
+    /// Call this early in application startup to enable visual output
+    /// and event notifications throughout the application lifecycle.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if actor creation or initialization fails.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// use acton_reactive::prelude::*;
+    /// use crately::console::Console;
+    /// use crately::messages::Init;
+    ///
+    /// #[tokio::main]
+    /// async fn main() -> anyhow::Result<()> {
+    ///     let mut runtime = ActonApp::launch();
+    ///
+    ///     // Spawn the Console actor for visual output
+    ///     let console = Console::spawn(&mut runtime).await?;
+    ///
+    ///     // Trigger initialization sequence
+    ///     console.send(Init).await;
+    ///
+    ///     runtime.shutdown_all().await?;
+    ///     Ok(())
+    /// }
+    /// ```
+    pub async fn spawn(runtime: &mut AgentRuntime) -> anyhow::Result<AgentHandle> {
         let mut builder = runtime
             .new_agent_with_name::<Console>("console".to_string())
             .await;

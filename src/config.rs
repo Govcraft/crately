@@ -157,10 +157,14 @@ pub struct ConfigManager {
 }
 
 impl ConfigManager {
-    /// Creates, configures, and starts a new ConfigManager agent
+    /// Spawns, configures, and starts a new ConfigManager actor
     ///
-    /// The agent loads configuration from the XDG-compliant config file
-    /// and provides query and reload capabilities through message passing.
+    /// This is the standard factory method for creating ConfigManager actors.
+    /// It loads configuration from the XDG-compliant config file, initializes
+    /// the actor with the loaded state, and starts it to handle messages.
+    ///
+    /// This follows the service actor pattern where startup data is returned
+    /// alongside the handle for immediate use by the application.
     ///
     /// # Arguments
     ///
@@ -169,12 +173,21 @@ impl ConfigManager {
     /// # Returns
     ///
     /// Returns a tuple containing:
-    /// - The started ConfigManager agent handle
-    /// - The loaded configuration (for immediate use during startup)
+    /// - `AgentHandle` - Handle to the started ConfigManager actor for message passing
+    /// - `Config` - The loaded configuration for immediate use during startup
+    ///
+    /// # When to Use
+    ///
+    /// Call this during application startup when you need both:
+    /// 1. An actor to manage configuration updates via message passing
+    /// 2. Immediate access to configuration values for initialization
     ///
     /// # Errors
     ///
-    /// Returns an error if configuration loading or agent creation fails.
+    /// Returns an error if:
+    /// - Configuration file cannot be loaded or parsed
+    /// - Actor creation or initialization fails
+    /// - XDG directories cannot be determined
     ///
     /// # Example
     ///
@@ -185,21 +198,22 @@ impl ConfigManager {
     /// #[tokio::main]
     /// async fn main() -> anyhow::Result<()> {
     ///     let mut runtime = ActonApp::launch();
-    ///     let (config_manager, config) = ConfigManager::new(&mut runtime).await?;
+    ///
+    ///     // Spawn the ConfigManager actor and get the initial config
+    ///     let (config_manager, config) = ConfigManager::spawn(&mut runtime).await?;
     ///
     ///     // Use config immediately for startup
     ///     println!("Server port: {}", config.port);
     ///
-    ///     // Query configuration using GetConfig message for updates
+    ///     // Query configuration updates via messages
     ///     config_manager.send(GetConfig).await;
     ///
     ///     runtime.shutdown_all().await?;
     ///     Ok(())
     /// }
     /// ```
-    #[allow(clippy::new_ret_no_self)] // Returns (AgentHandle, Config), standard pattern for actor creation
     #[instrument(skip(runtime))]
-    pub async fn new(runtime: &mut AgentRuntime) -> anyhow::Result<(AgentHandle, Config)> {
+    pub async fn spawn(runtime: &mut AgentRuntime) -> anyhow::Result<(AgentHandle, Config)> {
         // Load configuration internally
         let (config, config_path) = load_config_internal()
             .map_err(|e| anyhow::anyhow!("Failed to load configuration: {}", e))?;
@@ -322,7 +336,7 @@ fn load_config_internal() -> Result<(Config, PathBuf), ConfigError> {
 ///
 /// async fn example() -> anyhow::Result<()> {
 ///     let mut runtime = ActonApp::launch();
-///     let (config_manager, config) = ConfigManager::new(&mut runtime).await?;
+///     let (config_manager, config) = ConfigManager::spawn(&mut runtime).await?;
 ///     // Use config immediately for startup
 ///     println!("Server port: {}", config.port);
 ///     Ok(())

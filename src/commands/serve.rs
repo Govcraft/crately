@@ -126,7 +126,7 @@ pub async fn run() -> Result<()> {
 
     // Launch the acton-reactive runtime
     let mut acton_runtime = ActonApp::launch();
-    let console = Console::init(&mut acton_runtime).await?;
+    let console = Console::spawn(&mut acton_runtime).await?;
     console.send(Init).await;
 
     // Print startup banner and logging confirmation
@@ -134,7 +134,7 @@ pub async fn run() -> Result<()> {
 
     // Create and start the ConfigManager actor (it loads its own configuration)
     debug!("Creating ConfigManager actor");
-    let (config_manager, config) = match ConfigManager::new(&mut acton_runtime).await {
+    let (config_manager, config) = match ConfigManager::spawn(&mut acton_runtime).await {
         Ok((handle, cfg)) => {
             console::print_success("ConfigManager actor initialized");
             (handle, cfg)
