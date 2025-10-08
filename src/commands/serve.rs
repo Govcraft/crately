@@ -53,15 +53,12 @@ pub async fn run(mut actor_system: ActorSystem) -> Result<()> {
     let (_shutdown_tx, mut shutdown_rx) = mpsc::channel::<()>(1);
 
     // Spawn keyboard handler actor (only for serve command)
-    info!("Spawning keyboard handler");
     let keyboard_handle = KeyboardHandler::spawn(actor_system.runtime_mut()).await?;
 
     // Spawn server actor
-    info!("Spawning server actor");
     let server_handle = ServerActor::spawn(actor_system.runtime_mut(), config, actors).await?;
 
     // Start the server
-    info!("Sending StartServer message");
     server_handle.send(StartServer).await;
 
     eprintln!();
@@ -71,8 +68,6 @@ pub async fn run(mut actor_system: ActorSystem) -> Result<()> {
 
     // Wait for shutdown signal
     shutdown_signal(&mut shutdown_rx).await;
-
-    info!("Shutdown signal received, stopping server");
 
     // Stop the server
     server_handle.send(StopServer).await;

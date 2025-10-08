@@ -13,7 +13,7 @@ use crossterm::{
 };
 use futures_util::StreamExt;
 use tokio::sync::mpsc;
-use tracing::{debug, error, info, warn};
+use tracing::{error, info, warn};
 
 use crate::messages::KeyPressed;
 
@@ -114,8 +114,6 @@ impl KeyboardHandler {
     /// }
     /// ```
     pub async fn spawn(runtime: &mut AgentRuntime) -> Result<AgentHandle> {
-        debug!("Spawning KeyboardHandler actor");
-
         let mut builder = runtime
             .new_agent_with_name::<KeyboardHandler>("keyboard_handler".to_string())
             .await;
@@ -153,7 +151,6 @@ impl KeyboardHandler {
                     tokio::select! {
                         // Check for stop signal
                         _ = stop_rx.recv() => {
-                            info!("Keyboard handler received stop signal");
                             break;
                         }
                         // Read keyboard events
@@ -162,8 +159,6 @@ impl KeyboardHandler {
                                 Some(Ok(Event::Key(key_event))) => {
                                     // Only handle key press events, not release or repeat
                                     if key_event.kind == KeyEventKind::Press {
-                                        debug!("Key pressed: {:?}", key_event);
-
                                         let message = KeyPressed {
                                             key: key_event.code,
                                             modifiers: key_event.modifiers,
@@ -187,8 +182,6 @@ impl KeyboardHandler {
                     }
                 }
 
-                debug!("Keyboard event reader task terminated");
-
                 // Disable raw mode when task ends
                 if let Err(e) = disable_raw_mode() {
                     error!("Failed to disable raw mode: {}", e);
@@ -200,9 +193,7 @@ impl KeyboardHandler {
 
         // Handle stop requests
         builder.act_on::<StopKeyboardHandler>(|_agent, _envelope| {
-            info!("KeyboardHandler received stop request");
             // Shutdown will be handled by the actor system
-
             AgentReply::immediate()
         });
 

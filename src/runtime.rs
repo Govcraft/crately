@@ -39,7 +39,7 @@ use acton_reactive::prelude::*;
 use anyhow::{Context, Result};
 use dashmap::DashMap;
 use std::sync::Arc;
-use tracing::{debug, error, info};
+use tracing::{error, info};
 
 use crate::{
     config::{Config, ConfigManager},
@@ -108,14 +108,11 @@ impl ActorSystem {
     /// # }
     /// ```
     pub async fn initialize() -> Result<Self> {
-        debug!("Initializing actor system");
-
         // Launch the acton-reactive runtime
         let mut runtime = ActonApp::launch();
         let actors = Arc::new(DashMap::new());
 
         // Spawn Console actor
-        debug!("Spawning Console actor");
         let console = Console::spawn(&mut runtime)
             .await
             .context("Failed to spawn Console actor")?;
@@ -132,27 +129,21 @@ impl ActorSystem {
             .await;
 
         actors.insert("console".to_string(), console.clone());
-        info!("Console actor initialized and registered");
 
         // Spawn ConfigManager actor
-        debug!("Spawning ConfigManager actor");
         let (config_manager, config) = ConfigManager::spawn(&mut runtime)
             .await
             .context("Failed to spawn ConfigManager actor")?;
 
         actors.insert("config_manager".to_string(), config_manager.clone());
-        info!("ConfigManager actor initialized and registered");
 
         // Spawn CrateDownloader actor
-        debug!("Spawning CrateDownloader actor");
         let crate_downloader = CrateDownloader::spawn(&mut runtime)
             .await
             .context("Failed to spawn CrateDownloader actor")?;
 
         actors.insert("crate_downloader".to_string(), crate_downloader.clone());
-        info!("CrateDownloader actor initialized and registered");
 
-        debug!("Actor system initialization complete");
         Ok(Self {
             runtime,
             actors,
@@ -278,10 +269,8 @@ impl ActorSystem {
 
         // Stop CrateDownloader actor
         if let Some(crate_downloader) = self.get_actor("crate_downloader") {
-            debug!("Stopping CrateDownloader actor");
             match crate_downloader.stop().await {
                 Ok(()) => {
-                    info!("CrateDownloader actor stopped successfully");
                     if let Some(console) = self.get_actor("console") {
                         console
                             .send(PrintSuccess("CrateDownloader actor stopped".to_string()))
@@ -296,10 +285,8 @@ impl ActorSystem {
 
         // Stop ConfigManager actor
         if let Some(config_manager) = self.get_actor("config_manager") {
-            debug!("Stopping ConfigManager actor");
             match config_manager.stop().await {
                 Ok(()) => {
-                    info!("ConfigManager actor stopped successfully");
                     if let Some(console) = self.get_actor("console") {
                         console
                             .send(PrintSuccess("ConfigManager actor stopped".to_string()))
@@ -314,11 +301,8 @@ impl ActorSystem {
 
         // Stop Console actor last so logging works throughout shutdown
         if let Some(console) = self.get_actor("console") {
-            debug!("Stopping Console actor");
             match console.stop().await {
-                Ok(()) => {
-                    info!("Console actor stopped successfully");
-                }
+                Ok(()) => {}
                 Err(e) => {
                     error!("Failed to stop Console actor: {:?}", e);
                 }
@@ -329,11 +313,8 @@ impl ActorSystem {
         self.actors.clear();
 
         // Shutdown the acton-reactive runtime
-        debug!("Shutting down acton-reactive runtime");
         match self.runtime.shutdown_all().await {
-            Ok(()) => {
-                info!("Acton-reactive runtime shut down successfully");
-            }
+            Ok(()) => {}
             Err(e) => {
                 error!("Failed to shut down acton-reactive runtime: {:?}", e);
             }

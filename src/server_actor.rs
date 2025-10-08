@@ -183,8 +183,6 @@ impl ServerActor {
         config: Config,
         actors: Arc<DashMap<String, AgentHandle>>,
     ) -> Result<AgentHandle> {
-        debug!("Spawning ServerActor");
-
         let mut builder = runtime
             .new_agent_with_name::<ServerActor>("server".to_string())
             .await;
@@ -247,7 +245,6 @@ impl ServerActor {
 
                 let server = axum::serve(listener, app).with_graceful_shutdown(async move {
                     let _ = shutdown_rx.await;
-                    info!("Server shutdown signal received");
                 });
 
                 if let Err(e) = server.await {
@@ -258,8 +255,6 @@ impl ServerActor {
                             .await;
                     }
                 }
-
-                info!("Server stopped");
             });
 
             agent.model.is_running = true;
@@ -325,7 +320,6 @@ impl ServerActor {
 
             match (key_event.key, key_event.modifiers) {
                 (KeyCode::Char('r'), KeyModifiers::NONE) => {
-                    info!("Reload requested via keyboard");
                     if let Some(console) = agent.model.actors.get("console") {
                         let console = console.clone();
                         return AgentReply::from_async(async move {
@@ -336,7 +330,6 @@ impl ServerActor {
                     }
                 }
                 (KeyCode::Char('s'), KeyModifiers::NONE) => {
-                    info!("Stop requested via keyboard");
                     if let Some(console) = agent.model.actors.get("console") {
                         let console = console.clone();
                         return AgentReply::from_async(async move {
@@ -348,7 +341,6 @@ impl ServerActor {
                 }
                 (KeyCode::Char('q'), KeyModifiers::NONE)
                 | (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
-                    info!("Quit requested via keyboard");
                     // The main shutdown handler will handle this
                 }
                 _ => {
