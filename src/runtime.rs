@@ -45,7 +45,9 @@ use crate::{
     config::{Config, ConfigManager},
     console::{Console, PrintSuccess},
     crate_downloader::CrateDownloader,
-    messages::Init,
+    keyboard_handler::{KeyboardHandler, StopKeyboardHandler},
+    messages::{Init, StopServer},
+    server_actor::ServerActor,
 };
 
 /// Centralized actor system managing runtime and all actors.
@@ -67,6 +69,8 @@ use crate::{
 /// - `"console"` - Console output formatting actor
 /// - `"config_manager"` - Configuration management actor
 /// - `"crate_downloader"` - Crate download orchestration actor
+/// - `"keyboard_handler"` - Keyboard event handler actor (server mode only)
+/// - `"server"` - HTTP server actor (server mode only)
 pub struct ActorSystem {
     /// The acton-reactive runtime managing actor execution
     runtime: AgentRuntime,
@@ -74,6 +78,8 @@ pub struct ActorSystem {
     actors: Arc<DashMap<String, AgentHandle>>,
     /// The initial configuration loaded at startup
     config: Config,
+    /// Whether server-specific actors have been initialized
+    server_mode: bool,
 }
 
 impl ActorSystem {
@@ -148,6 +154,7 @@ impl ActorSystem {
             runtime,
             actors,
             config,
+            server_mode: false,
         })
     }
 
@@ -236,16 +243,143 @@ impl ActorSystem {
         &mut self.runtime
     }
 
+    /// Initializes server-specific actors for the HTTP server.
+    ///
+    /// This method spawns and configures the KeyboardHandler and ServerActor
+    /// actors required for running the HTTP server. It should be called after
+    /// `initialize()` when the serve command is executed.
+    ///
+    /// The server actor is automatically configured with the system's actors
+    /// registry and configuration. The keyboard handler is spawned to enable
+    /// interactive server control.
+    ///
+    /// # Returns
+    ///
+    /// Returns `Ok(())` on successful initialization of both actors.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - KeyboardHandler fails to spawn (e.g., terminal raw mode unavailable)
+    /// - ServerActor fails to spawn
+    /// - Server-specific actors are already initialized (idempotent)
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// # use crately::runtime::ActorSystem;
+    /// # async fn example() -> anyhow::Result<()> {
+    /// let mut system = ActorSystem::initialize().await?;
+    /// system.initialize_server_actors().await?;
+    ///
+    /// // Server actors are now available
+    /// let server = system.get_actor("server").expect("Server exists");
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn initialize_server_actors(&mut self) -> Result<()> {
+        // Check if already initialized to maintain idempotency
+        if self.server_mode {
+            info!("Server actors already initialized, skipping");
+            return Ok(());
+        }
+
+        info!("Initializing server-specific actors");
+
+        // Spawn KeyboardHandler actor
+        let keyboard_handle = KeyboardHandler::spawn(&mut self.runtime)
+            .await
+            .context("Failed to spawn KeyboardHandler actor")?;
+
+        self.actors
+            .insert("keyboard_handler".to_string(), keyboard_handle.clone());
+
+        if let Some(console) = self.get_actor("console") {
+            console
+                .send(PrintSuccess("KeyboardHandler actor started".to_string()))
+                .await;
+        }
+
+        // Spawn ServerActor
+        let server_handle = ServerActor::spawn(
+            &mut self.runtime,
+            self.config.clone(),
+            Arc::clone(&self.actors),
+        )
+        .await
+        .context("Failed to spawn ServerActor actor")?;
+
+        self.actors.insert("server".to_string(), server_handle.clone());
+
+        if let Some(console) = self.get_actor("console") {
+            console
+                .send(PrintSuccess("ServerActor actor started".to_string()))
+                .await;
+        }
+
+        self.server_mode = true;
+
+        Ok(())
+    }
+
+    /// Waits for a shutdown signal from Ctrl+C, SIGTERM, or keyboard 'q' press.
+    ///
+    /// This method blocks until one of the following occurs:
+    /// - User presses Ctrl+C
+    /// - Process receives SIGTERM (Unix only)
+    /// - Keyboard handler broadcasts shutdown signal (requires keyboard_handler actor)
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// # use crately::runtime::ActorSystem;
+    /// # async fn example() {
+    /// ActorSystem::wait_for_shutdown().await;
+    /// println!("Shutdown signal received");
+    /// # }
+    /// ```
+    pub async fn wait_for_shutdown() {
+        let ctrl_c = async {
+            tokio::signal::ctrl_c()
+                .await
+                .expect("failed to install Ctrl+C handler");
+        };
+
+        #[cfg(unix)]
+        let terminate = async {
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                .expect("failed to install signal handler")
+                .recv()
+                .await;
+        };
+
+        #[cfg(not(unix))]
+        let terminate = std::future::pending::<()>();
+
+        tokio::select! {
+            _ = ctrl_c => {
+                info!("Received Ctrl+C signal, initiating graceful shutdown");
+            },
+            _ = terminate => {
+                info!("Received termination signal, initiating graceful shutdown");
+            },
+        }
+    }
+
     /// Gracefully shuts down the actor system.
     ///
     /// This method performs a clean shutdown sequence:
-    /// 1. Stops the CrateDownloader actor
-    /// 2. Stops the ConfigManager actor
-    /// 3. Stops the Console actor
-    /// 4. Shuts down the acton-reactive runtime
+    /// 1. Stops ServerActor (if running) - gracefully stop accepting requests
+    /// 2. Stops KeyboardHandler (if running) - stop listening for input
+    /// 3. Stops CrateDownloader actor - finish any pending work
+    /// 4. Stops ConfigManager actor - finish any pending work
+    /// 5. Stops Console actor - last so logging works throughout
+    /// 6. Clears actor registry
+    /// 7. Shuts down the acton-reactive runtime
     ///
-    /// The shutdown order ensures that logging remains available until
-    /// all other actors have completed their shutdown procedures.
+    /// The shutdown order ensures that the server stops first, followed by
+    /// supporting actors, with logging remaining available until all other
+    /// actors have completed their shutdown procedures.
     ///
     /// # Errors
     ///
@@ -266,6 +400,48 @@ impl ActorSystem {
     /// ```
     pub async fn shutdown(mut self) -> Result<()> {
         info!("Initiating graceful shutdown sequence");
+
+        // Stop ServerActor first (if running in server mode)
+        if self.server_mode {
+            if let Some(server) = self.get_actor("server") {
+                // Send StopServer message first to gracefully stop accepting requests
+                server.send(StopServer).await;
+
+                // Give server time to drain connections
+                tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+
+                match server.stop().await {
+                    Ok(()) => {
+                        if let Some(console) = self.get_actor("console") {
+                            console
+                                .send(PrintSuccess("ServerActor stopped".to_string()))
+                                .await;
+                        }
+                    }
+                    Err(e) => {
+                        error!("Failed to stop ServerActor: {:?}", e);
+                    }
+                }
+            }
+
+            // Stop KeyboardHandler (if running)
+            if let Some(keyboard_handler) = self.get_actor("keyboard_handler") {
+                keyboard_handler.send(StopKeyboardHandler).await;
+
+                match keyboard_handler.stop().await {
+                    Ok(()) => {
+                        if let Some(console) = self.get_actor("console") {
+                            console
+                                .send(PrintSuccess("KeyboardHandler stopped".to_string()))
+                                .await;
+                        }
+                    }
+                    Err(e) => {
+                        error!("Failed to stop KeyboardHandler: {:?}", e);
+                    }
+                }
+            }
+        }
 
         // Stop CrateDownloader actor
         if let Some(crate_downloader) = self.get_actor("crate_downloader") {
@@ -332,6 +508,7 @@ impl ActorSystem {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::messages::StartServer;
 
     #[tokio::test(flavor = "multi_thread")]
     async fn test_actor_system_initialize_succeeds() {
@@ -453,6 +630,98 @@ mod tests {
         system.actors.remove("crate_downloader");
 
         // Shutdown should still succeed even with missing actor
+        system.shutdown().await.expect("Shutdown should succeed");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_actor_system_initialize_server_actors_succeeds() {
+        let mut system = ActorSystem::initialize()
+            .await
+            .expect("Initialization should succeed");
+
+        // Server mode should initially be false
+        assert!(!system.server_mode, "Server mode should be false initially");
+
+        // Initialize server actors
+        system
+            .initialize_server_actors()
+            .await
+            .expect("Server actor initialization should succeed");
+
+        // Server mode should now be true
+        assert!(system.server_mode, "Server mode should be true after initialization");
+
+        // Both server actors should be registered
+        assert!(
+            system.get_actor("keyboard_handler").is_some(),
+            "KeyboardHandler should be registered"
+        );
+        assert!(
+            system.get_actor("server").is_some(),
+            "ServerActor should be registered"
+        );
+
+        system.shutdown().await.expect("Shutdown should succeed");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_actor_system_initialize_server_actors_is_idempotent() {
+        let mut system = ActorSystem::initialize()
+            .await
+            .expect("Initialization should succeed");
+
+        // Initialize server actors twice
+        system
+            .initialize_server_actors()
+            .await
+            .expect("First initialization should succeed");
+
+        system
+            .initialize_server_actors()
+            .await
+            .expect("Second initialization should succeed");
+
+        // Should still only have one of each actor
+        let actors = system.actors();
+        assert_eq!(
+            actors.len(),
+            5,
+            "Should have exactly 5 actors (3 core + 2 server)"
+        );
+
+        system.shutdown().await.expect("Shutdown should succeed");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_actor_system_shutdown_with_server_actors() {
+        let mut system = ActorSystem::initialize()
+            .await
+            .expect("Initialization should succeed");
+
+        // Initialize server actors
+        system
+            .initialize_server_actors()
+            .await
+            .expect("Server actor initialization should succeed");
+
+        // Start the server
+        let server = system.get_actor("server").expect("Server should exist");
+        server.send(StartServer).await;
+
+        // Give server time to start
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+        // Shutdown should cleanly stop all actors including server actors
+        system.shutdown().await.expect("Shutdown should succeed");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_actor_system_shutdown_without_server_actors() {
+        let system = ActorSystem::initialize()
+            .await
+            .expect("Initialization should succeed");
+
+        // Shutdown should succeed without server actors initialized
         system.shutdown().await.expect("Shutdown should succeed");
     }
 }

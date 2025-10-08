@@ -1,25 +1,19 @@
 /// Serve command implementation for running the HTTP server
 ///
-/// This module contains the server startup logic and graceful shutdown handling
-/// for the crately HTTP service. The actor system is pre-initialized by main.rs
-/// and passed as a parameter.
+/// This module provides a thin wrapper around ActorSystem that initializes
+/// server-specific actors, starts the HTTP server, and coordinates shutdown.
+/// All actor lifecycle management is delegated to the ActorSystem.
+use acton_reactive::prelude::*;
 use anyhow::Result;
-use tokio::sync::mpsc;
 use tracing::info;
 
-use acton_reactive::prelude::*;
-
-use crate::{
-    keyboard_handler::{KeyboardHandler, StopKeyboardHandler},
-    messages::{StartServer, StopServer},
-    runtime::ActorSystem,
-    server_actor::ServerActor,
-};
+use crate::{messages::StartServer, runtime::ActorSystem};
 
 /// Execute the serve command to start the HTTP server
 ///
-/// Initializes keyboard handler and server actors, then waits for shutdown signal.
-/// The ActorSystem must be pre-initialized by the caller (main.rs).
+/// This method initializes server-specific actors (KeyboardHandler and ServerActor),
+/// starts the HTTP server, waits for a shutdown signal, and then triggers graceful
+/// shutdown via the ActorSystem.
 ///
 /// # Arguments
 ///
@@ -45,76 +39,26 @@ use crate::{
 pub async fn run(mut actor_system: ActorSystem) -> Result<()> {
     info!("Starting serve command");
 
-    // Get references to needed actors
-    let config = actor_system.config().clone();
-    let actors = actor_system.actors();
+    // Initialize server-specific actors (KeyboardHandler and ServerActor)
+    actor_system.initialize_server_actors().await?;
 
-    // Create a channel for coordinating shutdown
-    let (_shutdown_tx, mut shutdown_rx) = mpsc::channel::<()>(1);
+    // Get the server actor and start it
+    let server = actor_system
+        .get_actor("server")
+        .expect("Server actor should exist after initialization");
 
-    // Spawn keyboard handler actor (only for serve command)
-    let keyboard_handle = KeyboardHandler::spawn(actor_system.runtime_mut()).await?;
+    server.send(StartServer).await;
 
-    // Spawn server actor
-    let server_handle = ServerActor::spawn(actor_system.runtime_mut(), config, actors).await?;
-
-    // Start the server
-    server_handle.send(StartServer).await;
-
+    // Display user instructions
     eprintln!();
     eprintln!("Server is running. Press 'q' or Ctrl+C to shutdown gracefully");
     eprintln!("Press 'r' to reload configuration");
     eprintln!();
 
-    // Wait for shutdown signal
-    shutdown_signal(&mut shutdown_rx).await;
-
-    // Stop the server
-    server_handle.send(StopServer).await;
-
-    // Give server time to drain connections
-    tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
-
-    // Stop keyboard handler
-    keyboard_handle.send(StopKeyboardHandler).await;
-
-    // Stop actors
-    server_handle.stop().await?;
-    keyboard_handle.stop().await?;
+    // Wait for shutdown signal (Ctrl+C, SIGTERM, or keyboard 'q')
+    ActorSystem::wait_for_shutdown().await;
 
     info!("Serve command completed");
 
     Ok(())
-}
-
-/// Wait for shutdown signal (keyboard 'q' or Ctrl+C)
-async fn shutdown_signal(shutdown_rx: &mut mpsc::Receiver<()>) {
-    let ctrl_c = async {
-        tokio::signal::ctrl_c()
-            .await
-            .expect("failed to install Ctrl+C handler");
-    };
-
-    #[cfg(unix)]
-    let terminate = async {
-        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-            .expect("failed to install signal handler")
-            .recv()
-            .await;
-    };
-
-    #[cfg(not(unix))]
-    let terminate = std::future::pending::<()>();
-
-    tokio::select! {
-        _ = ctrl_c => {
-            info!("Received Ctrl+C signal, initiating graceful shutdown");
-        },
-        _ = terminate => {
-            info!("Received termination signal, initiating graceful shutdown");
-        },
-        _ = shutdown_rx.recv() => {
-            info!("Received shutdown signal from keyboard handler");
-        },
-    }
 }
