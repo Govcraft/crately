@@ -42,9 +42,8 @@ use std::sync::Arc;
 use tracing::{debug, error, info};
 
 use crate::{
-    Console,
     config::{Config, ConfigManager},
-    console::PrintSuccess,
+    console::{Console, PrintSuccess},
     crate_downloader::CrateDownloader,
     messages::Init,
 };
@@ -223,6 +222,27 @@ impl ActorSystem {
     /// ```
     pub fn actors(&self) -> Arc<DashMap<String, AgentHandle>> {
         Arc::clone(&self.actors)
+    }
+
+    /// Gets mutable access to the runtime for spawning new actors.
+    ///
+    /// This method provides mutable access to the underlying acton-reactive
+    /// runtime, allowing commands to spawn additional actors after the initial
+    /// system initialization.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// # use crately::runtime::ActorSystem;
+    /// # async fn example(mut system: ActorSystem) -> anyhow::Result<()> {
+    /// // Spawn additional actors
+    /// let runtime = system.runtime_mut();
+    /// // Use runtime.new_agent() to create new actors
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn runtime_mut(&mut self) -> &mut AgentRuntime {
+        &mut self.runtime
     }
 
     /// Gracefully shuts down the actor system.
