@@ -21,6 +21,10 @@ async fn main() -> anyhow::Result<()> {
 
     // Dispatch to the appropriate command handler
     match cli.command {
+        Commands::Cache(args) => {
+            // Run the cache command
+            commands::cache::run(args)?;
+        }
         Commands::Doctor(args) => {
             // Run the doctor command
             commands::doctor::run(args)?;
