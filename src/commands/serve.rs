@@ -1,8 +1,8 @@
 /// Serve command implementation for running the HTTP server
 ///
-/// This module contains the server startup logic, actor system initialization,
-/// and graceful shutdown handling for the crately HTTP service.
-use acton_reactive::prelude::*;
+/// This module contains the server startup logic and graceful shutdown handling
+/// for the crately HTTP service. Actor system initialization is handled by the
+/// centralized runtime module.
 use anyhow::Result;
 use axum::{
     Router,
@@ -10,29 +10,24 @@ use axum::{
     routing::post,
 };
 use chrono::Local;
+use dashmap::DashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use tracing::{debug, error, info};
+use tracing::{debug, info};
 
+use acton_reactive::prelude::*;
 use crate::{
-    Console,
-    config::ConfigManager,
     console::{PrintError, PrintProgress, PrintSuccess},
-    crate_downloader::CrateDownloader,
-    messages::Init,
     request::CrateRequest,
     response::CrateResponse,
+    runtime::ActorSystem,
 };
 
-/// Shared application state containing the acton-reactive runtime
+/// Shared application state containing actor handles
 #[derive(Clone)]
 struct AppState {
-    /// The acton-reactive runtime for managing reactive agents
-    acton_runtime: Arc<AgentRuntime>,
-    /// Handle to the configuration manager actor
-    config_manager: AgentHandle,
-    /// Handle to the console actor for output formatting
-    console: AgentHandle,
+    /// Thread-safe map of actor handles accessible by name
+    actors: Arc<DashMap<String, AgentHandle>>,
 }
 
 /// Handle HTTP POST requests to the /crate endpoint
@@ -45,9 +40,6 @@ async fn handle_crate_request(
         payload.specifier, payload.features
     );
 
-    // Access the acton-reactive runtime (available for future use)
-    let _runtime = &state.acton_runtime;
-
     // CrateSpecifier is already validated during deserialization
     let specifier = &payload.specifier;
 
@@ -57,7 +49,12 @@ async fn handle_crate_request(
         specifier.version()
     );
 
-    // TODO: Send download request to CrateDownloader actor via runtime
+    // TODO: Send download request to CrateDownloader actor
+    // Access the crate downloader actor from the registry
+    if let Some(_crate_downloader) = state.actors.get("crate_downloader") {
+        // Future: send DownloadCrate message to the actor
+    }
+
     // For now, just echo back with a success message
     let response = CrateResponse {
         name: specifier.name().to_string(),
@@ -104,7 +101,7 @@ async fn shutdown_signal() {
 
 /// Execute the serve command to start the HTTP server
 ///
-/// Initializes the acton-reactive runtime, creates actor instances,
+/// Initializes the actor system via `ActorSystem::initialize()`,
 /// starts the HTTP server, and handles graceful shutdown.
 ///
 /// # Returns
@@ -126,33 +123,21 @@ pub async fn run() -> Result<()> {
     // Initialize XDG-compliant file logging
     let (_guard, log_dir) = crate::logging::init().expect("Failed to initialize logging");
 
-    // Launch the acton-reactive runtime
-    let mut acton_runtime = ActonApp::launch();
-    let console = Console::spawn(&mut acton_runtime).await?;
-    console.send(Init).await;
+    // Initialize the centralized actor system
+    debug!("Initializing actor system");
+    let actor_system = ActorSystem::initialize().await?;
 
-    // Print startup banner and logging confirmation
-    console
-        .send(PrintSuccess(format!(
-            "Logging initialized → {}",
-            log_dir.display()
-        )))
-        .await;
+    // Get actor handles from the registry
+    let console = actor_system
+        .get_actor("console")
+        .expect("Console actor should be registered");
 
-    // Create and start the ConfigManager actor (it loads its own configuration)
-    debug!("Creating ConfigManager actor");
-    let (config_manager, config) = ConfigManager::spawn(&mut acton_runtime).await?;
+    // Get configuration from the actor system
+    let config = actor_system.config();
 
-    // Create and start the CrateDownloader actor using spawn pattern
-    debug!("Creating and starting CrateDownloader actor");
-    let crate_downloader_handle = CrateDownloader::spawn(&mut acton_runtime).await?;
-    info!("CrateDownloader actor started successfully");
-
-    // Create shared application state
+    // Create shared application state with the actor registry
     let app_state = AppState {
-        acton_runtime: Arc::new(acton_runtime),
-        config_manager: config_manager.clone(),
-        console: console.clone(),
+        actors: actor_system.actors(),
     };
 
     // Build our application with routes and state
@@ -168,8 +153,7 @@ pub async fn run() -> Result<()> {
         Ok(l) => l,
         Err(e) => {
             eprintln!();
-            app_state
-                .console
+            console
                 .send(PrintError("Failed to start server".to_string()))
                 .await;
             eprintln!("  Reason: {}", e);
@@ -183,8 +167,7 @@ pub async fn run() -> Result<()> {
         }
     };
 
-    app_state
-        .console
+    console
         .send(PrintSuccess(format!("Server listening → http://{}", addr)))
         .await;
     eprintln!();
@@ -196,8 +179,7 @@ pub async fn run() -> Result<()> {
         .await
     {
         eprintln!();
-        app_state
-            .console
+        console
             .send(PrintError("Server error during execution".to_string()))
             .await;
         eprintln!("  Reason: {}", e);
@@ -213,81 +195,15 @@ pub async fn run() -> Result<()> {
 
     // Clear the ^C that the terminal printed and move to start of line
     eprint!("\r");
-    app_state
-        .console
+    console
         .send(PrintProgress("Shutting down gracefully...".to_string()))
         .await;
-    app_state
-        .console
+    console
         .send(PrintSuccess("Server stopped".to_string()))
         .await;
 
-    // Shutdown sequence: stop individual actors first, then shutdown runtime
-    info!("Initiating graceful shutdown sequence");
+    // Delegate shutdown to the ActorSystem
+    actor_system.shutdown().await?;
 
-    // Step 1: Stop the CrateDownloader actor
-    debug!("Stopping CrateDownloader actor");
-    match crate_downloader_handle.stop().await {
-        Ok(()) => {
-            info!("CrateDownloader actor stopped successfully");
-            app_state
-                .console
-                .send(PrintSuccess("CrateDownloader actor stopped".to_string()))
-                .await;
-        }
-        Err(e) => {
-            error!("Failed to stop CrateDownloader actor: {:?}", e);
-        }
-    }
-
-    // Step 1.5: Stop the ConfigManager actor
-    debug!("Stopping ConfigManager actor");
-    match app_state.config_manager.stop().await {
-        Ok(()) => {
-            info!("ConfigManager actor stopped successfully");
-            app_state
-                .console
-                .send(PrintSuccess("ConfigManager actor stopped".to_string()))
-                .await;
-        }
-        Err(e) => {
-            error!("Failed to stop ConfigManager actor: {:?}", e);
-        }
-    }
-
-    // Step 2: Stop the Console actor before shutting down runtime
-    debug!("Stopping Console actor");
-    match app_state.console.stop().await {
-        Ok(()) => {
-            info!("Console actor stopped successfully");
-        }
-        Err(e) => {
-            error!("Failed to stop Console actor: {:?}", e);
-        }
-    }
-
-    // Step 3: Shutdown the acton-reactive runtime
-    debug!("Shutting down acton-reactive runtime");
-    match Arc::try_unwrap(app_state.acton_runtime) {
-        Ok(mut runtime) => match runtime.shutdown_all().await {
-            Ok(()) => {
-                info!("Acton-reactive runtime shut down successfully");
-            }
-            Err(e) => {
-                error!("Failed to shut down acton-reactive runtime: {:?}", e);
-            }
-        },
-        Err(_arc) => {
-            error!(
-                "Failed to unwrap acton runtime Arc - multiple references still exist. \
-                 This indicates the runtime may not be properly cleaned up."
-            );
-        }
-    }
-
-    // Log session end separator
-    info!("========================================");
-    info!("= APPLICATION SHUTDOWN COMPLETE");
-    info!("========================================");
     Ok(())
 }

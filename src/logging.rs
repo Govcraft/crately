@@ -54,6 +54,19 @@ impl std::error::Error for LoggingError {
 /// # Errors
 ///
 /// Returns `LoggingError::HomeDirectoryNotFound` if the HOME directory cannot be determined
+///
+/// # Example
+///
+/// ```no_run
+/// use crately::logging::get_log_dir;
+///
+/// let log_dir = get_log_dir().expect("Failed to get log directory");
+/// println!("Logs are stored in: {}", log_dir.display());
+/// ```
+pub fn get_log_dir() -> Result<PathBuf, LoggingError> {
+    get_log_directory()
+}
+
 fn get_log_directory() -> Result<PathBuf, LoggingError> {
     // Use with_prefix to automatically append "crately" to all paths
     let base_dirs = BaseDirectories::with_prefix("crately");

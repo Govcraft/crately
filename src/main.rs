@@ -10,6 +10,7 @@ mod logging;
 mod messages;
 mod request;
 mod response;
+pub mod runtime;
 
 use clap::Parser;
 use cli::{Cli, Commands};
