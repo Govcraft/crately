@@ -95,36 +95,16 @@ async fn shutdown_signal() {
 }
 
 #[tokio::main]
-async fn main() {
+async fn main() -> anyhow::Result<()> {
     // Initialize XDG-compliant file logging
     let (_guard, log_dir) = logging::init().expect("Failed to initialize logging");
 
     // Launch the acton-reactive runtime
-    info!("Launching acton-reactive runtime");
     let mut acton_runtime = ActonApp::launch();
-    info!("Acton-reactive runtime launched successfully");
-    let console = match Console::Init(&mut acton_runtime).await {
-        Ok(c) => c,
-        Err(e) => {
-            error!("Failed to initialize Console actor: {:?}", e);
-            eprintln!();
-            console::print_error("Failed to initialize Console actor");
-            eprintln!("  Reason: {}", e);
-            eprintln!("  Action: Check runtime initialization and actor system");
-            eprintln!(
-                "  Logs: {}/crately.{}",
-                log_dir.display(),
-                Local::now().format("%Y-%m-%d")
-            );
-            std::process::exit(1);
-        }
-    };
+    let console = Console::init(&mut acton_runtime).await?;
     console.send(Init).await;
 
-    console::print_success("Runtime started");
     // Print startup banner and logging confirmation
-    console::print_banner(env!("CARGO_PKG_VERSION"));
-    console::print_separator();
     console::print_success(&format!("Logging initialized → {}", log_dir.display()));
 
     // Load configuration
@@ -148,10 +128,6 @@ async fn main() {
     };
 
     // Log session separator for clarity in log files
-    info!("========================================");
-    info!("= APPLICATION STARTUP");
-    info!("= Crately v{}", env!("CARGO_PKG_VERSION"));
-    info!("========================================");
     info!("Logging initialized successfully");
     info!("Configuration loaded from: {}", config_path.display());
     info!("Server port configured: {}", config.port);
@@ -261,4 +237,5 @@ async fn main() {
     info!("========================================");
     info!("= APPLICATION SHUTDOWN COMPLETE");
     info!("========================================");
+    Ok(())
 }

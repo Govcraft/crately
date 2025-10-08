@@ -10,6 +10,7 @@
 use acton_reactive::prelude::*;
 
 use crate::messages::Init;
+use tracing::info;
 
 /// Success symbol (✓)
 pub const SUCCESS: &str = "✓";
@@ -46,14 +47,22 @@ pub const BANNER_TEMPLATE: &str = "\
 #[acton_actor]
 pub struct Console;
 impl Console {
-    pub async fn Init(runtime: &mut AgentRuntime) -> anyhow::Result<AgentHandle> {
+    pub async fn init(runtime: &mut AgentRuntime) -> anyhow::Result<AgentHandle> {
         let mut builder = runtime
             .new_agent_with_name::<Console>("console".to_string())
             .await;
-        builder.act_on::<Init>(|_actor, _context| {
-            print_banner(env!("CARGO_PKG_VERSION"));
-            AgentReply::immediate()
-        });
+
+        builder
+            .before_start(|_| {
+                print_banner(env!("CARGO_PKG_VERSION"));
+
+                AgentReply::immediate()
+            })
+            .act_on::<Init>(|_actor, _context| AgentReply::immediate())
+            .after_start(|_actor| {
+                print_success("Runtime initialized");
+                AgentReply::immediate()
+            });
 
         Ok(builder.start().await)
     }
@@ -76,6 +85,10 @@ impl Console {
 pub fn print_banner(version: &str) {
     eprintln!();
     eprintln!(
+        "{}",
+        BANNER_TEMPLATE.replace("{version:<7}", &format!("{version:<7}"))
+    );
+    info!(
         "{}",
         BANNER_TEMPLATE.replace("{version:<7}", &format!("{version:<7}"))
     );
