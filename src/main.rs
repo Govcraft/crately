@@ -25,6 +25,10 @@ async fn main() -> anyhow::Result<()> {
             // Run the doctor command
             commands::doctor::run(args)?;
         }
+        Commands::Init(args) => {
+            // Run the init command
+            commands::init::run(args)?;
+        }
         Commands::Serve => {
             // Run the serve command
             commands::serve::run().await?;

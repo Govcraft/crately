@@ -30,6 +30,15 @@ pub enum Commands {
     /// - Runtime environment checks
     Doctor(DoctorArgs),
 
+    /// Initialize crately configuration
+    ///
+    /// Runs an interactive wizard to guide through initial setup including:
+    /// - OpenAI API key configuration
+    /// - Cache configuration
+    /// - Test run validation
+    /// - Setup completion verification
+    Init(InitArgs),
+
     /// Start the crately server
     ///
     /// Launches the HTTP server to process crate documentation requests
@@ -60,6 +69,18 @@ pub struct DoctorArgs {
     /// - Cleaning up temporary files
     #[arg(short, long)]
     pub fix: bool,
+}
+
+/// Arguments for the init subcommand
+#[derive(Parser, Debug)]
+pub struct InitArgs {
+    /// Skip interactive wizard and use defaults
+    ///
+    /// When enabled, bypasses the interactive setup wizard and initializes
+    /// crately with default configuration values. Manual configuration
+    /// will be required after initialization.
+    #[arg(long)]
+    pub no_interactive: bool,
 }
 
 #[cfg(test)]
@@ -154,5 +175,31 @@ mod tests {
         // Help flag should cause parse to fail with exit, which is expected behavior
         let result = Cli::try_parse_from(["crately", "--help"]);
         assert!(result.is_err(), "Help flag should cause early exit");
+    }
+
+    #[test]
+    fn test_cli_init_no_flags() {
+        let cli = Cli::try_parse_from(["crately", "init"]).expect("Failed to parse CLI");
+        match cli.command {
+            Commands::Init(args) => {
+                assert!(
+                    !args.no_interactive,
+                    "no_interactive should default to false"
+                );
+            }
+            _ => panic!("Expected Init command"),
+        }
+    }
+
+    #[test]
+    fn test_cli_init_with_no_interactive_flag() {
+        let cli = Cli::try_parse_from(["crately", "init", "--no-interactive"])
+            .expect("Failed to parse CLI");
+        match cli.command {
+            Commands::Init(args) => {
+                assert!(args.no_interactive, "no_interactive should be true");
+            }
+            _ => panic!("Expected Init command"),
+        }
     }
 }
