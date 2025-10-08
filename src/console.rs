@@ -48,6 +48,26 @@ pub const BANNER_TEMPLATE: &str = "\
 #[acton_actor]
 pub struct Console;
 
+/// Message to print a success message with the success symbol (✓)
+#[acton_message(raw)]
+pub struct PrintSuccess(pub String);
+
+/// Message to print an error message with the error symbol (✗)
+#[acton_message(raw)]
+pub struct PrintError(pub String);
+
+/// Message to print a progress message with the progress symbol (→)
+#[acton_message(raw)]
+pub struct PrintProgress(pub String);
+
+/// Message to print a warning message with the warning symbol (⚠)
+#[acton_message(raw)]
+pub struct PrintWarning(pub String);
+
+/// Message to print a horizontal separator line
+#[acton_message(raw)]
+pub struct PrintSeparator;
+
 impl Console {
     /// Spawns, configures, and starts a new Console actor
     ///
@@ -108,6 +128,30 @@ impl Console {
                 AgentReply::immediate()
             })
             .act_on::<Init>(|_actor, _context| AgentReply::immediate())
+            .act_on::<PrintSuccess>(|_actor, envelope| {
+                let message = envelope.message();
+                print_success(&message.0);
+                AgentReply::immediate()
+            })
+            .act_on::<PrintError>(|_actor, envelope| {
+                let message = envelope.message();
+                print_error(&message.0);
+                AgentReply::immediate()
+            })
+            .act_on::<PrintProgress>(|_actor, envelope| {
+                let message = envelope.message();
+                print_progress(&message.0);
+                AgentReply::immediate()
+            })
+            .act_on::<PrintWarning>(|_actor, envelope| {
+                let message = envelope.message();
+                print_warning(&message.0);
+                AgentReply::immediate()
+            })
+            .act_on::<PrintSeparator>(|_actor, _envelope| {
+                print_separator();
+                AgentReply::immediate()
+            })
             .mutate_on::<ConfigLoaded>(|_agent, envelope| {
                 let message = envelope.message();
                 print_success(&format!(
@@ -154,72 +198,57 @@ pub fn print_banner(version: &str) {
 
 /// Prints a success message with the success symbol (✓).
 ///
+/// This is a private helper function used by the Console actor's message handlers.
+/// External code should send `PrintSuccess` messages to the Console actor instead.
+///
 /// # Arguments
 ///
 /// * `message` - The success message to display
-///
-/// # Example
-///
-/// ```no_run
-/// crately::console::print_success("Server started on 127.0.0.1:3000");
-/// ```
-pub fn print_success(message: &str) {
+fn print_success(message: &str) {
     eprintln!("{} {}", SUCCESS, message);
 }
 
 /// Prints an error message with the error symbol (✗).
 ///
+/// This is a private helper function used by the Console actor's message handlers.
+/// External code should send `PrintError` messages to the Console actor instead.
+///
 /// # Arguments
 ///
 /// * `message` - The error message to display
-///
-/// # Example
-///
-/// ```no_run
-/// crately::console::print_error("Failed to connect to database");
-/// ```
-pub fn print_error(message: &str) {
+fn print_error(message: &str) {
     eprintln!("{} {}", ERROR, message);
 }
 
 /// Prints a progress message with the progress symbol (→).
 ///
+/// This is a private helper function used by the Console actor's message handlers.
+/// External code should send `PrintProgress` messages to the Console actor instead.
+///
 /// # Arguments
 ///
 /// * `message` - The progress message to display
-///
-/// # Example
-///
-/// ```no_run
-/// crately::console::print_progress("Initializing runtime");
-/// ```
-pub fn print_progress(message: &str) {
+fn print_progress(message: &str) {
     eprintln!("{} {}", PROGRESS, message);
 }
 
 /// Prints a warning message with the warning symbol (⚠).
 ///
+/// This is a private helper function used by the Console actor's message handlers.
+/// External code should send `PrintWarning` messages to the Console actor instead.
+///
 /// # Arguments
 ///
 /// * `message` - The warning message to display
-///
-/// # Example
-///
-/// ```no_run
-/// crately::console::print_warning("Using default configuration");
-/// ```
-pub fn print_warning(message: &str) {
+fn print_warning(message: &str) {
     eprintln!("{} {}", WARNING, message);
 }
 
 /// Prints a horizontal separator line.
 ///
-/// # Example
-///
-/// ```no_run
-/// crately::console::print_separator();
-/// ```
-pub fn print_separator() {
+/// This is a private helper function used by the Console actor's message handlers.
+/// External code should send `PrintSeparator` messages to the Console actor instead.
+fn print_separator() {
     eprintln!("───────────────────────────────────────────────────────────");
 }
 
@@ -315,5 +344,62 @@ mod tests {
     #[test]
     fn test_print_separator_executes_without_panic() {
         print_separator();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_console_actor_handles_print_success_message() {
+        let mut runtime = ActonApp::launch();
+        let console = Console::spawn(&mut runtime).await.unwrap();
+
+        // Send message and verify it doesn't panic
+        console.send(PrintSuccess("Test message".to_string())).await;
+
+        // Cleanup
+        console.stop().await.unwrap();
+        runtime.shutdown_all().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_console_actor_handles_print_error_message() {
+        let mut runtime = ActonApp::launch();
+        let console = Console::spawn(&mut runtime).await.unwrap();
+
+        console.send(PrintError("Test error".to_string())).await;
+
+        console.stop().await.unwrap();
+        runtime.shutdown_all().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_console_actor_handles_print_progress_message() {
+        let mut runtime = ActonApp::launch();
+        let console = Console::spawn(&mut runtime).await.unwrap();
+
+        console.send(PrintProgress("Test progress".to_string())).await;
+
+        console.stop().await.unwrap();
+        runtime.shutdown_all().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_console_actor_handles_print_warning_message() {
+        let mut runtime = ActonApp::launch();
+        let console = Console::spawn(&mut runtime).await.unwrap();
+
+        console.send(PrintWarning("Test warning".to_string())).await;
+
+        console.stop().await.unwrap();
+        runtime.shutdown_all().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_console_actor_handles_print_separator_message() {
+        let mut runtime = ActonApp::launch();
+        let console = Console::spawn(&mut runtime).await.unwrap();
+
+        console.send(PrintSeparator).await;
+
+        console.stop().await.unwrap();
+        runtime.shutdown_all().await.unwrap();
     }
 }

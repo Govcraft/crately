@@ -15,8 +15,13 @@ use std::sync::Arc;
 use tracing::{debug, error, info};
 
 use crate::{
-    Console, config::ConfigManager, console, crate_downloader::CrateDownloader, messages::Init,
-    request::CrateRequest, response::CrateResponse,
+    Console,
+    config::ConfigManager,
+    console::{PrintError, PrintProgress, PrintSuccess},
+    crate_downloader::CrateDownloader,
+    messages::Init,
+    request::CrateRequest,
+    response::CrateResponse,
 };
 
 /// Shared application state containing the acton-reactive runtime
@@ -26,6 +31,8 @@ struct AppState {
     acton_runtime: Arc<AgentRuntime>,
     /// Handle to the configuration manager actor
     config_manager: AgentHandle,
+    /// Handle to the console actor for output formatting
+    console: AgentHandle,
 }
 
 /// Handle HTTP POST requests to the /crate endpoint
@@ -125,7 +132,12 @@ pub async fn run() -> Result<()> {
     console.send(Init).await;
 
     // Print startup banner and logging confirmation
-    console::print_success(&format!("Logging initialized → {}", log_dir.display()));
+    console
+        .send(PrintSuccess(format!(
+            "Logging initialized → {}",
+            log_dir.display()
+        )))
+        .await;
 
     // Create and start the ConfigManager actor (it loads its own configuration)
     debug!("Creating ConfigManager actor");
@@ -140,6 +152,7 @@ pub async fn run() -> Result<()> {
     let app_state = AppState {
         acton_runtime: Arc::new(acton_runtime),
         config_manager: config_manager.clone(),
+        console: console.clone(),
     };
 
     // Build our application with routes and state
@@ -155,7 +168,10 @@ pub async fn run() -> Result<()> {
         Ok(l) => l,
         Err(e) => {
             eprintln!();
-            console::print_error("Failed to start server");
+            app_state
+                .console
+                .send(PrintError("Failed to start server".to_string()))
+                .await;
             eprintln!("  Reason: {}", e);
             eprintln!("  Action: Check if port {} is already in use", addr.port());
             eprintln!(
@@ -167,7 +183,10 @@ pub async fn run() -> Result<()> {
         }
     };
 
-    console::print_success(&format!("Server listening → http://{}", addr));
+    app_state
+        .console
+        .send(PrintSuccess(format!("Server listening → http://{}", addr)))
+        .await;
     eprintln!();
     eprintln!("Press Ctrl+C to shutdown gracefully");
     eprintln!();
@@ -177,7 +196,10 @@ pub async fn run() -> Result<()> {
         .await
     {
         eprintln!();
-        console::print_error("Server error during execution");
+        app_state
+            .console
+            .send(PrintError("Server error during execution".to_string()))
+            .await;
         eprintln!("  Reason: {}", e);
         eprintln!(
             "  Logs: {}/crately.{}",
@@ -191,8 +213,14 @@ pub async fn run() -> Result<()> {
 
     // Clear the ^C that the terminal printed and move to start of line
     eprint!("\r");
-    console::print_progress("Shutting down gracefully...");
-    console::print_success("Server stopped");
+    app_state
+        .console
+        .send(PrintProgress("Shutting down gracefully...".to_string()))
+        .await;
+    app_state
+        .console
+        .send(PrintSuccess("Server stopped".to_string()))
+        .await;
 
     // Shutdown sequence: stop individual actors first, then shutdown runtime
     info!("Initiating graceful shutdown sequence");
@@ -202,7 +230,10 @@ pub async fn run() -> Result<()> {
     match crate_downloader_handle.stop().await {
         Ok(()) => {
             info!("CrateDownloader actor stopped successfully");
-            console::print_success("CrateDownloader actor stopped");
+            app_state
+                .console
+                .send(PrintSuccess("CrateDownloader actor stopped".to_string()))
+                .await;
         }
         Err(e) => {
             error!("Failed to stop CrateDownloader actor: {:?}", e);
@@ -214,20 +245,33 @@ pub async fn run() -> Result<()> {
     match app_state.config_manager.stop().await {
         Ok(()) => {
             info!("ConfigManager actor stopped successfully");
-            console::print_success("ConfigManager actor stopped");
+            app_state
+                .console
+                .send(PrintSuccess("ConfigManager actor stopped".to_string()))
+                .await;
         }
         Err(e) => {
             error!("Failed to stop ConfigManager actor: {:?}", e);
         }
     }
 
-    // Step 2: Shutdown the acton-reactive runtime
+    // Step 2: Stop the Console actor before shutting down runtime
+    debug!("Stopping Console actor");
+    match app_state.console.stop().await {
+        Ok(()) => {
+            info!("Console actor stopped successfully");
+        }
+        Err(e) => {
+            error!("Failed to stop Console actor: {:?}", e);
+        }
+    }
+
+    // Step 3: Shutdown the acton-reactive runtime
     debug!("Shutting down acton-reactive runtime");
     match Arc::try_unwrap(app_state.acton_runtime) {
         Ok(mut runtime) => match runtime.shutdown_all().await {
             Ok(()) => {
                 info!("Acton-reactive runtime shut down successfully");
-                console::print_success("Runtime terminated");
             }
             Err(e) => {
                 error!("Failed to shut down acton-reactive runtime: {:?}", e);
