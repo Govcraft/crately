@@ -116,10 +116,6 @@ impl Console {
                     message.config_path.display()
                 ));
                 AgentReply::immediate()
-            })
-            .after_start(|_actor| {
-                print_success("Runtime initialized");
-                AgentReply::immediate()
             });
 
         // Subscribe to ConfigLoaded messages before starting

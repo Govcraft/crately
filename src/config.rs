@@ -234,9 +234,8 @@ impl ConfigManager {
         })?;
 
         // Create agent configuration
-        let agent_config =
-            AgentConfig::new(Ern::with_root("config_manager").unwrap(), None, None)
-                .context("Failed to create ConfigManager agent configuration")?;
+        let agent_config = AgentConfig::new(Ern::with_root("config_manager").unwrap(), None, None)
+            .context("Failed to create ConfigManager agent configuration")?;
 
         // Create the ConfigManager model with the loaded configuration
         let config_manager = ConfigManager {
@@ -246,7 +245,9 @@ impl ConfigManager {
 
         // Create agent builder - we need to manually construct this
         // since we have a non-default initial state
-        let mut builder = runtime.new_agent_with_config::<ConfigManager>(agent_config).await;
+        let mut builder = runtime
+            .new_agent_with_config::<ConfigManager>(agent_config)
+            .await;
 
         // Override the default model with our initialized one
         // This happens before .start() is called, so we can set it directly
@@ -293,7 +294,10 @@ impl ConfigManager {
 
         // Add lifecycle hook to log configuration on startup and broadcast ConfigLoaded
         builder.after_start(|agent| {
-            info!("Configuration loaded from: {}", agent.model.config_path.display());
+            info!(
+                "Configuration loaded from: {}",
+                agent.model.config_path.display()
+            );
             info!("Server port configured: {}", agent.model.config.port);
 
             // Broadcast ConfigLoaded message to subscribers

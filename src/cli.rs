@@ -256,8 +256,8 @@ mod tests {
 
     #[test]
     fn test_cli_doctor_verbose_flag() {
-        let cli = Cli::try_parse_from(["crately", "doctor", "--verbose"])
-            .expect("Failed to parse CLI");
+        let cli =
+            Cli::try_parse_from(["crately", "doctor", "--verbose"]).expect("Failed to parse CLI");
         match cli.command {
             Commands::Doctor(args) => {
                 assert!(args.verbose, "verbose should be true");
@@ -269,8 +269,7 @@ mod tests {
 
     #[test]
     fn test_cli_doctor_fix_flag() {
-        let cli =
-            Cli::try_parse_from(["crately", "doctor", "--fix"]).expect("Failed to parse CLI");
+        let cli = Cli::try_parse_from(["crately", "doctor", "--fix"]).expect("Failed to parse CLI");
         match cli.command {
             Commands::Doctor(args) => {
                 assert!(!args.verbose, "verbose should be false");
@@ -295,8 +294,8 @@ mod tests {
 
     #[test]
     fn test_cli_doctor_short_flags() {
-        let cli = Cli::try_parse_from(["crately", "doctor", "-v", "-f"])
-            .expect("Failed to parse CLI");
+        let cli =
+            Cli::try_parse_from(["crately", "doctor", "-v", "-f"]).expect("Failed to parse CLI");
         match cli.command {
             Commands::Doctor(args) => {
                 assert!(args.verbose, "verbose should be true with -v");
@@ -402,8 +401,7 @@ mod tests {
 
     #[test]
     fn test_cache_stats_command() {
-        let cli =
-            Cli::try_parse_from(["crately", "cache", "stats"]).expect("Failed to parse CLI");
+        let cli = Cli::try_parse_from(["crately", "cache", "stats"]).expect("Failed to parse CLI");
         match cli.command {
             Commands::Cache(args) => match args.command {
                 CacheCommands::Stats => {}
@@ -420,10 +418,7 @@ mod tests {
         match cli.command {
             Commands::Cache(args) => match args.command {
                 CacheCommands::Clean(clean_args) => {
-                    assert_eq!(
-                        clean_args.older_than, "30d",
-                        "older_than should be '30d'"
-                    );
+                    assert_eq!(clean_args.older_than, "30d", "older_than should be '30d'");
                 }
                 _ => panic!("Expected Clean subcommand"),
             },
@@ -462,16 +457,13 @@ mod tests {
 
     #[test]
     fn test_cache_clear_with_all_flag() {
-        let cli = Cli::try_parse_from(["crately", "cache", "clear", "--all"])
-            .expect("Failed to parse");
+        let cli =
+            Cli::try_parse_from(["crately", "cache", "clear", "--all"]).expect("Failed to parse");
         match cli.command {
             Commands::Cache(args) => match args.command {
                 CacheCommands::Clear(clear_args) => {
                     assert!(clear_args.all, "all should be true");
-                    assert_eq!(
-                        clear_args.crate_spec, None,
-                        "crate_spec should be None"
-                    );
+                    assert_eq!(clear_args.crate_spec, None, "crate_spec should be None");
                 }
                 _ => panic!("Expected Clear subcommand"),
             },
@@ -494,10 +486,7 @@ mod tests {
         match cli.command {
             Commands::Cache(args) => match args.command {
                 CacheCommands::Clear(clear_args) => {
-                    assert_eq!(
-                        clear_args.crate_spec, None,
-                        "crate_spec should be None"
-                    );
+                    assert_eq!(clear_args.crate_spec, None, "crate_spec should be None");
                     assert!(!clear_args.all, "all should be false");
                 }
                 _ => panic!("Expected Clear subcommand"),
@@ -571,8 +560,8 @@ mod tests {
 
     #[test]
     fn test_batch_with_single_crate() {
-        let cli = Cli::try_parse_from(["crately", "batch", "serde@1.0.0"])
-            .expect("Failed to parse");
+        let cli =
+            Cli::try_parse_from(["crately", "batch", "serde@1.0.0"]).expect("Failed to parse");
         match cli.command {
             Commands::Batch(args) => {
                 assert_eq!(args.crates.len(), 1, "should have 1 crate specifier");
@@ -602,9 +591,8 @@ mod tests {
 
     #[test]
     fn test_batch_with_parallel_flag() {
-        let cli =
-            Cli::try_parse_from(["crately", "batch", "--parallel", "4", "serde@1.0.0"])
-                .expect("Failed to parse");
+        let cli = Cli::try_parse_from(["crately", "batch", "--parallel", "4", "serde@1.0.0"])
+            .expect("Failed to parse");
         match cli.command {
             Commands::Batch(args) => {
                 assert_eq!(args.crates.len(), 1);
@@ -640,13 +628,8 @@ mod tests {
 
     #[test]
     fn test_batch_rejects_crates_and_from() {
-        let result = Cli::try_parse_from([
-            "crately",
-            "batch",
-            "serde@1.0.0",
-            "--from",
-            "Cargo.toml",
-        ]);
+        let result =
+            Cli::try_parse_from(["crately", "batch", "serde@1.0.0", "--from", "Cargo.toml"]);
         assert!(
             result.is_err(),
             "Batch should reject both crates and --from"
@@ -680,8 +663,8 @@ mod tests {
 
     #[test]
     fn test_warm_with_parallel_flag() {
-        let cli = Cli::try_parse_from(["crately", "warm", "--parallel", "6"])
-            .expect("Failed to parse");
+        let cli =
+            Cli::try_parse_from(["crately", "warm", "--parallel", "6"]).expect("Failed to parse");
         match cli.command {
             Commands::Warm(args) => {
                 assert!(!args.popular, "popular should be false");
@@ -730,8 +713,8 @@ mod tests {
 
     #[test]
     fn test_warm_parallel_accepts_positive_numbers() {
-        let cli = Cli::try_parse_from(["crately", "warm", "--parallel", "50"])
-            .expect("Failed to parse");
+        let cli =
+            Cli::try_parse_from(["crately", "warm", "--parallel", "50"]).expect("Failed to parse");
         match cli.command {
             Commands::Warm(args) => {
                 assert_eq!(args.parallel, Some(50), "parallel should be 50");

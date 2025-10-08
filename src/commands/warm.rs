@@ -108,10 +108,7 @@ mod tests {
             parallel: Some(12),
         };
         let result = run(args);
-        assert!(
-            result.is_ok(),
-            "Warm with both flags should succeed"
-        );
+        assert!(result.is_ok(), "Warm with both flags should succeed");
     }
 
     #[test]
@@ -131,10 +128,7 @@ mod tests {
             parallel: Some(100),
         };
         let result = run(args);
-        assert!(
-            result.is_ok(),
-            "Warm with high parallelism should succeed"
-        );
+        assert!(result.is_ok(), "Warm with high parallelism should succeed");
     }
 
     #[test]
@@ -144,10 +138,7 @@ mod tests {
             parallel: Some(1),
         };
         let result = run(args);
-        assert!(
-            result.is_ok(),
-            "Warm with low parallelism should succeed"
-        );
+        assert!(result.is_ok(), "Warm with low parallelism should succeed");
     }
 
     #[test]
@@ -157,9 +148,6 @@ mod tests {
             parallel: None,
         };
         let result = run(args);
-        assert!(
-            result.is_ok(),
-            "Warm with default behavior should succeed"
-        );
+        assert!(result.is_ok(), "Warm with default behavior should succeed");
     }
 }

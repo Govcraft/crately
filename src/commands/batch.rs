@@ -117,10 +117,7 @@ mod tests {
             parallel: None,
         };
         let result = run(args);
-        assert!(
-            result.is_ok(),
-            "Batch with multiple crates should succeed"
-        );
+        assert!(result.is_ok(), "Batch with multiple crates should succeed");
     }
 
     #[test]
@@ -131,10 +128,7 @@ mod tests {
             parallel: Some(4),
         };
         let result = run(args);
-        assert!(
-            result.is_ok(),
-            "Batch with parallel flag should succeed"
-        );
+        assert!(result.is_ok(), "Batch with parallel flag should succeed");
     }
 
     #[test]
@@ -195,9 +189,6 @@ mod tests {
             parallel: Some(100),
         };
         let result = run(args);
-        assert!(
-            result.is_ok(),
-            "Batch with high parallelism should succeed"
-        );
+        assert!(result.is_ok(), "Batch with high parallelism should succeed");
     }
 }

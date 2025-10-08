@@ -90,7 +90,10 @@ mod tests {
             no_interactive: false,
         };
         let result = run(args);
-        assert!(result.is_ok(), "Init command should succeed in interactive mode");
+        assert!(
+            result.is_ok(),
+            "Init command should succeed in interactive mode"
+        );
     }
 
     #[test]

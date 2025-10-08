@@ -5,9 +5,9 @@
 use acton_reactive::prelude::*;
 use anyhow::Result;
 use axum::{
+    Router,
     extract::{Json, State},
     routing::post,
-    Router,
 };
 use chrono::Local;
 use std::net::SocketAddr;
@@ -15,13 +15,8 @@ use std::sync::Arc;
 use tracing::{debug, error, info};
 
 use crate::{
-    config::ConfigManager,
-    console,
-    crate_downloader::CrateDownloader,
-    messages::Init,
-    request::CrateRequest,
-    response::CrateResponse,
-    Console,
+    Console, config::ConfigManager, console, crate_downloader::CrateDownloader, messages::Init,
+    request::CrateRequest, response::CrateResponse,
 };
 
 /// Shared application state containing the acton-reactive runtime
@@ -136,12 +131,9 @@ pub async fn run() -> Result<()> {
     debug!("Creating ConfigManager actor");
     let (config_manager, config) = ConfigManager::spawn(&mut acton_runtime).await?;
 
-    // Create and start the CrateDownloader actor
-    debug!("Creating CrateDownloader actor");
-    let crate_downloader = acton_runtime.new_agent::<CrateDownloader>().await;
-
-    debug!("Starting CrateDownloader actor");
-    let crate_downloader_handle = crate_downloader.start().await;
+    // Create and start the CrateDownloader actor using spawn pattern
+    debug!("Creating and starting CrateDownloader actor");
+    let crate_downloader_handle = CrateDownloader::spawn(&mut acton_runtime).await?;
     info!("CrateDownloader actor started successfully");
 
     // Create shared application state

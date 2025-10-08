@@ -153,7 +153,10 @@ fn handle_clean(args: CleanArgs, dry_run: bool, json: bool) -> Result<()> {
         println!();
 
         if dry_run {
-            println!("[DRY RUN] Would remove 0 cache entries older than {}", older_than);
+            println!(
+                "[DRY RUN] Would remove 0 cache entries older than {}",
+                older_than
+            );
         } else {
             println!("Removed 0 cache entries");
         }
@@ -372,10 +375,7 @@ mod tests {
             all: true,
         };
         let result = handle_clear(args, false, false);
-        assert!(
-            result.is_ok(),
-            "Clear command with --all should succeed"
-        );
+        assert!(result.is_ok(), "Clear command with --all should succeed");
     }
 
     #[test]
@@ -474,10 +474,7 @@ mod tests {
             json: false,
         };
         let result = run(args);
-        assert!(
-            result.is_ok(),
-            "Run with dry-run flag should succeed"
-        );
+        assert!(result.is_ok(), "Run with dry-run flag should succeed");
     }
 
     #[test]
@@ -502,9 +499,6 @@ mod tests {
             json: true,
         };
         let result = run(args);
-        assert!(
-            result.is_ok(),
-            "Run with both flags should succeed"
-        );
+        assert!(result.is_ok(), "Run with both flags should succeed");
     }
 }
