@@ -54,6 +54,18 @@ pub enum Commands {
     /// Launches the HTTP server to process crate documentation requests
     /// and provide semantic search capabilities.
     Serve,
+
+    /// Process multiple crates in batch
+    ///
+    /// Accepts multiple crate specifiers and processes them with configurable
+    /// parallelism. Can also process all dependencies from a manifest file.
+    Batch(BatchArgs),
+
+    /// Pre-populate cache with popular crates
+    ///
+    /// Warms the cache by processing commonly used crates to improve
+    /// query performance for popular dependencies.
+    Warm(WarmArgs),
 }
 
 /// Arguments for the doctor subcommand
@@ -180,6 +192,50 @@ pub struct ClearArgs {
     /// Cannot be used together with a specific crate argument.
     #[arg(long, conflicts_with = "crate_spec")]
     pub all: bool,
+}
+
+/// Arguments for the batch subcommand
+#[derive(Parser, Debug)]
+pub struct BatchArgs {
+    /// Crate specifiers to process
+    ///
+    /// Format: name@version (e.g., serde@^1.0 tokio@1.35)
+    /// Multiple crates can be specified as space-separated arguments.
+    #[arg(value_name = "CRATES")]
+    pub crates: Vec<String>,
+
+    /// Process all dependencies from a manifest file
+    ///
+    /// Reads dependencies from the specified file (e.g., Cargo.toml)
+    /// and processes all listed crates. Cannot be used with positional
+    /// crate arguments.
+    #[arg(long, value_name = "FILE", conflicts_with = "crates")]
+    pub from: Option<String>,
+
+    /// Number of concurrent processing tasks
+    ///
+    /// Controls how many crates are processed in parallel.
+    /// Default is determined by system capabilities.
+    #[arg(long, value_name = "N")]
+    pub parallel: Option<usize>,
+}
+
+/// Arguments for the warm subcommand
+#[derive(Parser, Debug)]
+pub struct WarmArgs {
+    /// Warm cache with popular crates
+    ///
+    /// When enabled, processes a curated list of commonly used crates
+    /// to pre-populate the cache for better query performance.
+    #[arg(long)]
+    pub popular: bool,
+
+    /// Number of concurrent processing tasks
+    ///
+    /// Controls how many crates are processed in parallel.
+    /// Default is determined by system capabilities.
+    #[arg(long, value_name = "N")]
+    pub parallel: Option<usize>,
 }
 
 #[cfg(test)]
@@ -487,6 +543,200 @@ mod tests {
                 }
             }
             _ => panic!("Expected Cache command"),
+        }
+    }
+
+    #[test]
+    fn test_batch_with_multiple_crates() {
+        let cli = Cli::try_parse_from([
+            "crately",
+            "batch",
+            "serde@^1.0",
+            "tokio@1.35",
+            "actix-web@4.4",
+        ])
+        .expect("Failed to parse");
+        match cli.command {
+            Commands::Batch(args) => {
+                assert_eq!(args.crates.len(), 3, "should have 3 crate specifiers");
+                assert_eq!(args.crates[0], "serde@^1.0");
+                assert_eq!(args.crates[1], "tokio@1.35");
+                assert_eq!(args.crates[2], "actix-web@4.4");
+                assert_eq!(args.from, None, "from should be None");
+                assert_eq!(args.parallel, None, "parallel should be None");
+            }
+            _ => panic!("Expected Batch command"),
+        }
+    }
+
+    #[test]
+    fn test_batch_with_single_crate() {
+        let cli = Cli::try_parse_from(["crately", "batch", "serde@1.0.0"])
+            .expect("Failed to parse");
+        match cli.command {
+            Commands::Batch(args) => {
+                assert_eq!(args.crates.len(), 1, "should have 1 crate specifier");
+                assert_eq!(args.crates[0], "serde@1.0.0");
+            }
+            _ => panic!("Expected Batch command"),
+        }
+    }
+
+    #[test]
+    fn test_batch_with_from_flag() {
+        let cli = Cli::try_parse_from(["crately", "batch", "--from", "Cargo.toml"])
+            .expect("Failed to parse");
+        match cli.command {
+            Commands::Batch(args) => {
+                assert_eq!(args.crates.len(), 0, "crates should be empty");
+                assert_eq!(
+                    args.from,
+                    Some("Cargo.toml".to_string()),
+                    "from should be Cargo.toml"
+                );
+                assert_eq!(args.parallel, None, "parallel should be None");
+            }
+            _ => panic!("Expected Batch command"),
+        }
+    }
+
+    #[test]
+    fn test_batch_with_parallel_flag() {
+        let cli =
+            Cli::try_parse_from(["crately", "batch", "--parallel", "4", "serde@1.0.0"])
+                .expect("Failed to parse");
+        match cli.command {
+            Commands::Batch(args) => {
+                assert_eq!(args.crates.len(), 1);
+                assert_eq!(args.parallel, Some(4), "parallel should be 4");
+            }
+            _ => panic!("Expected Batch command"),
+        }
+    }
+
+    #[test]
+    fn test_batch_with_from_and_parallel() {
+        let cli = Cli::try_parse_from([
+            "crately",
+            "batch",
+            "--from",
+            "Cargo.toml",
+            "--parallel",
+            "8",
+        ])
+        .expect("Failed to parse");
+        match cli.command {
+            Commands::Batch(args) => {
+                assert_eq!(
+                    args.from,
+                    Some("Cargo.toml".to_string()),
+                    "from should be Cargo.toml"
+                );
+                assert_eq!(args.parallel, Some(8), "parallel should be 8");
+            }
+            _ => panic!("Expected Batch command"),
+        }
+    }
+
+    #[test]
+    fn test_batch_rejects_crates_and_from() {
+        let result = Cli::try_parse_from([
+            "crately",
+            "batch",
+            "serde@1.0.0",
+            "--from",
+            "Cargo.toml",
+        ]);
+        assert!(
+            result.is_err(),
+            "Batch should reject both crates and --from"
+        );
+    }
+
+    #[test]
+    fn test_batch_allows_no_arguments() {
+        let cli = Cli::try_parse_from(["crately", "batch"]).expect("Failed to parse");
+        match cli.command {
+            Commands::Batch(args) => {
+                assert_eq!(args.crates.len(), 0, "crates should be empty");
+                assert_eq!(args.from, None, "from should be None");
+                assert_eq!(args.parallel, None, "parallel should be None");
+            }
+            _ => panic!("Expected Batch command"),
+        }
+    }
+
+    #[test]
+    fn test_warm_with_popular_flag() {
+        let cli = Cli::try_parse_from(["crately", "warm", "--popular"]).expect("Failed to parse");
+        match cli.command {
+            Commands::Warm(args) => {
+                assert!(args.popular, "popular should be true");
+                assert_eq!(args.parallel, None, "parallel should be None");
+            }
+            _ => panic!("Expected Warm command"),
+        }
+    }
+
+    #[test]
+    fn test_warm_with_parallel_flag() {
+        let cli = Cli::try_parse_from(["crately", "warm", "--parallel", "6"])
+            .expect("Failed to parse");
+        match cli.command {
+            Commands::Warm(args) => {
+                assert!(!args.popular, "popular should be false");
+                assert_eq!(args.parallel, Some(6), "parallel should be 6");
+            }
+            _ => panic!("Expected Warm command"),
+        }
+    }
+
+    #[test]
+    fn test_warm_with_both_flags() {
+        let cli = Cli::try_parse_from(["crately", "warm", "--popular", "--parallel", "12"])
+            .expect("Failed to parse");
+        match cli.command {
+            Commands::Warm(args) => {
+                assert!(args.popular, "popular should be true");
+                assert_eq!(args.parallel, Some(12), "parallel should be 12");
+            }
+            _ => panic!("Expected Warm command"),
+        }
+    }
+
+    #[test]
+    fn test_warm_with_no_flags() {
+        let cli = Cli::try_parse_from(["crately", "warm"]).expect("Failed to parse");
+        match cli.command {
+            Commands::Warm(args) => {
+                assert!(!args.popular, "popular should default to false");
+                assert_eq!(args.parallel, None, "parallel should be None");
+            }
+            _ => panic!("Expected Warm command"),
+        }
+    }
+
+    #[test]
+    fn test_batch_parallel_accepts_positive_numbers() {
+        let cli = Cli::try_parse_from(["crately", "batch", "--parallel", "100"])
+            .expect("Failed to parse");
+        match cli.command {
+            Commands::Batch(args) => {
+                assert_eq!(args.parallel, Some(100), "parallel should be 100");
+            }
+            _ => panic!("Expected Batch command"),
+        }
+    }
+
+    #[test]
+    fn test_warm_parallel_accepts_positive_numbers() {
+        let cli = Cli::try_parse_from(["crately", "warm", "--parallel", "50"])
+            .expect("Failed to parse");
+        match cli.command {
+            Commands::Warm(args) => {
+                assert_eq!(args.parallel, Some(50), "parallel should be 50");
+            }
+            _ => panic!("Expected Warm command"),
         }
     }
 }

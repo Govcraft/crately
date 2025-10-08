@@ -37,6 +37,14 @@ async fn main() -> anyhow::Result<()> {
             // Run the serve command
             commands::serve::run().await?;
         }
+        Commands::Batch(args) => {
+            // Run the batch command
+            commands::batch::run(args)?;
+        }
+        Commands::Warm(args) => {
+            // Run the warm command
+            commands::warm::run(args)?;
+        }
     }
 
     Ok(())
