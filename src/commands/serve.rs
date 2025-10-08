@@ -134,24 +134,7 @@ pub async fn run() -> Result<()> {
 
     // Create and start the ConfigManager actor (it loads its own configuration)
     debug!("Creating ConfigManager actor");
-    let (config_manager, config) = match ConfigManager::spawn(&mut acton_runtime).await {
-        Ok((handle, cfg)) => {
-            console::print_success("ConfigManager actor initialized");
-            (handle, cfg)
-        }
-        Err(e) => {
-            eprintln!();
-            console::print_error("Failed to initialize ConfigManager");
-            eprintln!("  Reason: {}", e);
-            eprintln!("  Action: Check XDG_CONFIG_HOME and file permissions");
-            eprintln!(
-                "  Logs: {}/crately.{}",
-                log_dir.display(),
-                Local::now().format("%Y-%m-%d")
-            );
-            std::process::exit(1);
-        }
-    };
+    let (config_manager, config) = ConfigManager::spawn(&mut acton_runtime).await?;
 
     // Create and start the CrateDownloader actor
     debug!("Creating CrateDownloader actor");
@@ -160,7 +143,6 @@ pub async fn run() -> Result<()> {
     debug!("Starting CrateDownloader actor");
     let crate_downloader_handle = crate_downloader.start().await;
     info!("CrateDownloader actor started successfully");
-    console::print_success("Actor system ready (2 agents)");
 
     // Create shared application state
     let app_state = AppState {

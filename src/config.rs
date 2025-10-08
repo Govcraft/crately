@@ -214,13 +214,29 @@ impl ConfigManager {
     /// ```
     #[instrument(skip(runtime))]
     pub async fn spawn(runtime: &mut AgentRuntime) -> anyhow::Result<(AgentHandle, Config)> {
-        // Load configuration internally
-        let (config, config_path) = load_config_internal()
-            .map_err(|e| anyhow::anyhow!("Failed to load configuration: {}", e))?;
+        use anyhow::Context;
+
+        // Load configuration internally with rich error context
+        let (config, config_path) = load_config_internal().with_context(|| {
+            let config_path = get_config_path().ok().map(|p| p.display().to_string())
+                .unwrap_or_else(|| "<unknown>".to_string());
+            format!(
+                "Failed to load configuration from {}\n\
+                 \n\
+                 Possible causes:\n\
+                 - XDG_CONFIG_HOME environment variable is not set or invalid\n\
+                 - Configuration file has invalid TOML syntax\n\
+                 - Insufficient permissions to read config file or create config directory\n\
+                 \n\
+                 Expected location: $XDG_CONFIG_HOME/crately/config.toml (usually ~/.config/crately/config.toml)",
+                config_path
+            )
+        })?;
 
         // Create agent configuration
         let agent_config =
-            AgentConfig::new(Ern::with_root("config_manager").unwrap(), None, None)?;
+            AgentConfig::new(Ern::with_root("config_manager").unwrap(), None, None)
+                .context("Failed to create ConfigManager agent configuration")?;
 
         // Create the ConfigManager model with the loaded configuration
         let config_manager = ConfigManager {
