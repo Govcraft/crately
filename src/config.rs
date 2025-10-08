@@ -4,12 +4,14 @@
 //! Specification. The configuration file is stored at `$XDG_CONFIG_HOME/crately/config.toml`
 //! (typically `~/.config/crately/config.toml`).
 //!
-//! The configuration is loaded at startup, with automatic creation of default configuration
-//! if the file does not exist.
+//! The configuration is managed by a `ConfigManager` actor that loads configuration at startup
+//! and provides query and reload capabilities through message passing.
 
+use acton_reactive::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
+use tracing::*;
 use xdg::BaseDirectories;
 
 /// Application configuration structure
@@ -33,6 +35,29 @@ impl Default for Config {
 
 fn default_port() -> u16 {
     3000
+}
+
+/// Message types for ConfigManager actor communication
+/// Request to get the current configuration
+#[acton_actor]
+pub struct GetConfig;
+
+/// Broadcast message when configuration has been loaded
+#[acton_actor]
+pub struct ConfigLoaded {
+    pub config_path: PathBuf,
+}
+
+/// Request to reload configuration from disk
+#[acton_actor]
+pub struct ReloadConfig;
+
+/// Response containing the current configuration and its path
+#[acton_actor]
+#[allow(dead_code)] // Used by subscribers via message passing
+pub struct ConfigResponse {
+    pub config: Config,
+    pub config_path: PathBuf,
 }
 
 /// Error types that can occur during configuration operations
@@ -121,34 +146,145 @@ fn ensure_config_directory_exists(config_path: &Path) -> Result<(), ConfigError>
     Ok(())
 }
 
-/// Loads configuration from the XDG-compliant config file
+/// ConfigManager agent that manages application configuration
 ///
-/// This function attempts to load configuration from `$XDG_CONFIG_HOME/crately/config.toml`.
-/// If the file does not exist, it creates a default configuration file and returns the
-/// default configuration.
+/// This actor loads configuration from the XDG-compliant config file at startup
+/// and provides query and reload capabilities through message passing.
+#[acton_actor]
+pub struct ConfigManager {
+    config: Config,
+    config_path: PathBuf,
+}
+
+impl ConfigManager {
+    /// Creates, configures, and starts a new ConfigManager agent
+    ///
+    /// The agent loads configuration from the XDG-compliant config file
+    /// and provides query and reload capabilities through message passing.
+    ///
+    /// # Arguments
+    ///
+    /// * `runtime` - Mutable reference to the acton-reactive runtime
+    ///
+    /// # Returns
+    ///
+    /// Returns a tuple containing:
+    /// - The started ConfigManager agent handle
+    /// - The loaded configuration (for immediate use during startup)
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if configuration loading or agent creation fails.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// use acton_reactive::prelude::*;
+    /// use crately::config::ConfigManager;
+    ///
+    /// #[tokio::main]
+    /// async fn main() -> anyhow::Result<()> {
+    ///     let mut runtime = ActonApp::launch();
+    ///     let (config_manager, config) = ConfigManager::new(&mut runtime).await?;
+    ///
+    ///     // Use config immediately for startup
+    ///     println!("Server port: {}", config.port);
+    ///
+    ///     // Query configuration using GetConfig message for updates
+    ///     config_manager.send(GetConfig).await;
+    ///
+    ///     runtime.shutdown_all().await?;
+    ///     Ok(())
+    /// }
+    /// ```
+    #[allow(clippy::new_ret_no_self)] // Returns (AgentHandle, Config), standard pattern for actor creation
+    #[instrument(skip(runtime))]
+    pub async fn new(runtime: &mut AgentRuntime) -> anyhow::Result<(AgentHandle, Config)> {
+        // Load configuration internally
+        let (config, config_path) = load_config_internal()
+            .map_err(|e| anyhow::anyhow!("Failed to load configuration: {}", e))?;
+
+        // Create agent configuration
+        let agent_config =
+            AgentConfig::new(Ern::with_root("config_manager").unwrap(), None, None)?;
+
+        // Create the ConfigManager model with the loaded configuration
+        let config_manager = ConfigManager {
+            config: config.clone(),
+            config_path: config_path.clone(),
+        };
+
+        // Create agent builder - we need to manually construct this
+        // since we have a non-default initial state
+        let mut builder = runtime.new_agent_with_config::<ConfigManager>(agent_config).await;
+
+        // Override the default model with our initialized one
+        // This happens before .start() is called, so we can set it directly
+        builder.model = config_manager;
+
+        // Handle GetConfig requests
+        builder.mutate_on::<GetConfig>(|agent, _envelope| {
+            let response = ConfigResponse {
+                config: agent.model.config.clone(),
+                config_path: agent.model.config_path.clone(),
+            };
+            let broker = agent.broker().clone();
+
+            AgentReply::from_async(async move {
+                broker.broadcast(response).await;
+            })
+        });
+
+        // Handle ReloadConfig requests
+        builder.mutate_on::<ReloadConfig>(|agent, _envelope| {
+            match load_config_internal() {
+                Ok((new_config, new_config_path)) => {
+                    info!("Configuration reloaded from: {}", new_config_path.display());
+
+                    // Broadcast the new config. The ConfigManager's state remains unchanged,
+                    // but subscribers can update their own state with the new values.
+                    let response = ConfigResponse {
+                        config: new_config,
+                        config_path: new_config_path,
+                    };
+                    let broker = agent.broker().clone();
+
+                    Box::pin(async move {
+                        broker.broadcast(response).await;
+                    })
+                }
+                Err(e) => {
+                    error!("Failed to reload configuration: {}", e);
+                    // Keep existing config on reload failure
+                    AgentReply::immediate()
+                }
+            }
+        });
+
+        // Add lifecycle hook to log configuration on startup and broadcast ConfigLoaded
+        builder.after_start(|agent| {
+            info!("Configuration loaded from: {}", agent.model.config_path.display());
+            info!("Server port configured: {}", agent.model.config.port);
+
+            // Broadcast ConfigLoaded message to subscribers
+            let broker = agent.broker().clone();
+            let config_path = agent.model.config_path.clone();
+
+            AgentReply::from_async(async move {
+                broker.broadcast(ConfigLoaded { config_path }).await;
+            })
+        });
+
+        let handle = builder.start().await;
+        Ok((handle, config))
+    }
+}
+
+/// Internal helper function to load configuration (legacy compatibility)
 ///
-/// # Returns
-///
-/// Returns a tuple of `(Config, PathBuf)` containing:
-/// - The loaded or default `Config`
-/// - The `PathBuf` to the config file for informational purposes
-///
-/// # Errors
-///
-/// Returns `ConfigError` if:
-/// - XDG base directories cannot be determined
-/// - Config directory cannot be created
-/// - Config file cannot be read or written
-/// - TOML parsing or serialization fails
-///
-/// # Example
-///
-/// ```no_run
-/// let (config, config_path) = config::load().expect("Failed to load configuration");
-/// println!("Loaded config from: {}", config_path.display());
-/// println!("Server port: {}", config.port);
-/// ```
-pub fn load() -> Result<(Config, PathBuf), ConfigError> {
+/// This function is kept for backward compatibility and internal use.
+/// New code should use the ConfigManager actor instead.
+fn load_config_internal() -> Result<(Config, PathBuf), ConfigError> {
     let config_path = get_config_path()?;
 
     // Ensure the config directory exists
@@ -165,6 +301,40 @@ pub fn load() -> Result<(Config, PathBuf), ConfigError> {
         save_config(&config_path, &config)?;
         Ok((config, config_path))
     }
+}
+
+/// Loads configuration from the XDG-compliant config file
+///
+/// # Deprecated
+///
+/// This function is deprecated in favor of using the `ConfigManager` actor.
+/// It is kept for backward compatibility but should not be used in new code.
+///
+/// # Example
+///
+/// ```no_run
+/// // Old approach (deprecated):
+/// // let (config, config_path) = config::load().expect("Failed to load configuration");
+///
+/// // New approach (recommended):
+/// use acton_reactive::prelude::*;
+/// use crately::config::ConfigManager;
+///
+/// async fn example() -> anyhow::Result<()> {
+///     let mut runtime = ActonApp::launch();
+///     let (config_manager, config) = ConfigManager::new(&mut runtime).await?;
+///     // Use config immediately for startup
+///     println!("Server port: {}", config.port);
+///     Ok(())
+/// }
+/// ```
+#[deprecated(
+    since = "0.1.0",
+    note = "Use ConfigManager actor instead for better concurrency support"
+)]
+#[allow(dead_code)] // Kept for backward compatibility
+pub fn load() -> Result<(Config, PathBuf), ConfigError> {
+    load_config_internal()
 }
 
 /// Saves the configuration to the specified path

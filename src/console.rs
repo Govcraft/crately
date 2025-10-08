@@ -9,6 +9,7 @@
 
 use acton_reactive::prelude::*;
 
+use crate::config::ConfigLoaded;
 use crate::messages::Init;
 use tracing::info;
 
@@ -59,10 +60,22 @@ impl Console {
                 AgentReply::immediate()
             })
             .act_on::<Init>(|_actor, _context| AgentReply::immediate())
+            .mutate_on::<ConfigLoaded>(|_agent, envelope| {
+                let message = envelope.message();
+                print_success(&format!(
+                    "Configuration loaded {} {}",
+                    PROGRESS,
+                    message.config_path.display()
+                ));
+                AgentReply::immediate()
+            })
             .after_start(|_actor| {
                 print_success("Runtime initialized");
                 AgentReply::immediate()
             });
+
+        // Subscribe to ConfigLoaded messages before starting
+        builder.handle().subscribe::<ConfigLoaded>().await;
 
         Ok(builder.start().await)
     }

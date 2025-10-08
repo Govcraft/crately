@@ -15,8 +15,13 @@ use std::sync::Arc;
 use tracing::{debug, error, info};
 
 use crate::{
-    config, console, crate_downloader::CrateDownloader, messages::Init, request::CrateRequest,
-    response::CrateResponse, Console,
+    config::ConfigManager,
+    console,
+    crate_downloader::CrateDownloader,
+    messages::Init,
+    request::CrateRequest,
+    response::CrateResponse,
+    Console,
 };
 
 /// Shared application state containing the acton-reactive runtime
@@ -24,6 +29,8 @@ use crate::{
 struct AppState {
     /// The acton-reactive runtime for managing reactive agents
     acton_runtime: Arc<AgentRuntime>,
+    /// Handle to the configuration manager actor
+    config_manager: AgentHandle,
 }
 
 /// Handle HTTP POST requests to the /crate endpoint
@@ -125,15 +132,16 @@ pub async fn run() -> Result<()> {
     // Print startup banner and logging confirmation
     console::print_success(&format!("Logging initialized → {}", log_dir.display()));
 
-    // Load configuration
-    let (config, config_path) = match config::load() {
-        Ok((cfg, path)) => {
-            console::print_success(&format!("Configuration loaded → {}", path.display()));
-            (cfg, path)
+    // Create and start the ConfigManager actor (it loads its own configuration)
+    debug!("Creating ConfigManager actor");
+    let (config_manager, config) = match ConfigManager::new(&mut acton_runtime).await {
+        Ok((handle, cfg)) => {
+            console::print_success("ConfigManager actor initialized");
+            (handle, cfg)
         }
         Err(e) => {
             eprintln!();
-            console::print_error("Failed to load configuration");
+            console::print_error("Failed to initialize ConfigManager");
             eprintln!("  Reason: {}", e);
             eprintln!("  Action: Check XDG_CONFIG_HOME and file permissions");
             eprintln!(
@@ -145,11 +153,6 @@ pub async fn run() -> Result<()> {
         }
     };
 
-    // Log session separator for clarity in log files
-    info!("Logging initialized successfully");
-    info!("Configuration loaded from: {}", config_path.display());
-    info!("Server port configured: {}", config.port);
-
     // Create and start the CrateDownloader actor
     debug!("Creating CrateDownloader actor");
     let crate_downloader = acton_runtime.new_agent::<CrateDownloader>().await;
@@ -157,11 +160,12 @@ pub async fn run() -> Result<()> {
     debug!("Starting CrateDownloader actor");
     let crate_downloader_handle = crate_downloader.start().await;
     info!("CrateDownloader actor started successfully");
-    console::print_success("Actor system ready (1 agent)");
+    console::print_success("Actor system ready (2 agents)");
 
     // Create shared application state
     let app_state = AppState {
         acton_runtime: Arc::new(acton_runtime),
+        config_manager: config_manager.clone(),
     };
 
     // Build our application with routes and state
@@ -228,6 +232,18 @@ pub async fn run() -> Result<()> {
         }
         Err(e) => {
             error!("Failed to stop CrateDownloader actor: {:?}", e);
+        }
+    }
+
+    // Step 1.5: Stop the ConfigManager actor
+    debug!("Stopping ConfigManager actor");
+    match app_state.config_manager.stop().await {
+        Ok(()) => {
+            info!("ConfigManager actor stopped successfully");
+            console::print_success("ConfigManager actor stopped");
+        }
+        Err(e) => {
+            error!("Failed to stop ConfigManager actor: {:?}", e);
         }
     }
 
