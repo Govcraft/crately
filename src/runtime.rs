@@ -46,7 +46,7 @@ use crate::{
     console::{Console, PrintSuccess},
     crate_downloader::CrateDownloader,
     keyboard_handler::{KeyboardHandler, StopKeyboardHandler},
-    messages::{Init, StopServer},
+    messages::{Init, KeyPressed, StopServer},
     server_actor::ServerActor,
 };
 
@@ -327,18 +327,60 @@ impl ActorSystem {
     /// This method blocks until one of the following occurs:
     /// - User presses Ctrl+C
     /// - Process receives SIGTERM (Unix only)
-    /// - Keyboard handler broadcasts shutdown signal (requires keyboard_handler actor)
+    /// - User presses 'q' key (only when keyboard handler is active)
+    ///
+    /// # Arguments
+    ///
+    /// * `actor_system` - Reference to the actor system for subscribing to keyboard events
     ///
     /// # Example
     ///
     /// ```no_run
     /// # use crately::runtime::ActorSystem;
-    /// # async fn example() {
-    /// ActorSystem::wait_for_shutdown().await;
+    /// # async fn example(system: &ActorSystem) {
+    /// ActorSystem::wait_for_shutdown(system).await;
     /// println!("Shutdown signal received");
     /// # }
     /// ```
-    pub async fn wait_for_shutdown() {
+    pub async fn wait_for_shutdown(actor_system: &ActorSystem) {
+        use crossterm::event::KeyCode;
+        use tokio::sync::mpsc;
+
+        // Create a channel for keyboard shutdown signal
+        let (shutdown_tx, mut shutdown_rx) = mpsc::channel::<()>(1);
+
+        // Spawn a listener for keyboard 'q' press if keyboard handler exists
+        let keyboard_listener = if actor_system.get_actor("keyboard_handler").is_some() {
+            let mut runtime = ActonApp::launch();
+            let shutdown_tx_clone = shutdown_tx.clone();
+
+            Some(tokio::spawn(async move {
+                // Create a minimal listener actor
+                #[acton_actor]
+                struct ShutdownListener;
+
+                let mut builder = runtime.new_agent::<ShutdownListener>().await;
+                let shutdown_tx = shutdown_tx_clone;
+
+                builder.act_on::<KeyPressed>(move |_agent, envelope| {
+                    let message = envelope.message();
+                    if matches!(message.key, KeyCode::Char('q')) {
+                        info!("Received 'q' key press, initiating graceful shutdown");
+                        let _ = shutdown_tx.try_send(());
+                    }
+                    AgentReply::immediate()
+                });
+
+                let handle = builder.start().await;
+                handle.subscribe::<KeyPressed>().await;
+
+                // Keep the task alive
+                std::future::pending::<()>().await
+            }))
+        } else {
+            None
+        };
+
         let ctrl_c = async {
             tokio::signal::ctrl_c()
                 .await
@@ -363,6 +405,14 @@ impl ActorSystem {
             _ = terminate => {
                 info!("Received termination signal, initiating graceful shutdown");
             },
+            _ = shutdown_rx.recv() => {
+                info!("Received keyboard shutdown signal");
+            },
+        }
+
+        // Clean up the keyboard listener task
+        if let Some(task) = keyboard_listener {
+            task.abort();
         }
     }
 
