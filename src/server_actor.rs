@@ -21,7 +21,7 @@ use tracing::{debug, error, info, warn};
 use crate::{
     config::{Config, ConfigResponse},
     console::{PrintError, PrintProgress, PrintSuccess},
-    messages::{KeyPressed, StartServer, StopServer},
+    messages::{KeyPressed, ServerStarted, StartServer, StopServer},
     request::CrateRequest,
     response::CrateResponse,
 };
@@ -206,6 +206,7 @@ impl ServerActor {
             let config = agent.model.config.clone();
             let actors = Arc::clone(&agent.model.actors);
             let console = actors.get("console").map(|h| h.clone());
+            let broker = agent.broker().clone();
 
             // Create shared application state
             let app_state = AppState { actors };
@@ -242,6 +243,9 @@ impl ServerActor {
                         .send(PrintSuccess(format!("Server listening → http://{}", addr)))
                         .await;
                 }
+
+                // Broadcast ServerStarted event after successful bind
+                broker.broadcast(ServerStarted).await;
 
                 let server = axum::serve(listener, app).with_graceful_shutdown(async move {
                     let _ = shutdown_rx.await;

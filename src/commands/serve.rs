@@ -49,12 +49,6 @@ pub async fn run(mut actor_system: ActorSystem) -> Result<()> {
 
     server.send(StartServer).await;
 
-    // Display user instructions
-    eprintln!();
-    eprintln!("Server is running. Press 'q' or Ctrl+C to shutdown gracefully");
-    eprintln!("Press 'r' to reload configuration");
-    eprintln!();
-
     // Wait for shutdown signal (Ctrl+C, SIGTERM, or keyboard 'q')
     ActorSystem::wait_for_shutdown().await;
 

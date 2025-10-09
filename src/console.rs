@@ -10,7 +10,7 @@
 use acton_reactive::prelude::*;
 
 use crate::config::ConfigLoaded;
-use crate::messages::Init;
+use crate::messages::{Init, ServerStarted};
 use tracing::info;
 
 /// Success symbol (✓)
@@ -160,10 +160,18 @@ impl Console {
                     message.config_path.display()
                 ));
                 AgentReply::immediate()
+            })
+            .act_on::<ServerStarted>(|_actor, _envelope| {
+                eprintln!();
+                eprintln!("Server is running. Press 'q' or Ctrl+C to shutdown gracefully");
+                eprintln!("Press 'r' to reload configuration");
+                eprintln!();
+                AgentReply::immediate()
             });
 
-        // Subscribe to ConfigLoaded messages before starting
+        // Subscribe to broadcast messages before starting
         builder.handle().subscribe::<ConfigLoaded>().await;
+        builder.handle().subscribe::<ServerStarted>().await;
 
         Ok(builder.start().await)
     }
