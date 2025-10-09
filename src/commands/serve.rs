@@ -50,7 +50,7 @@ pub async fn run(mut actor_system: ActorSystem) -> Result<()> {
     server.send(StartServer).await;
 
     // Wait for shutdown signal (Ctrl+C, SIGTERM, or keyboard 'q')
-    ActorSystem::wait_for_shutdown(&actor_system).await;
+    ActorSystem::wait_for_shutdown(&mut actor_system).await;
 
     info!("Serve command completed");
 

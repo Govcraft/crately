@@ -329,54 +329,57 @@ impl ActorSystem {
     /// - Process receives SIGTERM (Unix only)
     /// - User presses 'q' key (only when keyboard handler is active)
     ///
-    /// Uses the oneshot channel pattern from the acton-reactive fruit_market example
-    /// for handling keyboard events without actors or broadcast subscriptions.
+    /// Creates a temporary ShutdownListener actor that subscribes to KeyPressed
+    /// broadcasts from the KeyboardHandler to receive raw mode keyboard events
+    /// without requiring Enter key press.
     ///
     /// # Arguments
     ///
-    /// * `actor_system` - Reference to the actor system for checking server mode
+    /// * `actor_system` - Mutable reference to the actor system for spawning the listener
     ///
     /// # Example
     ///
     /// ```no_run
     /// # use crately::runtime::ActorSystem;
-    /// # async fn example(system: &ActorSystem) {
-    /// ActorSystem::wait_for_shutdown(system).await;
+    /// # async fn example(mut system: ActorSystem) {
+    /// ActorSystem::wait_for_shutdown(&mut system).await;
     /// println!("Shutdown signal received");
     /// # }
     /// ```
-    pub async fn wait_for_shutdown(actor_system: &ActorSystem) {
-        use crossterm::event::{Event, KeyCode};
-        use futures_util::StreamExt;
-        use tokio::sync::oneshot;
+    pub async fn wait_for_shutdown(actor_system: &mut ActorSystem) {
+        use crate::messages::KeyPressed;
+        use crossterm::event::KeyCode;
+        use tokio::sync::mpsc;
 
-        // Set up graceful shutdown mechanism using a oneshot channel
-        let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+        // Set up graceful shutdown mechanism using a channel
+        let (shutdown_tx, mut shutdown_rx) = mpsc::channel::<()>(1);
 
-        // Spawn keyboard event loop only if keyboard handler exists (server mode)
-        let keyboard_task = if actor_system.get_actor("keyboard_handler").is_some() {
-            Some(tokio::spawn(async move {
-                // Create a stream for reading terminal events
-                let mut reader = crossterm::event::EventStream::new();
+        // Create a minimal listener actor if keyboard handler exists
+        let shutdown_listener = if actor_system.get_actor("keyboard_handler").is_some() {
+            // Define a minimal actor that listens for 'q' keypresses
+            #[acton_actor]
+            struct ShutdownListener;
 
-                // Loop reading terminal events
-                while let Some(event_result) = reader.next().await {
-                    match event_result {
-                        // 'q' for quit/shutdown
-                        Ok(Event::Key(key_event)) if matches!(key_event.code, KeyCode::Char('q')) => {
-                            info!("Received 'q' key press, initiating graceful shutdown");
-                            let _ = shutdown_tx.send(());
-                            break;
-                        }
-                        Err(e) => {
-                            error!("Error reading terminal event: {}", e);
-                            let _ = shutdown_tx.send(());
-                            break;
-                        }
-                        _ => {}
-                    }
+            let mut builder = actor_system
+                .runtime
+                .new_agent::<ShutdownListener>()
+                .await;
+
+            builder.act_on::<KeyPressed>(move |_agent, envelope| {
+                let message = envelope.message();
+                if matches!(message.key, KeyCode::Char('q')) {
+                    info!("Received 'q' key press, initiating graceful shutdown");
+
+                    // Send shutdown signal (non-blocking, won't fail if channel is full)
+                    let _ = shutdown_tx.try_send(());
                 }
-            }))
+                AgentReply::immediate()
+            });
+
+            // Subscribe to KeyPressed broadcasts before starting
+            builder.handle().subscribe::<KeyPressed>().await;
+
+            Some(builder.start().await)
         } else {
             None
         };
@@ -405,14 +408,14 @@ impl ActorSystem {
             _ = terminate => {
                 info!("Received termination signal, initiating graceful shutdown");
             },
-            _ = shutdown_rx => {
+            _ = shutdown_rx.recv() => {
                 info!("Received keyboard shutdown signal");
             },
         }
 
-        // Clean up the keyboard listener task
-        if let Some(task) = keyboard_task {
-            task.abort();
+        // Clean up the shutdown listener actor
+        if let Some(handle) = shutdown_listener {
+            let _ = handle.stop().await;
         }
     }
 
