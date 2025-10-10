@@ -52,6 +52,9 @@ pub async fn run(mut actor_system: ActorSystem) -> Result<()> {
     // Wait for shutdown signal (Ctrl+C, SIGTERM, or keyboard 'q')
     ActorSystem::wait_for_shutdown(&mut actor_system).await;
 
+    // Explicit shutdown to ensure proper cleanup (disables raw mode, stops actors)
+    actor_system.shutdown().await?;
+
     info!("Serve command completed");
 
     Ok(())
