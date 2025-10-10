@@ -90,11 +90,13 @@
 mod init;
 mod key_pressed;
 mod server_started;
+mod set_raw_mode;
 mod start_server;
 mod stop_server;
 
 pub use init::Init;
 pub use key_pressed::KeyPressed;
 pub use server_started::ServerStarted;
+pub use set_raw_mode::SetRawMode;
 pub use start_server::StartServer;
 pub use stop_server::StopServer;

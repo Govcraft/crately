@@ -285,8 +285,8 @@ impl ActorSystem {
 
         info!("Initializing server-specific actors");
 
-        // Spawn KeyboardHandler actor
-        let keyboard_handle = KeyboardHandler::spawn(&mut self.runtime)
+        // Spawn KeyboardHandler actor with access to actor registry
+        let keyboard_handle = KeyboardHandler::spawn(&mut self.runtime, Arc::clone(&self.actors))
             .await
             .context("Failed to spawn KeyboardHandler actor")?;
 
@@ -465,13 +465,7 @@ impl ActorSystem {
                 tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
 
                 match server.stop().await {
-                    Ok(()) => {
-                        if let Some(console) = self.get_actor("console") {
-                            console
-                                .send(PrintSuccess("ServerActor stopped".to_string()))
-                                .await;
-                        }
-                    }
+                    Ok(()) => {}
                     Err(e) => {
                         error!("Failed to stop ServerActor: {:?}", e);
                     }
@@ -483,13 +477,7 @@ impl ActorSystem {
                 keyboard_handler.send(StopKeyboardHandler).await;
 
                 match keyboard_handler.stop().await {
-                    Ok(()) => {
-                        if let Some(console) = self.get_actor("console") {
-                            console
-                                .send(PrintSuccess("KeyboardHandler stopped".to_string()))
-                                .await;
-                        }
-                    }
+                    Ok(()) => {}
                     Err(e) => {
                         error!("Failed to stop KeyboardHandler: {:?}", e);
                     }
@@ -500,13 +488,7 @@ impl ActorSystem {
         // Stop CrateDownloader actor
         if let Some(crate_downloader) = self.get_actor("crate_downloader") {
             match crate_downloader.stop().await {
-                Ok(()) => {
-                    if let Some(console) = self.get_actor("console") {
-                        console
-                            .send(PrintSuccess("CrateDownloader actor stopped".to_string()))
-                            .await;
-                    }
-                }
+                Ok(()) => {}
                 Err(e) => {
                     error!("Failed to stop CrateDownloader actor: {:?}", e);
                 }
@@ -516,13 +498,7 @@ impl ActorSystem {
         // Stop ConfigManager actor
         if let Some(config_manager) = self.get_actor("config_manager") {
             match config_manager.stop().await {
-                Ok(()) => {
-                    if let Some(console) = self.get_actor("console") {
-                        console
-                            .send(PrintSuccess("ConfigManager actor stopped".to_string()))
-                            .await;
-                    }
-                }
+                Ok(()) => {}
                 Err(e) => {
                     error!("Failed to stop ConfigManager actor: {:?}", e);
                 }

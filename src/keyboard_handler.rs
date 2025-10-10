@@ -11,11 +11,13 @@ use crossterm::{
     event::{Event, EventStream, KeyEventKind},
     terminal::{disable_raw_mode, enable_raw_mode},
 };
+use dashmap::DashMap;
 use futures_util::StreamExt;
+use std::sync::Arc;
 use tokio::sync::mpsc;
 use tracing::{error, info, warn};
 
-use crate::messages::KeyPressed;
+use crate::messages::{KeyPressed, SetRawMode};
 
 /// Message to stop the keyboard handler gracefully.
 #[acton_message]
@@ -79,11 +81,13 @@ impl KeyboardHandler {
     ///
     /// This is the standard factory method for creating KeyboardHandler actors.
     /// The actor enables terminal raw mode and begins listening for keyboard
-    /// events, broadcasting them via the message broker.
+    /// events, broadcasting them via the message broker. It also notifies the
+    /// Console actor when raw mode is enabled or disabled.
     ///
     /// # Arguments
     ///
     /// * `runtime` - Mutable reference to the acton-reactive runtime
+    /// * `actors` - Thread-safe map of actor handles for accessing Console
     ///
     /// # Returns
     ///
@@ -106,16 +110,22 @@ impl KeyboardHandler {
     /// ```no_run
     /// use acton_reactive::prelude::*;
     /// use crately::keyboard_handler::KeyboardHandler;
+    /// use dashmap::DashMap;
+    /// use std::sync::Arc;
     ///
     /// #[tokio::main]
     /// async fn main() -> anyhow::Result<()> {
     ///     let mut runtime = ActonApp::launch();
-    ///     let keyboard = KeyboardHandler::spawn(&mut runtime).await?;
+    ///     let actors = Arc::new(DashMap::new());
+    ///     let keyboard = KeyboardHandler::spawn(&mut runtime, actors).await?;
     ///     runtime.shutdown_all().await?;
     ///     Ok(())
     /// }
     /// ```
-    pub async fn spawn(runtime: &mut AgentRuntime) -> Result<AgentHandle> {
+    pub async fn spawn(
+        runtime: &mut AgentRuntime,
+        actors: Arc<DashMap<String, AgentHandle>>,
+    ) -> Result<AgentHandle> {
         let mut builder = runtime
             .new_agent_with_name::<KeyboardHandler>("keyboard_handler".to_string())
             .await;
@@ -126,7 +136,8 @@ impl KeyboardHandler {
             stop_tx: None,
         };
 
-        builder.after_start(|_| {
+        let actors_for_start = Arc::clone(&actors);
+        builder.after_start(move |_| {
             info!("KeyboardHandler starting - enabling raw mode");
 
             // Enable raw mode
@@ -134,6 +145,15 @@ impl KeyboardHandler {
                 error!("Failed to enable raw mode: {}", e);
                 return AgentReply::immediate();
             }
+
+            // Notify Console actor that raw mode is active
+            if let Some(console) = actors_for_start.get("console") {
+                let console_handle = console.clone();
+                tokio::spawn(async move {
+                    console_handle.send(SetRawMode(true)).await;
+                });
+            }
+
             AgentReply::immediate()
         });
 
@@ -207,8 +227,17 @@ impl KeyboardHandler {
         });
 
         // Clean up on shutdown
-        builder.before_stop(|_agent| {
+        let actors_for_stop = Arc::clone(&actors);
+        builder.before_stop(move |_agent| {
             info!("KeyboardHandler stopping - disabling raw mode");
+
+            // Notify Console actor that raw mode is being disabled
+            if let Some(console) = actors_for_stop.get("console") {
+                let console_handle = console.clone();
+                tokio::spawn(async move {
+                    console_handle.send(SetRawMode(false)).await;
+                });
+            }
 
             // Disable raw mode
             if let Err(e) = disable_raw_mode() {
@@ -243,9 +272,10 @@ mod tests {
         // This test verifies that the actor can be spawned and stopped
         // Actual keyboard event handling requires a TTY environment
         let mut runtime = ActonApp::launch();
+        let actors = Arc::new(DashMap::new());
 
         // Attempt to spawn - should succeed even in non-TTY environments
-        let result = KeyboardHandler::spawn(&mut runtime).await;
+        let result = KeyboardHandler::spawn(&mut runtime, Arc::clone(&actors)).await;
 
         if let Ok(handle) = result {
             handle.send(StopKeyboardHandler).await;
@@ -262,8 +292,9 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn test_keyboard_handler_stop_message() {
         let mut runtime = ActonApp::launch();
+        let actors = Arc::new(DashMap::new());
 
-        if let Ok(handle) = KeyboardHandler::spawn(&mut runtime).await {
+        if let Ok(handle) = KeyboardHandler::spawn(&mut runtime, Arc::clone(&actors)).await {
             // Send stop message
             handle.send(StopKeyboardHandler).await;
 

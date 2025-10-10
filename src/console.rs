@@ -10,7 +10,7 @@
 use acton_reactive::prelude::*;
 
 use crate::config::ConfigLoaded;
-use crate::messages::{Init, ServerStarted};
+use crate::messages::{Init, ServerStarted, SetRawMode};
 use tracing::info;
 
 /// Success symbol (✓)
@@ -46,7 +46,13 @@ pub const BANNER_TEMPLATE: &str = "\
 ╚═══════════════════════════════════════════════════════════╝";
 
 #[acton_actor]
-pub struct Console;
+pub struct Console {
+    /// Whether terminal raw mode is currently active.
+    ///
+    /// When raw mode is active, console output must use `\r\n` for line endings
+    /// instead of just `\n` to ensure proper cursor positioning.
+    raw_mode_active: bool,
+}
 
 /// Message to print a success message with the success symbol (✓)
 #[acton_message(raw)]
@@ -121,51 +127,68 @@ impl Console {
             .new_agent_with_name::<Console>("console".to_string())
             .await;
 
+        // Initialize with raw mode inactive by default
+        builder.model = Console {
+            raw_mode_active: false,
+        };
+
         builder
             .before_start(|_| {
-                print_banner(env!("CARGO_PKG_VERSION"));
+                print_banner(env!("CARGO_PKG_VERSION"), false);
 
                 AgentReply::immediate()
             })
             .act_on::<Init>(|_actor, _context| AgentReply::immediate())
-            .act_on::<PrintSuccess>(|_actor, envelope| {
+            .mutate_on::<SetRawMode>(|agent, envelope| {
                 let message = envelope.message();
-                print_success(&message.0);
+                agent.model.raw_mode_active = message.0;
                 AgentReply::immediate()
             })
-            .act_on::<PrintError>(|_actor, envelope| {
+            .act_on::<PrintSuccess>(|actor, envelope| {
                 let message = envelope.message();
-                print_error(&message.0);
+                print_success(&message.0, actor.model.raw_mode_active);
                 AgentReply::immediate()
             })
-            .act_on::<PrintProgress>(|_actor, envelope| {
+            .act_on::<PrintError>(|actor, envelope| {
                 let message = envelope.message();
-                print_progress(&message.0);
+                print_error(&message.0, actor.model.raw_mode_active);
                 AgentReply::immediate()
             })
-            .act_on::<PrintWarning>(|_actor, envelope| {
+            .act_on::<PrintProgress>(|actor, envelope| {
                 let message = envelope.message();
-                print_warning(&message.0);
+                print_progress(&message.0, actor.model.raw_mode_active);
                 AgentReply::immediate()
             })
-            .act_on::<PrintSeparator>(|_actor, _envelope| {
-                print_separator();
-                AgentReply::immediate()
-            })
-            .mutate_on::<ConfigLoaded>(|_agent, envelope| {
+            .act_on::<PrintWarning>(|actor, envelope| {
                 let message = envelope.message();
-                print_success(&format!(
-                    "Configuration loaded {} {}",
-                    PROGRESS,
-                    message.config_path.display()
-                ));
+                print_warning(&message.0, actor.model.raw_mode_active);
                 AgentReply::immediate()
             })
-            .act_on::<ServerStarted>(|_actor, _envelope| {
-                eprintln!();
-                eprintln!("Server is running. Press 'q' or Ctrl+C to shutdown gracefully");
-                eprintln!("Press 'r' to reload configuration");
-                eprintln!();
+            .act_on::<PrintSeparator>(|actor, _envelope| {
+                print_separator(actor.model.raw_mode_active);
+                AgentReply::immediate()
+            })
+            .mutate_on::<ConfigLoaded>(|agent, envelope| {
+                let message = envelope.message();
+                print_success(
+                    &format!(
+                        "Configuration loaded {} {}",
+                        PROGRESS,
+                        message.config_path.display()
+                    ),
+                    agent.model.raw_mode_active,
+                );
+                AgentReply::immediate()
+            })
+            .act_on::<ServerStarted>(|actor, _envelope| {
+                let raw_mode = actor.model.raw_mode_active;
+                print_newline(raw_mode);
+                print_line(
+                    "Server is running. Press 'q' or Ctrl+C to shutdown gracefully",
+                    raw_mode,
+                );
+                print_line("Press 'r' to reload configuration", raw_mode);
+                print_newline(raw_mode);
                 AgentReply::immediate()
             });
 
@@ -176,6 +199,43 @@ impl Console {
         Ok(builder.start().await)
     }
 }
+/// Returns the appropriate line ending based on raw mode state.
+///
+/// # Arguments
+///
+/// * `raw_mode` - Whether terminal raw mode is active
+///
+/// # Returns
+///
+/// Returns `"\r\n"` when raw mode is active, `"\n"` otherwise
+#[inline]
+fn line_ending(raw_mode: bool) -> &'static str {
+    if raw_mode {
+        "\r\n"
+    } else {
+        "\n"
+    }
+}
+
+/// Prints a line with the appropriate line ending for the current mode.
+///
+/// # Arguments
+///
+/// * `text` - The text to print
+/// * `raw_mode` - Whether terminal raw mode is active
+fn print_line(text: &str, raw_mode: bool) {
+    eprint!("{}{}", text, line_ending(raw_mode));
+}
+
+/// Prints a newline with the appropriate line ending for the current mode.
+///
+/// # Arguments
+///
+/// * `raw_mode` - Whether terminal raw mode is active
+fn print_newline(raw_mode: bool) {
+    eprint!("{}", line_ending(raw_mode));
+}
+
 /// Prints the startup banner with version information.
 ///
 /// This function uses [`BANNER_TEMPLATE`] to generate a consistent startup banner
@@ -185,23 +245,20 @@ impl Console {
 /// # Arguments
 ///
 /// * `version` - The application version string (max 7 chars for proper alignment)
+/// * `raw_mode` - Whether terminal raw mode is active
 ///
 /// # Example
 ///
 /// ```no_run
-/// crately::console::print_banner("0.1.0");
+/// crately::console::print_banner("0.1.0", false);
 /// ```
-pub fn print_banner(version: &str) {
-    eprintln!();
-    eprintln!(
-        "{}",
-        BANNER_TEMPLATE.replace("{version:<7}", &format!("{version:<7}"))
-    );
-    info!(
-        "{}",
-        BANNER_TEMPLATE.replace("{version:<7}", &format!("{version:<7}"))
-    );
-    eprintln!();
+pub fn print_banner(version: &str, raw_mode: bool) {
+    let banner_text = BANNER_TEMPLATE.replace("{version:<7}", &format!("{version:<7}"));
+
+    print_newline(raw_mode);
+    print_line(&banner_text, raw_mode);
+    info!("{}", banner_text);
+    print_newline(raw_mode);
 }
 
 /// Prints a success message with the success symbol (✓).
@@ -212,8 +269,9 @@ pub fn print_banner(version: &str) {
 /// # Arguments
 ///
 /// * `message` - The success message to display
-fn print_success(message: &str) {
-    eprintln!("{} {}", SUCCESS, message);
+/// * `raw_mode` - Whether terminal raw mode is active
+fn print_success(message: &str, raw_mode: bool) {
+    print_line(&format!("{} {}", SUCCESS, message), raw_mode);
 }
 
 /// Prints an error message with the error symbol (✗).
@@ -224,8 +282,9 @@ fn print_success(message: &str) {
 /// # Arguments
 ///
 /// * `message` - The error message to display
-fn print_error(message: &str) {
-    eprintln!("{} {}", ERROR, message);
+/// * `raw_mode` - Whether terminal raw mode is active
+fn print_error(message: &str, raw_mode: bool) {
+    print_line(&format!("{} {}", ERROR, message), raw_mode);
 }
 
 /// Prints a progress message with the progress symbol (→).
@@ -236,8 +295,9 @@ fn print_error(message: &str) {
 /// # Arguments
 ///
 /// * `message` - The progress message to display
-fn print_progress(message: &str) {
-    eprintln!("{} {}", PROGRESS, message);
+/// * `raw_mode` - Whether terminal raw mode is active
+fn print_progress(message: &str, raw_mode: bool) {
+    print_line(&format!("{} {}", PROGRESS, message), raw_mode);
 }
 
 /// Prints a warning message with the warning symbol (⚠).
@@ -248,16 +308,21 @@ fn print_progress(message: &str) {
 /// # Arguments
 ///
 /// * `message` - The warning message to display
-fn print_warning(message: &str) {
-    eprintln!("{} {}", WARNING, message);
+/// * `raw_mode` - Whether terminal raw mode is active
+fn print_warning(message: &str, raw_mode: bool) {
+    print_line(&format!("{} {}", WARNING, message), raw_mode);
 }
 
 /// Prints a horizontal separator line.
 ///
 /// This is a private helper function used by the Console actor's message handlers.
 /// External code should send `PrintSeparator` messages to the Console actor instead.
-fn print_separator() {
-    eprintln!("───────────────────────────────────────────────────────────");
+///
+/// # Arguments
+///
+/// * `raw_mode` - Whether terminal raw mode is active
+fn print_separator(raw_mode: bool) {
+    print_line("───────────────────────────────────────────────────────────", raw_mode);
 }
 
 #[cfg(test)]
@@ -300,58 +365,98 @@ mod tests {
     }
 
     #[test]
+    fn test_line_ending_normal_mode() {
+        assert_eq!(line_ending(false), "\n");
+    }
+
+    #[test]
+    fn test_line_ending_raw_mode() {
+        assert_eq!(line_ending(true), "\r\n");
+    }
+
+    #[test]
     fn test_print_banner_executes_without_panic() {
         // This test verifies the function executes successfully
-        print_banner("0.1.0");
+        print_banner("0.1.0", false);
+    }
+
+    #[test]
+    fn test_print_banner_raw_mode_executes_without_panic() {
+        print_banner("0.1.0", true);
     }
 
     #[test]
     fn test_print_banner_with_short_version() {
         // Short versions should work fine
-        print_banner("0.1");
+        print_banner("0.1", false);
     }
 
     #[test]
     fn test_print_banner_with_max_length_version() {
         // 7 character version should work properly
-        print_banner("10.20.3");
+        print_banner("10.20.3", false);
     }
 
     #[test]
     fn test_print_banner_with_long_version() {
         // Longer versions may break alignment but should not panic
-        print_banner("1.0.0-rc.1");
+        print_banner("1.0.0-rc.1", false);
     }
 
     #[test]
     fn test_print_banner_with_empty_version() {
         // Empty version should not panic
-        print_banner("");
+        print_banner("", false);
     }
 
     #[test]
     fn test_print_success_executes_without_panic() {
-        print_success("Test success message");
+        print_success("Test success message", false);
+    }
+
+    #[test]
+    fn test_print_success_raw_mode_executes_without_panic() {
+        print_success("Test success message", true);
     }
 
     #[test]
     fn test_print_error_executes_without_panic() {
-        print_error("Test error message");
+        print_error("Test error message", false);
+    }
+
+    #[test]
+    fn test_print_error_raw_mode_executes_without_panic() {
+        print_error("Test error message", true);
     }
 
     #[test]
     fn test_print_progress_executes_without_panic() {
-        print_progress("Test progress message");
+        print_progress("Test progress message", false);
+    }
+
+    #[test]
+    fn test_print_progress_raw_mode_executes_without_panic() {
+        print_progress("Test progress message", true);
     }
 
     #[test]
     fn test_print_warning_executes_without_panic() {
-        print_warning("Test warning message");
+        print_warning("Test warning message", false);
+    }
+
+    #[test]
+    fn test_print_warning_raw_mode_executes_without_panic() {
+        print_warning("Test warning message", true);
     }
 
     #[test]
     fn test_print_separator_executes_without_panic() {
-        print_separator();
+        print_separator(false);
+    }
+
+    #[test]
+    fn test_print_separator_raw_mode_executes_without_panic() {
+        print_separator(true);
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -406,6 +511,64 @@ mod tests {
         let console = Console::spawn(&mut runtime).await.unwrap();
 
         console.send(PrintSeparator).await;
+
+        console.stop().await.unwrap();
+        runtime.shutdown_all().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_console_actor_handles_set_raw_mode_true() {
+        let mut runtime = ActonApp::launch();
+        let console = Console::spawn(&mut runtime).await.unwrap();
+
+        // Send SetRawMode(true) message
+        console.send(SetRawMode(true)).await;
+
+        // Give it time to process
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+
+        // Verify it doesn't panic and can still handle messages
+        console.send(PrintSuccess("Test after raw mode".to_string())).await;
+
+        console.stop().await.unwrap();
+        runtime.shutdown_all().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_console_actor_handles_set_raw_mode_false() {
+        let mut runtime = ActonApp::launch();
+        let console = Console::spawn(&mut runtime).await.unwrap();
+
+        // Send SetRawMode(false) message
+        console.send(SetRawMode(false)).await;
+
+        // Give it time to process
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+
+        // Verify it doesn't panic and can still handle messages
+        console.send(PrintSuccess("Test after normal mode".to_string())).await;
+
+        console.stop().await.unwrap();
+        runtime.shutdown_all().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_console_actor_handles_mode_transition() {
+        let mut runtime = ActonApp::launch();
+        let console = Console::spawn(&mut runtime).await.unwrap();
+
+        // Start in normal mode
+        console.send(PrintSuccess("Normal mode 1".to_string())).await;
+
+        // Switch to raw mode
+        console.send(SetRawMode(true)).await;
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        console.send(PrintSuccess("Raw mode".to_string())).await;
+
+        // Switch back to normal mode
+        console.send(SetRawMode(false)).await;
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        console.send(PrintSuccess("Normal mode 2".to_string())).await;
 
         console.stop().await.unwrap();
         runtime.shutdown_all().await.unwrap();
