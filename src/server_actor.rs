@@ -19,7 +19,7 @@ use tokio::sync::oneshot;
 use tracing::{debug, error, info, warn};
 
 use crate::{
-    config::{Config, ConfigResponse},
+    config::{Config, ConfigResponse, ReloadConfig},
     console::{PrintError, PrintProgress, PrintSuccess},
     messages::{KeyPressed, ServerStarted, StartServer, StopServer},
     request::CrateRequest,
@@ -332,17 +332,27 @@ impl ServerActor {
             match (key_event.key, key_event.modifiers) {
                 (KeyCode::Char('r'), KeyModifiers::NONE) => {
                     info!("Processing 'r' key - reload configuration request");
+
+                    // Display progress message
                     if let Some(console) = agent.model.actors.get("console") {
                         let console = console.clone();
-                        return AgentReply::from_async(async move {
+                        tokio::spawn(async move {
                             console
                                 .send(PrintProgress(
                                     "Reload requested - reloading configuration...".to_string(),
                                 ))
                                 .await;
                         });
+                    }
+
+                    // Trigger actual reload
+                    if let Some(config_manager) = agent.model.actors.get("config_manager") {
+                        let config_manager = config_manager.clone();
+                        return AgentReply::from_async(async move {
+                            config_manager.send(ReloadConfig).await;
+                        });
                     } else {
-                        warn!("Console actor not found, cannot display reload message");
+                        warn!("ConfigManager actor not found, cannot reload configuration");
                     }
                 }
                 (KeyCode::Char('s'), KeyModifiers::NONE) => {
