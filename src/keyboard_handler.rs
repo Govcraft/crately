@@ -70,6 +70,8 @@ struct KeyboardHandlerStarted;
 pub struct KeyboardHandler {
     /// Whether the handler has been initialized
     initialized: bool,
+    /// Channel sender for stopping the keyboard event loop
+    stop_tx: Option<mpsc::Sender<()>>,
 }
 
 impl KeyboardHandler {
@@ -121,14 +123,10 @@ impl KeyboardHandler {
         // Initialize model
         builder.model = KeyboardHandler {
             initialized: false,
+            stop_tx: None,
         };
 
-        // Set up the keyboard event handler on start
-        builder.mutate_on::<KeyboardHandlerStarted>(|agent, _envelope| {
-            if agent.model.initialized {
-                return AgentReply::immediate();
-            }
-
+        builder.after_start(|_| {
             info!("KeyboardHandler starting - enabling raw mode");
 
             // Enable raw mode
@@ -136,11 +134,22 @@ impl KeyboardHandler {
                 error!("Failed to enable raw mode: {}", e);
                 return AgentReply::immediate();
             }
+            AgentReply::immediate()
+        });
+
+        // Set up the keyboard event handler on start
+        builder.mutate_on::<KeyboardHandlerStarted>(|agent, _envelope| {
+            if agent.model.initialized {
+                return AgentReply::immediate();
+            }
 
             agent.model.initialized = true;
 
             // Create a channel for stopping the event reader
-            let (_stop_tx, mut stop_rx) = mpsc::channel::<()>(1);
+            let (stop_tx, mut stop_rx) = mpsc::channel::<()>(1);
+
+            // Store the sender in the actor model for shutdown signaling
+            agent.model.stop_tx = Some(stop_tx);
 
             // Spawn a task to read keyboard events
             let broker = agent.broker().clone();
@@ -151,6 +160,7 @@ impl KeyboardHandler {
                     tokio::select! {
                         // Check for stop signal
                         _ = stop_rx.recv() => {
+                            info!("Stop received");
                             break;
                         }
                         // Read keyboard events
@@ -164,6 +174,7 @@ impl KeyboardHandler {
                                             modifiers: key_event.modifiers,
                                         };
 
+                                        info!("Key pressed");
                                         broker.broadcast(message).await;
                                     }
                                 }
@@ -181,19 +192,17 @@ impl KeyboardHandler {
                         }
                     }
                 }
-
-                // Disable raw mode when task ends
-                if let Err(e) = disable_raw_mode() {
-                    error!("Failed to disable raw mode: {}", e);
-                }
             });
 
             AgentReply::immediate()
         });
 
         // Handle stop requests
-        builder.act_on::<StopKeyboardHandler>(|_agent, _envelope| {
-            // Shutdown will be handled by the actor system
+        builder.mutate_on::<StopKeyboardHandler>(|agent, _envelope| {
+            // Signal the keyboard event loop to stop by dropping the sender
+            if let Some(stop_tx) = agent.model.stop_tx.take() {
+                drop(stop_tx);
+            }
             AgentReply::immediate()
         });
 
@@ -226,6 +235,7 @@ mod tests {
     fn test_keyboard_handler_default() {
         let handler = KeyboardHandler::default();
         assert!(!handler.initialized);
+        assert!(handler.stop_tx.is_none());
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -243,7 +253,10 @@ mod tests {
             handle.stop().await.expect("Should stop cleanly");
         }
 
-        runtime.shutdown_all().await.expect("Runtime should shutdown");
+        runtime
+            .shutdown_all()
+            .await
+            .expect("Runtime should shutdown");
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -260,6 +273,9 @@ mod tests {
             handle.stop().await.expect("Should stop cleanly");
         }
 
-        runtime.shutdown_all().await.expect("Runtime should shutdown");
+        runtime
+            .shutdown_all()
+            .await
+            .expect("Runtime should shutdown");
     }
 }

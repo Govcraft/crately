@@ -43,7 +43,7 @@ use tracing::{error, info};
 
 use crate::{
     config::{Config, ConfigManager},
-    console::{Console, PrintSuccess},
+    console::{Console, PrintProgress, PrintSuccess},
     crate_downloader::CrateDownloader,
     keyboard_handler::{KeyboardHandler, StopKeyboardHandler},
     messages::{Init, StopServer},
@@ -125,8 +125,7 @@ impl ActorSystem {
         console.send(Init).await;
 
         // Print startup banner and logging confirmation
-        let log_dir = crate::logging::get_log_dir()
-            .context("Failed to determine log directory")?;
+        let log_dir = crate::logging::get_log_dir().context("Failed to determine log directory")?;
         console
             .send(PrintSuccess(format!(
                 "Logging initialized → {}",
@@ -294,12 +293,6 @@ impl ActorSystem {
         self.actors
             .insert("keyboard_handler".to_string(), keyboard_handle.clone());
 
-        if let Some(console) = self.get_actor("console") {
-            console
-                .send(PrintSuccess("KeyboardHandler actor started".to_string()))
-                .await;
-        }
-
         // Spawn ServerActor
         let server_handle = ServerActor::spawn(
             &mut self.runtime,
@@ -309,29 +302,24 @@ impl ActorSystem {
         .await
         .context("Failed to spawn ServerActor actor")?;
 
-        self.actors.insert("server".to_string(), server_handle.clone());
-
-        if let Some(console) = self.get_actor("console") {
-            console
-                .send(PrintSuccess("ServerActor actor started".to_string()))
-                .await;
-        }
+        self.actors
+            .insert("server".to_string(), server_handle.clone());
 
         self.server_mode = true;
 
         Ok(())
     }
 
-    /// Waits for a shutdown signal from Ctrl+C, SIGTERM, or keyboard 'q' press.
+    /// Waits for a shutdown signal from Ctrl+C, SIGTERM, or keyboard shutdown keys.
     ///
     /// This method blocks until one of the following occurs:
-    /// - User presses Ctrl+C
+    /// - User presses Ctrl+C (signal handler or keyboard in raw mode)
     /// - Process receives SIGTERM (Unix only)
     /// - User presses 'q' key (only when keyboard handler is active)
     ///
     /// Creates a temporary ShutdownListener actor that subscribes to KeyPressed
     /// broadcasts from the KeyboardHandler to receive raw mode keyboard events
-    /// without requiring Enter key press.
+    /// ('q' or Ctrl+C) without requiring Enter key press.
     ///
     /// # Arguments
     ///
@@ -348,7 +336,7 @@ impl ActorSystem {
     /// ```
     pub async fn wait_for_shutdown(actor_system: &mut ActorSystem) {
         use crate::messages::KeyPressed;
-        use crossterm::event::KeyCode;
+        use crossterm::event::{KeyCode, KeyModifiers};
         use tokio::sync::mpsc;
 
         // Set up graceful shutdown mechanism using a channel
@@ -356,22 +344,25 @@ impl ActorSystem {
 
         // Create a minimal listener actor if keyboard handler exists
         let shutdown_listener = if actor_system.get_actor("keyboard_handler").is_some() {
-            // Define a minimal actor that listens for 'q' keypresses
+            // Define a minimal actor that listens for 'q' or Ctrl+C keypresses
             #[acton_actor]
             struct ShutdownListener;
 
-            let mut builder = actor_system
-                .runtime
-                .new_agent::<ShutdownListener>()
-                .await;
+            let mut builder = actor_system.runtime.new_agent::<ShutdownListener>().await;
 
             builder.act_on::<KeyPressed>(move |_agent, envelope| {
                 let message = envelope.message();
-                if matches!(message.key, KeyCode::Char('q')) {
-                    info!("Received 'q' key press, initiating graceful shutdown");
+                match (message.key, message.modifiers) {
+                    (KeyCode::Char('q'), KeyModifiers::NONE)
+                    | (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
+                        info!("Received shutdown key ('q' or Ctrl+C), initiating graceful shutdown");
 
-                    // Send shutdown signal (non-blocking, won't fail if channel is full)
-                    let _ = shutdown_tx.try_send(());
+                        // Send shutdown signal (non-blocking, won't fail if channel is full)
+                        let _ = shutdown_tx.try_send(());
+                    }
+                    _ => {
+                        // Ignore other keys
+                    }
                 }
                 AgentReply::immediate()
             });
@@ -411,6 +402,16 @@ impl ActorSystem {
             _ = shutdown_rx.recv() => {
                 info!("Received keyboard shutdown signal");
             },
+        }
+
+        // Display shutdown message to user via Console actor
+        if let Some(console) = actor_system.get_actor("console") {
+            console
+                .send(PrintProgress("Initiating graceful shutdown...".to_string()))
+                .await;
+
+            // Brief delay to allow Console to process and display the message
+            tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
         }
 
         // Clean up the shutdown listener actor
@@ -614,12 +615,8 @@ mod tests {
             .await
             .expect("Initialization should succeed");
 
-        let console1 = system
-            .get_actor("console")
-            .expect("Console should exist");
-        let console2 = system
-            .get_actor("console")
-            .expect("Console should exist");
+        let console1 = system.get_actor("console").expect("Console should exist");
+        let console2 = system.get_actor("console").expect("Console should exist");
 
         // Both handles should work independently
         console1.send(Init).await;
@@ -648,11 +645,7 @@ mod tests {
             .expect("Initialization should succeed");
 
         let actors = system.actors();
-        assert_eq!(
-            actors.len(),
-            3,
-            "Should have exactly 3 actors registered"
-        );
+        assert_eq!(actors.len(), 3, "Should have exactly 3 actors registered");
 
         system.shutdown().await.expect("Shutdown should succeed");
     }
@@ -702,7 +695,10 @@ mod tests {
             .expect("Server actor initialization should succeed");
 
         // Server mode should now be true
-        assert!(system.server_mode, "Server mode should be true after initialization");
+        assert!(
+            system.server_mode,
+            "Server mode should be true after initialization"
+        );
 
         // Both server actors should be registered
         assert!(

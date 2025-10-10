@@ -7,9 +7,9 @@
 use acton_reactive::prelude::*;
 use anyhow::Result;
 use axum::{
+    Router,
     extract::{Json, State},
     routing::post,
-    Router,
 };
 use crossterm::event::{KeyCode, KeyModifiers};
 use dashmap::DashMap;
@@ -281,7 +281,9 @@ impl ServerActor {
             if let Some(console) = agent.model.actors.get("console") {
                 let console = console.clone();
                 return AgentReply::from_async(async move {
-                    console.send(PrintSuccess("Server stopped".to_string())).await;
+                    console
+                        .send(PrintSuccess("Server stopped".to_string()))
+                        .await;
                 });
             }
 
@@ -309,7 +311,9 @@ impl ServerActor {
                 if let Some(console) = console {
                     return AgentReply::from_async(async move {
                         console
-                            .send(PrintProgress("Reloading server with new configuration...".to_string()))
+                            .send(PrintProgress(
+                                "Reloading server with new configuration...".to_string(),
+                            ))
                             .await;
                     });
                 }
@@ -322,18 +326,27 @@ impl ServerActor {
         builder.act_on::<KeyPressed>(|agent, envelope| {
             let key_event = envelope.message();
 
+            info!("ServerActor received KeyPressed event: key={:?}, modifiers={:?}",
+                  key_event.key, key_event.modifiers);
+
             match (key_event.key, key_event.modifiers) {
                 (KeyCode::Char('r'), KeyModifiers::NONE) => {
+                    info!("Processing 'r' key - reload configuration request");
                     if let Some(console) = agent.model.actors.get("console") {
                         let console = console.clone();
                         return AgentReply::from_async(async move {
                             console
-                                .send(PrintProgress("Reload requested - reloading configuration...".to_string()))
+                                .send(PrintProgress(
+                                    "Reload requested - reloading configuration...".to_string(),
+                                ))
                                 .await;
                         });
+                    } else {
+                        warn!("Console actor not found, cannot display reload message");
                     }
                 }
                 (KeyCode::Char('s'), KeyModifiers::NONE) => {
+                    info!("Processing 's' key - stop server request");
                     if let Some(console) = agent.model.actors.get("console") {
                         let console = console.clone();
                         return AgentReply::from_async(async move {
@@ -341,14 +354,17 @@ impl ServerActor {
                                 .send(PrintProgress("Stop requested via keyboard...".to_string()))
                                 .await;
                         });
+                    } else {
+                        warn!("Console actor not found, cannot display stop message");
                     }
                 }
                 (KeyCode::Char('q'), KeyModifiers::NONE)
                 | (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
-                    // The main shutdown handler will handle this
+                    info!("Received shutdown key (q or Ctrl+C) - deferring to main shutdown handler");
                 }
                 _ => {
-                    // Ignore other keys
+                    debug!("Ignoring unhandled key: {:?} with modifiers {:?}",
+                           key_event.key, key_event.modifiers);
                 }
             }
 
@@ -379,7 +395,10 @@ mod tests {
 
         let handle = result.unwrap();
         handle.stop().await.expect("Should stop cleanly");
-        runtime.shutdown_all().await.expect("Runtime should shutdown");
+        runtime
+            .shutdown_all()
+            .await
+            .expect("Runtime should shutdown");
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -405,7 +424,10 @@ mod tests {
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
         handle.stop().await.expect("Should stop cleanly");
-        runtime.shutdown_all().await.expect("Runtime should shutdown");
+        runtime
+            .shutdown_all()
+            .await
+            .expect("Runtime should shutdown");
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -429,6 +451,9 @@ mod tests {
         tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
 
         handle.stop().await.expect("Should stop cleanly");
-        runtime.shutdown_all().await.expect("Runtime should shutdown");
+        runtime
+            .shutdown_all()
+            .await
+            .expect("Runtime should shutdown");
     }
 }
