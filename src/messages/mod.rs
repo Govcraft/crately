@@ -88,11 +88,18 @@
 //! ```
 
 mod config_reload_failed;
+mod crate_downloaded;
+mod crate_download_failed;
 mod crate_list_response;
 mod crate_persisted;
+mod crate_processing_complete;
 mod crate_query_response;
+mod crate_received;
 mod database_error;
 mod database_ready;
+mod documentation_chunked;
+mod documentation_extracted;
+mod documentation_vectorized;
 mod init;
 mod key_pressed;
 mod keyboard_handler_started;
@@ -112,11 +119,18 @@ mod stop_keyboard_handler;
 mod stop_server;
 
 pub use config_reload_failed::ConfigReloadFailed;
+pub use crate_downloaded::CrateDownloaded;
+pub use crate_download_failed::{CrateDownloadFailed, DownloadErrorKind};
 pub use crate_list_response::{CrateListResponse, CrateSummary};
 pub use crate_persisted::CratePersisted;
+pub use crate_processing_complete::CrateProcessingComplete;
 pub use crate_query_response::CrateQueryResponse;
+pub use crate_received::CrateReceived;
 pub use database_error::DatabaseError;
 pub use database_ready::DatabaseReady;
+pub use documentation_chunked::DocumentationChunked;
+pub use documentation_extracted::DocumentationExtracted;
+pub use documentation_vectorized::DocumentationVectorized;
 pub use init::Init;
 pub use key_pressed::KeyPressed;
 pub(crate) use keyboard_handler_started::KeyboardHandlerStarted;
