@@ -308,6 +308,10 @@ impl ActorSystem {
     /// registry and configuration. The keyboard handler is spawned to enable
     /// interactive server control.
     ///
+    /// All initialization errors are reported through the Console actor before
+    /// being propagated, ensuring users see clear error messages when actor
+    /// spawning fails.
+    ///
     /// # Returns
     ///
     /// Returns `Ok(())` on successful initialization of both actors.
@@ -341,30 +345,65 @@ impl ActorSystem {
 
         info!("Initializing server-specific actors");
 
+        // Get console handle for error reporting
+        let console = self
+            .get_actor("console")
+            .context("Console actor must be initialized before server actors")?;
+
         // Skip KeyboardHandler in test environments - it requires a TTY and blocks on stdin
         // which causes test hangs when multiple tests run concurrently
         #[cfg(not(test))]
         {
             // Spawn KeyboardHandler actor with access to actor registry
-            let keyboard_handle = KeyboardHandler::spawn(&mut self.runtime, Arc::clone(&self.actors))
-                .await
-                .context("Failed to spawn KeyboardHandler actor")?;
+            match KeyboardHandler::spawn(&mut self.runtime, Arc::clone(&self.actors)).await {
+                Ok(keyboard_handle) => {
+                    self.actors
+                        .insert("keyboard_handler".to_string(), keyboard_handle.clone());
+                }
+                Err(e) => {
+                    // Report error through Console before propagating
+                    console
+                        .send(crate::messages::PrintError(format!(
+                            "Failed to initialize keyboard handler: {}",
+                            e
+                        )))
+                        .await;
 
-            self.actors
-                .insert("keyboard_handler".to_string(), keyboard_handle.clone());
+                    // Give Console time to display the error
+                    tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+
+                    return Err(e.context("Failed to spawn KeyboardHandler actor"));
+                }
+            }
         }
 
         // Spawn ServerActor
-        let server_handle = ServerActor::spawn(
+        match ServerActor::spawn(
             &mut self.runtime,
             self.config.clone(),
             Arc::clone(&self.actors),
         )
         .await
-        .context("Failed to spawn ServerActor actor")?;
+        {
+            Ok(server_handle) => {
+                self.actors
+                    .insert("server".to_string(), server_handle.clone());
+            }
+            Err(e) => {
+                // Report error through Console before propagating
+                console
+                    .send(crate::messages::PrintError(format!(
+                        "Failed to initialize server actor: {}",
+                        e
+                    )))
+                    .await;
 
-        self.actors
-            .insert("server".to_string(), server_handle.clone());
+                // Give Console time to display the error
+                tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+
+                return Err(e.context("Failed to spawn ServerActor actor"));
+            }
+        }
 
         self.server_mode = true;
 

@@ -4,6 +4,20 @@
 //! and broadcasts them to subscribing actors using the pub/sub pattern. The handler
 //! does not dictate what keys do - it simply broadcasts events for other actors to
 //! handle as appropriate for their context.
+//!
+//! # TTY Detection and Graceful Degradation
+//!
+//! The KeyboardHandler automatically detects whether stdin is available and connected
+//! to a TTY (interactive terminal). When stdin is not a TTY (e.g., running as a daemon,
+//! background process, or in CI/CD), the handler gracefully disables keyboard input:
+//!
+//! - Logs a warning through the Console actor
+//! - Creates a disabled handler that does nothing
+//! - Allows the server to continue running normally
+//! - Prevents panics from crossterm's EventStream
+//!
+//! This design enables the same binary to run both interactively and as a service
+//! without requiring separate configurations or conditional compilation.
 
 use acton_reactive::prelude::*;
 use anyhow::Result;
@@ -13,6 +27,8 @@ use crossterm::{
 };
 use dashmap::DashMap;
 use futures_util::StreamExt;
+use is_terminal::IsTerminal;
+use std::io::stdin;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tracing::{error, info, warn};
@@ -62,6 +78,8 @@ use crate::messages::{KeyPressed, KeyboardHandlerStarted, SetRawMode, StopKeyboa
 /// ```
 #[acton_actor]
 pub struct KeyboardHandler {
+    /// Whether stdin is a TTY and keyboard input is enabled
+    enabled: bool,
     /// Whether the handler has been initialized
     initialized: bool,
     /// Channel sender for stopping the keyboard event loop
@@ -118,18 +136,44 @@ impl KeyboardHandler {
         runtime: &mut AgentRuntime,
         actors: Arc<DashMap<String, AgentHandle>>,
     ) -> Result<AgentHandle> {
+        // Check if stdin is a TTY before attempting to enable keyboard input
+        let stdin_is_tty = stdin().is_terminal();
+
+        if !stdin_is_tty {
+            // Log warning through Console actor if available
+            if let Some(console) = actors.get("console") {
+                use crate::messages::PrintWarning;
+                let console_handle = console.clone();
+                // Send warning synchronously to ensure it's visible before proceeding
+                console_handle
+                    .send(PrintWarning(
+                        "Keyboard input disabled (non-TTY environment). Server will run without interactive commands.".to_string()
+                    ))
+                    .await;
+            }
+
+            warn!("Stdin is not a TTY - creating disabled KeyboardHandler");
+        }
+
         let mut builder = runtime
             .new_agent_with_name::<KeyboardHandler>("keyboard_handler".to_string())
             .await;
 
-        // Initialize model
+        // Initialize model with enabled status
         builder.model = KeyboardHandler {
+            enabled: stdin_is_tty,
             initialized: false,
             stop_tx: None,
         };
 
         let actors_for_start = Arc::clone(&actors);
-        builder.after_start(move |_| {
+        builder.after_start(move |agent| {
+            // Only enable raw mode if keyboard input is available
+            if !agent.model.enabled {
+                info!("KeyboardHandler started in disabled mode (no TTY)");
+                return AgentReply::immediate();
+            }
+
             info!("KeyboardHandler starting - enabling raw mode");
 
             // Enable raw mode
@@ -156,6 +200,12 @@ impl KeyboardHandler {
             }
 
             agent.model.initialized = true;
+
+            // Skip event loop creation if keyboard input is disabled
+            if !agent.model.enabled {
+                info!("Skipping keyboard event loop creation (handler disabled)");
+                return AgentReply::immediate();
+            }
 
             // Create a channel for stopping the event reader
             let (stop_tx, mut stop_rx) = mpsc::channel::<()>(1);
@@ -220,7 +270,13 @@ impl KeyboardHandler {
 
         // Clean up on shutdown
         let actors_for_stop = Arc::clone(&actors);
-        builder.before_stop(move |_agent| {
+        builder.before_stop(move |agent| {
+            // Only disable raw mode if keyboard input was enabled
+            if !agent.model.enabled {
+                info!("KeyboardHandler stopping (was disabled)");
+                return AgentReply::immediate();
+            }
+
             info!("KeyboardHandler stopping - disabling raw mode");
 
             // Notify Console actor that raw mode is being disabled
@@ -255,41 +311,90 @@ mod tests {
     #[test]
     fn test_keyboard_handler_default() {
         let handler = KeyboardHandler::default();
+        assert!(!handler.enabled);
         assert!(!handler.initialized);
         assert!(handler.stop_tx.is_none());
     }
 
-    /// Tests that the KeyboardHandler actor can be spawned and cleaned up properly.
+    /// Tests that the KeyboardHandler actor gracefully handles non-TTY environments.
     ///
     /// **Scenario:**
-    /// 1. Launch the runtime.
+    /// 1. Launch the runtime in a test environment (typically non-TTY).
     /// 2. Create the actors registry.
     /// 3. Spawn the KeyboardHandler actor.
     /// 4. Allow time for initialization.
-    /// 5. Shutdown the runtime (which stops all actors).
+    /// 5. Shutdown the runtime.
     ///
     /// **Verification:**
-    /// - The actor spawns successfully even in non-TTY environments.
+    /// - The actor spawns successfully without panicking.
+    /// - The handler is created in disabled mode when stdin is not a TTY.
     /// - Runtime shutdown completes without hanging.
+    /// - No attempt is made to create EventStream or enable raw mode.
     ///
-    /// **Note:** Actual keyboard event handling requires a TTY environment.
-    /// This test is ignored by default to prevent test hangs when running concurrently.
-    /// Run individually with: `cargo nextest run --ignored test_keyboard_handler_spawn_succeeds`
+    /// **Note:** This test runs in CI/CD and non-interactive environments where
+    /// stdin is not a TTY. The handler should gracefully disable itself.
     #[tokio::test(flavor = "multi_thread")]
-    #[ignore = "Requires TTY, blocks on stdin, causes hangs when run concurrently"]
-    async fn test_keyboard_handler_spawn_succeeds() {
+    async fn test_keyboard_handler_non_tty_environment() {
         let mut runtime = ActonApp::launch();
         let actors = Arc::new(DashMap::new());
 
-        // Spawn the actor - should succeed even in non-TTY environments
-        let _handle = KeyboardHandler::spawn(&mut runtime, Arc::clone(&actors))
+        // Spawn the actor - should succeed and disable itself in non-TTY
+        let handle = KeyboardHandler::spawn(&mut runtime, Arc::clone(&actors))
+            .await
+            .expect("Should spawn successfully even without TTY");
+
+        // Allow time for actor initialization
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+        // Send stop message to verify proper shutdown
+        handle.send(StopKeyboardHandler).await;
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+
+        // Shutdown should complete cleanly
+        runtime
+            .shutdown_all()
+            .await
+            .expect("Runtime should shutdown cleanly");
+    }
+
+    /// Tests that the KeyboardHandler actor works in TTY environments.
+    ///
+    /// **Scenario:**
+    /// 1. Launch the runtime in a TTY environment.
+    /// 2. Create the actors registry.
+    /// 3. Spawn the KeyboardHandler actor.
+    /// 4. Allow time for initialization.
+    /// 5. Shutdown the runtime.
+    ///
+    /// **Verification:**
+    /// - The actor spawns successfully and enables keyboard input.
+    /// - Raw mode is enabled on the terminal.
+    /// - Runtime shutdown properly disables raw mode and cleans up.
+    ///
+    /// **Note:** This test is ignored by default because it requires a TTY
+    /// environment and can block stdin. Run individually with:
+    /// `cargo nextest run --ignored test_keyboard_handler_with_tty`
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "Requires TTY, blocks on stdin, run manually in interactive terminal"]
+    async fn test_keyboard_handler_with_tty() {
+        let mut runtime = ActonApp::launch();
+        let actors = Arc::new(DashMap::new());
+
+        // Spawn the actor - should enable keyboard input if TTY is available
+        let handle = KeyboardHandler::spawn(&mut runtime, Arc::clone(&actors))
             .await
             .expect("Should spawn successfully");
 
         // Allow time for actor initialization
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
-        // Let runtime handle all cleanup - this is the key fix
+        // Send stop message to trigger cleanup
+        handle.send(StopKeyboardHandler).await;
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+
+        // Shutdown should complete and disable raw mode
         runtime
             .shutdown_all()
             .await

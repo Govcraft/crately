@@ -15,7 +15,7 @@ use crossterm::event::{KeyCode, KeyModifiers};
 use dashmap::DashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use tokio::sync::oneshot;
+use tokio::sync::broadcast;
 use tracing::{debug, error, info, warn};
 
 use crate::{
@@ -140,6 +140,13 @@ pub struct ServerActor {
     actors: Arc<DashMap<String, AgentHandle>>,
     /// Whether the server is currently running
     is_running: bool,
+    /// Broadcast sender for shutdown signals (Clone-able, optional)
+    ///
+    /// This channel sender is cloneable and can be stored in the actor state.
+    /// When we want to shut down the server, we send a signal through this channel.
+    /// The receiver lives in the server task and triggers graceful shutdown.
+    /// Created fresh each time the server starts.
+    shutdown_broadcast: Option<broadcast::Sender<()>>,
 }
 
 impl ServerActor {
@@ -200,6 +207,7 @@ impl ServerActor {
             config,
             actors,
             is_running: false,
+            shutdown_broadcast: None,
         };
 
         // Handle StartServer messages
@@ -226,8 +234,11 @@ impl ServerActor {
 
             let addr = SocketAddr::from(([127, 0, 0, 1], config.port));
 
-            // Create shutdown channel
-            let (_shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+            // Create a new broadcast channel for this server instance
+            let (shutdown_tx, mut shutdown_rx) = broadcast::channel::<()>(1);
+
+            // Store the sender for shutdown signaling
+            agent.model.shutdown_broadcast = Some(shutdown_tx);
 
             // Spawn the server in a background task
             tokio::spawn(async move {
@@ -256,8 +267,10 @@ impl ServerActor {
                 // Broadcast ServerStarted event after successful bind
                 broker.broadcast(ServerStarted).await;
 
+                // Set up graceful shutdown: wait for shutdown signal from broadcast channel
                 let server = axum::serve(listener, app).with_graceful_shutdown(async move {
-                    let _ = shutdown_rx.await;
+                    let _ = shutdown_rx.recv().await;
+                    info!("Received shutdown signal, initiating graceful shutdown");
                 });
 
                 if let Err(e) = server.await {
@@ -283,8 +296,14 @@ impl ServerActor {
 
             info!("Stopping HTTP server");
 
-            // Note: Server shutdown is handled by Axum's graceful shutdown
-            // which will complete when the server actor is stopped
+            // Send shutdown signal through broadcast channel if it exists
+            // This triggers the receiver in the server's graceful_shutdown handler
+            // to complete, signaling Axum to stop accepting new connections
+            // and drain existing requests before shutting down
+            if let Some(sender) = &agent.model.shutdown_broadcast {
+                let _ = sender.send(());
+            }
+            agent.model.shutdown_broadcast = None;
             agent.model.is_running = false;
 
             if let Some(console) = agent.model.actors.get("console") {
@@ -306,8 +325,13 @@ impl ServerActor {
             let new_config = envelope.message().config.clone();
             let was_running = agent.model.is_running;
 
-            // Stop the server if it's running
+            // Stop the server if it's running by sending shutdown signal
             if agent.model.is_running {
+                info!("Shutting down server for configuration reload");
+                if let Some(sender) = &agent.model.shutdown_broadcast {
+                    let _ = sender.send(());
+                }
+                agent.model.shutdown_broadcast = None;
                 agent.model.is_running = false;
             }
 
@@ -316,17 +340,25 @@ impl ServerActor {
             agent.model.config = new_config;
 
             // Restart the server if it was running
+            // We send a message to ourselves via the actor system, not a direct handle
             if was_running {
                 let console = agent.model.actors.get("console").map(|h| h.clone());
                 let broker = agent.broker().clone();
+                let server_actor = agent.model.actors.get("server").map(|h| h.clone());
 
-                if let Some(console) = console {
+                if let (Some(console), Some(server)) = (console, server_actor) {
                     return AgentReply::from_async(async move {
                         console
                             .send(PrintProgress(
                                 "Reloading server with new configuration...".to_string(),
                             ))
                             .await;
+
+                        // Wait a moment for old server to drain connections
+                        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+
+                        // Restart the server with new configuration
+                        server.send(StartServer).await;
 
                         // Broadcast ServerReloaded to notify Console of successful reload
                         broker.broadcast(ServerReloaded { port: config_port }).await;
@@ -474,6 +506,108 @@ mod tests {
         tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
         handle.send(StopServer).await;
         tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+
+        handle.stop().await.expect("Should stop cleanly");
+        runtime
+            .shutdown_all()
+            .await
+            .expect("Runtime should shutdown");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_server_shutdown_mechanism_works() {
+        use std::io::ErrorKind;
+
+        let mut runtime = ActonApp::launch();
+        // Use a fixed test port that's unlikely to conflict
+        let test_port = 38291;
+        let config = Config { port: test_port };
+        let actors = Arc::new(DashMap::new());
+
+        let handle = ServerActor::spawn(&mut runtime, config, actors.clone())
+            .await
+            .expect("Should spawn");
+
+        // Start the server
+        handle.send(StartServer).await;
+
+        // Wait for server to fully start and bind to port
+        tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
+
+        // Verify server is actually listening on the port
+        let listener_check = tokio::net::TcpListener::bind(("127.0.0.1", test_port)).await;
+        assert!(
+            listener_check.is_err(),
+            "Port should be in use when server is running"
+        );
+        if let Err(e) = listener_check {
+            assert_eq!(
+                e.kind(),
+                ErrorKind::AddrInUse,
+                "Expected address-in-use error"
+            );
+        }
+
+        // Stop the server
+        handle.send(StopServer).await;
+
+        // Wait for shutdown to complete
+        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+
+        // Verify server stopped by checking port is now available
+        let listener_check = tokio::net::TcpListener::bind(("127.0.0.1", test_port)).await;
+        assert!(
+            listener_check.is_ok(),
+            "Port should be available after server stops"
+        );
+
+        // Clean up the test listener
+        drop(listener_check);
+
+        handle.stop().await.expect("Should stop cleanly");
+        runtime
+            .shutdown_all()
+            .await
+            .expect("Runtime should shutdown");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_server_multiple_start_stop_cycles() {
+        use std::io::ErrorKind;
+
+        let mut runtime = ActonApp::launch();
+        let test_port = 38292;
+        let config = Config { port: test_port };
+        let actors = Arc::new(DashMap::new());
+
+        let handle = ServerActor::spawn(&mut runtime, config, actors.clone())
+            .await
+            .expect("Should spawn");
+
+        // Cycle 1: Start and stop
+        handle.send(StartServer).await;
+        tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+
+        let check1 = tokio::net::TcpListener::bind(("127.0.0.1", test_port)).await;
+        assert!(check1.is_err() && check1.unwrap_err().kind() == ErrorKind::AddrInUse);
+
+        handle.send(StopServer).await;
+        tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
+
+        // Cycle 2: Start again and verify it works
+        handle.send(StartServer).await;
+        tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+
+        let check2 = tokio::net::TcpListener::bind(("127.0.0.1", test_port)).await;
+        assert!(check2.is_err() && check2.unwrap_err().kind() == ErrorKind::AddrInUse);
+
+        handle.send(StopServer).await;
+        tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
+
+        // Verify port is free after final stop
+        let check3 = tokio::net::TcpListener::bind(("127.0.0.1", test_port)).await;
+        assert!(check3.is_ok(), "Port should be available after second stop");
+        drop(check3);
 
         handle.stop().await.expect("Should stop cleanly");
         runtime

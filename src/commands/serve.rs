@@ -15,6 +15,9 @@ use crate::{messages::StartServer, runtime::ActorSystem};
 /// starts the HTTP server, waits for a shutdown signal, and then triggers graceful
 /// shutdown via the ActorSystem.
 ///
+/// All actor initialization errors are reported through the Console actor to ensure
+/// users receive clear feedback when something goes wrong during startup.
+///
 /// # Arguments
 ///
 /// * `actor_system` - Pre-initialized actor system with core actors
@@ -40,13 +43,15 @@ pub async fn run(mut actor_system: ActorSystem) -> Result<()> {
     info!("Starting serve command");
 
     // Initialize server-specific actors (KeyboardHandler and ServerActor)
+    // Errors are automatically reported through Console actor before being propagated
     actor_system.initialize_server_actors().await?;
 
-    // Get the server actor and start it
+    // Validate that server actor was initialized successfully
     let server = actor_system
         .get_actor("server")
-        .expect("Server actor should exist after initialization");
+        .expect("Server actor should exist after successful initialization");
 
+    // Start the server - this sends StartServer message which triggers HTTP server startup
     server.send(StartServer).await;
 
     // Wait for shutdown signal (Ctrl+C, SIGTERM, or keyboard 'q')
