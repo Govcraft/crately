@@ -25,7 +25,7 @@ mti = { version = "1.0.0", features = ["serde", "instrument"] }
 semver = { version = "1.0", features = ["serde"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-surrealdb = { version = "2.3.10", features = ["rustls", "protocol-ws"] }
+surrealdb = { version = "2.3.10", features = ["rustls", "protocol-ws", "kv-rocksdb"] }
 toml = "0.8"
 tokio = { version = "1.41", features = ["full"] }
 tower = { version = "0.5.2", features = ["full"] }

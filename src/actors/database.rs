@@ -6,7 +6,7 @@
 use acton_reactive::prelude::*;
 use anyhow::Context;
 use std::path::PathBuf;
-use surrealdb::engine::any::Any;
+use surrealdb::engine::local::{Db, RocksDb};
 use surrealdb::Surreal;
 use tracing::*;
 
@@ -37,12 +37,39 @@ pub struct DatabaseInfo {
 ///
 /// The actor uses the Service Actor Pattern, returning both a handle and database
 /// connection information at spawn time.
-#[acton_actor]
+///
+/// Note: This actor does not use `#[acton_actor]` because `Surreal<Db>` does not
+/// implement `Default`. Instead, the actor model is constructed manually in the
+/// `spawn` method after establishing the database connection.
+#[derive(Clone, Debug)]
 pub struct DatabaseActor {
-    db: Surreal<Any>,
+    db: Surreal<Db>,
     namespace: String,
     database: String,
     db_path: PathBuf,
+}
+
+impl Default for DatabaseActor {
+    /// Provides a placeholder Default implementation required by acton-reactive.
+    ///
+    /// This Default creates a temporary instance that is immediately replaced by
+    /// the spawn method. The placeholder uses an in-memory database connection
+    /// that is never actually used since spawn() always overwrites builder.model
+    /// with a properly configured instance before starting the actor.
+    ///
+    /// Note: This implementation exists solely to satisfy acton-reactive's
+    /// requirement that actor types implement Default. The actual actor
+    /// initialization happens in spawn() via builder.model assignment.
+    fn default() -> Self {
+        // Create a placeholder instance with an in-memory connection
+        // This will be immediately replaced by spawn() before the actor starts
+        Self {
+            db: Surreal::init(),
+            namespace: String::new(),
+            database: String::new(),
+            db_path: PathBuf::new(),
+        }
+    }
 }
 
 impl DatabaseActor {
@@ -110,12 +137,10 @@ impl DatabaseActor {
         runtime: &mut AgentRuntime,
         db_path: PathBuf,
     ) -> anyhow::Result<(AgentHandle, DatabaseInfo)> {
-        // Create connection string for RocksDB
-        let connection_string = format!("rocksdb://{}", db_path.display());
-        info!("Connecting to database: {}", connection_string);
-
         // Connect to embedded RocksDB
-        let db = Surreal::new::<Any>(&connection_string)
+        info!("Connecting to database: {}", db_path.display());
+
+        let db = Surreal::new::<RocksDb>(db_path.clone())
             .await
             .with_context(|| {
                 format!(
@@ -224,28 +249,43 @@ impl DatabaseActor {
             let broker = agent.broker().clone();
 
             Box::pin(async move {
-                // Execute the query
-                match db
-                    .query("SELECT * FROM crate WHERE name = $name AND version = $version")
-                    .bind(("name", &msg.name))
-                    .bind(("version", &msg.version))
-                    .await
-                {
+                // Clone fields to avoid lifetime issues with query bindings
+                let name = msg.name.clone();
+                let version_opt = msg.version.clone();
+
+                // Build query based on whether version is specified
+                let query_result = if let Some(version) = version_opt {
+                    // Query for specific version
+                    db.query("SELECT * FROM crate WHERE name = $name AND version = $version")
+                        .bind(("name", name))
+                        .bind(("version", version))
+                        .await
+                } else {
+                    // Query for latest version (highest version number)
+                    db.query("SELECT * FROM crate WHERE name = $name ORDER BY version DESC LIMIT 1")
+                        .bind(("name", name))
+                        .await
+                };
+
+                match query_result {
                     Ok(mut response) => {
                         // Take the first result
                         let result: Result<Option<serde_json::Value>, _> = response.take(0);
                         match result {
                             Ok(Some(record)) => {
-                                debug!("Query successful for {}@{}: {:?}", msg.name, msg.version, record);
+                                let version_display = msg.version.as_deref().unwrap_or("latest");
+                                debug!("Query successful for {}@{}: {:?}", msg.name, version_display, record);
                             }
                             Ok(None) => {
-                                debug!("No record found for {}@{}", msg.name, msg.version);
+                                let version_display = msg.version.as_deref().unwrap_or("latest");
+                                debug!("No record found for {}@{}", msg.name, version_display);
                             }
                             Err(e) => {
                                 error!("Failed to parse query result: {}", e);
+                                let version_display = msg.version.as_deref().unwrap_or("latest");
                                 broker
                                     .broadcast(DatabaseError {
-                                        operation: format!("query crate {}@{}", msg.name, msg.version),
+                                        operation: format!("query crate {}@{}", msg.name, version_display),
                                         error: e.to_string(),
                                     })
                                     .await;
@@ -254,9 +294,10 @@ impl DatabaseActor {
                     }
                     Err(e) => {
                         error!("Failed to query crate: {}", e);
+                        let version_display = msg.version.as_deref().unwrap_or("latest");
                         broker
                             .broadcast(DatabaseError {
-                                operation: format!("query crate {}@{}", msg.name, msg.version),
+                                operation: format!("query crate {}@{}", msg.name, version_display),
                                 error: e.to_string(),
                             })
                             .await;
@@ -328,7 +369,7 @@ mod tests {
     use super::*;
     use std::env;
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread")]
     async fn test_database_actor_spawns_successfully() {
         let mut runtime = ActonApp::launch();
         let test_db_path = env::temp_dir().join("crately_test_db_spawn");
@@ -353,7 +394,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&test_db_path);
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread")]
     async fn test_database_actor_lifecycle() {
         let mut runtime = ActonApp::launch();
         let test_db_path = env::temp_dir().join("crately_test_db_lifecycle");
@@ -382,7 +423,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&test_db_path);
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread")]
     async fn test_multiple_database_actors_use_isolated_connections() {
         let mut runtime = ActonApp::launch();
         let test_db_path_1 = env::temp_dir().join("crately_test_db_isolated_1");

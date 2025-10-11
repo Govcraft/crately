@@ -14,6 +14,7 @@
 //!   - [`Console`](console::Console) - Output formatting actor
 //!   - [`ConfigManager`](config::ConfigManager) - Configuration management with hot-reload
 //!   - [`CrateDownloader`](crate_downloader::CrateDownloader) - Crate download orchestration
+//!   - [`DatabaseActor`](database::DatabaseActor) - SurrealDB persistence management
 //!
 //! - **Server Actors** (initialized in `ActorSystem::initialize_server_actors()`):
 //!   - [`KeyboardHandler`](keyboard_handler::KeyboardHandler) - Interactive keyboard input
@@ -22,5 +23,6 @@
 pub mod config;
 pub mod console;
 pub mod crate_downloader;
+pub mod database;
 pub mod keyboard_handler;
 pub mod server_actor;
