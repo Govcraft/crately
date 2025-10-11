@@ -558,213 +558,358 @@ impl DatabaseActor {
 mod tests {
     use super::*;
     use std::env;
+    use std::time::{SystemTime, UNIX_EPOCH};
+    use tokio::time::Duration;
+
+    /// Helper: Create a unique test database path using test name and timestamp
+    /// to prevent lock contention between parallel tests.
+    fn create_test_db_path(test_name: &str) -> std::path::PathBuf {
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        env::temp_dir().join(format!("crately_test_{}_{}", test_name, timestamp))
+    }
+
+    /// Helper: Clean up test database with retry logic to handle file locks.
+    async fn cleanup_test_db(path: &std::path::Path) {
+        // Give RocksDB time to release file locks
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // Retry cleanup a few times if locks are still held
+        for attempt in 0..3 {
+            match std::fs::remove_dir_all(path) {
+                Ok(()) => break,
+                Err(e) if attempt < 2 => {
+                    tracing::warn!("Cleanup attempt {} failed: {}, retrying...", attempt + 1, e);
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+                Err(e) => {
+                    tracing::warn!("Final cleanup attempt failed: {}", e);
+                }
+            }
+        }
+    }
+
+    /// TestSubscriber helper actor for verifying broadcast responses in DatabaseActor tests.
+    ///
+    /// This actor subscribes to CrateQueryResponse, CrateListResponse, and DatabaseError
+    /// broadcasts and collects them for verification in the after_stop hook.
+    ///
+    /// Follows the acton-reactive test pattern:
+    /// 1. Subscribe to message types before starting
+    /// 2. Collect responses during execution
+    /// 3. Assert expectations in after_stop hook
+    #[acton_actor]
+    #[derive(Default, Clone)]
+    struct TestSubscriber {
+        query_responses: Vec<CrateQueryResponse>,
+        list_responses: Vec<CrateListResponse>,
+        error_responses: Vec<DatabaseError>,
+    }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn test_database_actor_spawns_successfully() {
-        let mut runtime = ActonApp::launch();
-        let test_db_path = env::temp_dir().join("crately_test_db_spawn");
+        tokio::time::timeout(Duration::from_secs(10), async {
+            let mut runtime = ActonApp::launch();
+            let test_db_path = create_test_db_path("spawn");
 
-        // Clean up any existing test database
-        let _ = std::fs::remove_dir_all(&test_db_path);
+            let result = DatabaseActor::spawn(&mut runtime, test_db_path.clone()).await;
 
-        let result = DatabaseActor::spawn(&mut runtime, test_db_path.clone()).await;
+            assert!(result.is_ok(), "DatabaseActor should spawn successfully");
 
-        assert!(result.is_ok(), "DatabaseActor should spawn successfully");
+            let (handle, db_info) = result.unwrap();
+            assert_eq!(db_info.namespace, "crately");
+            assert_eq!(db_info.database, "production");
+            assert_eq!(db_info.db_path, test_db_path);
 
-        let (handle, db_info) = result.unwrap();
-        assert_eq!(db_info.namespace, "crately");
-        assert_eq!(db_info.database, "production");
-        assert_eq!(db_info.db_path, test_db_path);
+            // Clean shutdown
+            handle.stop().await.unwrap();
+            runtime.shutdown_all().await.unwrap();
 
-        // Clean shutdown
-        handle.stop().await.unwrap();
-        runtime.shutdown_all().await.unwrap();
-
-        // Cleanup
-        let _ = std::fs::remove_dir_all(&test_db_path);
+            // Cleanup with proper delay
+            cleanup_test_db(&test_db_path).await;
+        })
+        .await
+        .expect("Test should complete within timeout");
     }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn test_database_actor_lifecycle() {
-        let mut runtime = ActonApp::launch();
-        let test_db_path = env::temp_dir().join("crately_test_db_lifecycle");
+        tokio::time::timeout(Duration::from_secs(10), async {
+            let mut runtime = ActonApp::launch();
+            let test_db_path = create_test_db_path("lifecycle");
 
-        // Clean up any existing test database
-        let _ = std::fs::remove_dir_all(&test_db_path);
+            // Spawn actor
+            let (handle, _db_info) = DatabaseActor::spawn(&mut runtime, test_db_path.clone())
+                .await
+                .unwrap();
 
-        // Spawn actor
-        let (handle, _db_info) = DatabaseActor::spawn(&mut runtime, test_db_path.clone())
-            .await
-            .unwrap();
+            // Give the after_start hook time to execute
+            tokio::time::sleep(Duration::from_millis(200)).await;
 
-        // Give the after_start hook time to execute
-        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+            // Stop actor gracefully
+            let stop_result = handle.stop().await;
+            assert!(
+                stop_result.is_ok(),
+                "DatabaseActor should stop gracefully"
+            );
 
-        // Stop actor gracefully
-        let stop_result = handle.stop().await;
-        assert!(
-            stop_result.is_ok(),
-            "DatabaseActor should stop gracefully"
-        );
+            runtime.shutdown_all().await.unwrap();
 
-        runtime.shutdown_all().await.unwrap();
-
-        // Cleanup
-        let _ = std::fs::remove_dir_all(&test_db_path);
+            // Cleanup with proper delay
+            cleanup_test_db(&test_db_path).await;
+        })
+        .await
+        .expect("Test should complete within timeout");
     }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn test_multiple_database_actors_use_isolated_connections() {
-        let mut runtime = ActonApp::launch();
-        let test_db_path_1 = env::temp_dir().join("crately_test_db_isolated_1");
-        let test_db_path_2 = env::temp_dir().join("crately_test_db_isolated_2");
+        tokio::time::timeout(Duration::from_secs(10), async {
+            let mut runtime = ActonApp::launch();
+            let test_db_path_1 = create_test_db_path("isolated_1");
+            let test_db_path_2 = create_test_db_path("isolated_2");
 
-        // Clean up any existing test databases
-        let _ = std::fs::remove_dir_all(&test_db_path_1);
-        let _ = std::fs::remove_dir_all(&test_db_path_2);
+            // Spawn first actor
+            let result1 = DatabaseActor::spawn(&mut runtime, test_db_path_1.clone()).await;
+            assert!(result1.is_ok(), "First DatabaseActor should spawn");
 
-        // Spawn first actor
-        let result1 = DatabaseActor::spawn(&mut runtime, test_db_path_1.clone()).await;
-        assert!(result1.is_ok(), "First DatabaseActor should spawn");
+            // Spawn second actor with different path
+            let result2 = DatabaseActor::spawn(&mut runtime, test_db_path_2.clone()).await;
+            assert!(result2.is_ok(), "Second DatabaseActor should spawn");
 
-        // Spawn second actor with different path
-        let result2 = DatabaseActor::spawn(&mut runtime, test_db_path_2.clone()).await;
-        assert!(result2.is_ok(), "Second DatabaseActor should spawn");
+            let (handle1, db_info1) = result1.unwrap();
+            let (handle2, db_info2) = result2.unwrap();
 
-        let (handle1, db_info1) = result1.unwrap();
-        let (handle2, db_info2) = result2.unwrap();
+            // Verify they use different paths
+            assert_ne!(
+                db_info1.db_path, db_info2.db_path,
+                "Database actors should use isolated paths"
+            );
 
-        // Verify they use different paths
-        assert_ne!(
-            db_info1.db_path, db_info2.db_path,
-            "Database actors should use isolated paths"
-        );
+            // Clean shutdown
+            handle1.stop().await.unwrap();
+            handle2.stop().await.unwrap();
+            runtime.shutdown_all().await.unwrap();
 
-        // Clean shutdown
-        handle1.stop().await.unwrap();
-        handle2.stop().await.unwrap();
-        runtime.shutdown_all().await.unwrap();
-
-        // Cleanup
-        let _ = std::fs::remove_dir_all(&test_db_path_1);
-        let _ = std::fs::remove_dir_all(&test_db_path_2);
+            // Cleanup with proper delays
+            cleanup_test_db(&test_db_path_1).await;
+            cleanup_test_db(&test_db_path_2).await;
+        })
+        .await
+        .expect("Test should complete within timeout");
     }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn test_database_actor_query_crate_specific_version() {
-        use std::str::FromStr;
+        tokio::time::timeout(Duration::from_secs(15), async {
+            use std::str::FromStr;
 
-        let mut runtime = ActonApp::launch();
-        let test_db_path = env::temp_dir().join("crately_test_db_query_specific");
+            let mut runtime = ActonApp::launch();
+            let test_db_path = create_test_db_path("query_specific");
 
-        // Clean up any existing test database
-        let _ = std::fs::remove_dir_all(&test_db_path);
+            let (handle, _db_info) = DatabaseActor::spawn(&mut runtime, test_db_path.clone())
+                .await
+                .unwrap();
 
-        let (handle, _db_info) = DatabaseActor::spawn(&mut runtime, test_db_path.clone())
-            .await
-            .unwrap();
+            // Create TestSubscriber to verify responses
+            let mut subscriber_builder = runtime.new_agent::<TestSubscriber>().await;
 
-        // Wait for schema initialization
-        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+            // Configure handler to collect query responses
+            subscriber_builder.mutate_on::<CrateQueryResponse>(|agent, envelope| {
+                let msg = envelope.message().clone();
+                agent.model.query_responses.push(msg);
+                AgentReply::immediate()
+            });
 
-        // Persist a test crate
-        let specifier = CrateSpecifier::from_str("serde@1.0.0").unwrap();
-        handle
-            .send(PersistCrate {
-                specifier,
-                features: vec!["derive".to_string()],
-            })
-            .await;
+            // Verify responses in after_stop hook
+            subscriber_builder.after_stop(|agent| {
+                assert_eq!(agent.model.query_responses.len(), 1, "Should receive exactly one query response");
 
-        // Wait for persistence
-        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+                let response = &agent.model.query_responses[0];
+                assert!(response.specifier.is_some(), "Should find the crate");
 
-        // Query for the specific version
-        handle
-            .send(QueryCrate {
-                name: "serde".to_string(),
-                version: Some("1.0.0".to_string()),
-            })
-            .await;
+                let spec = response.specifier.as_ref().unwrap();
+                assert_eq!(spec.name(), "serde", "Crate name should match");
+                assert_eq!(spec.version().to_string(), "1.0.0", "Version should match");
+                assert_eq!(response.features, vec!["derive"], "Features should match");
+                assert_eq!(response.status, "pending", "Status should be pending");
+                assert!(!response.created_at.is_empty(), "Should have created_at timestamp");
 
-        // Wait for query to complete
-        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+                AgentReply::immediate()
+            });
 
-        // Clean shutdown
-        handle.stop().await.unwrap();
-        runtime.shutdown_all().await.unwrap();
+            // Subscribe to broadcast messages before starting
+            subscriber_builder.handle().subscribe::<CrateQueryResponse>().await;
+            let subscriber_handle = subscriber_builder.start().await;
 
-        // Cleanup
-        let _ = std::fs::remove_dir_all(&test_db_path);
+            // Wait for schema initialization with longer timeout for safety
+            tokio::time::sleep(Duration::from_millis(300)).await;
+
+            // Persist a test crate
+            let specifier = CrateSpecifier::from_str("serde@1.0.0").unwrap();
+            handle
+                .send(PersistCrate {
+                    specifier,
+                    features: vec!["derive".to_string()],
+                })
+                .await;
+
+            // Wait for persistence with longer timeout
+            tokio::time::sleep(Duration::from_millis(200)).await;
+
+            // Query for the specific version
+            handle
+                .send(QueryCrate {
+                    name: "serde".to_string(),
+                    version: Some("1.0.0".to_string()),
+                })
+                .await;
+
+            // Wait for query to complete and broadcast with longer timeout
+            tokio::time::sleep(Duration::from_millis(200)).await;
+
+            // Clean shutdown (subscriber assertions trigger in after_stop)
+            subscriber_handle.stop().await.unwrap();
+            handle.stop().await.unwrap();
+            runtime.shutdown_all().await.unwrap();
+
+            // Cleanup with proper delay
+            cleanup_test_db(&test_db_path).await;
+        })
+        .await
+        .expect("Test should complete within timeout");
     }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn test_database_actor_query_crate_latest_version() {
-        use std::str::FromStr;
+        tokio::time::timeout(Duration::from_secs(15), async {
+            use std::str::FromStr;
 
-        let mut runtime = ActonApp::launch();
-        let test_db_path = env::temp_dir().join("crately_test_db_query_latest");
+            let mut runtime = ActonApp::launch();
+            let test_db_path = create_test_db_path("query_latest");
 
-        // Clean up any existing test database
-        let _ = std::fs::remove_dir_all(&test_db_path);
+            let (handle, _db_info) = DatabaseActor::spawn(&mut runtime, test_db_path.clone())
+                .await
+                .unwrap();
 
-        let (handle, _db_info) = DatabaseActor::spawn(&mut runtime, test_db_path.clone())
-            .await
-            .unwrap();
+        // Create TestSubscriber to verify responses
+        let mut subscriber_builder = runtime.new_agent::<TestSubscriber>().await;
 
-        // Wait for schema initialization
-        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+        // Configure handler to collect query responses
+        subscriber_builder.mutate_on::<CrateQueryResponse>(|agent, envelope| {
+            let msg = envelope.message().clone();
+            agent.model.query_responses.push(msg);
+            AgentReply::immediate()
+        });
 
-        // Persist multiple versions of the same crate
-        let specifier1 = CrateSpecifier::from_str("tokio@1.35.0").unwrap();
-        handle
-            .send(PersistCrate {
-                specifier: specifier1,
-                features: vec![],
-            })
-            .await;
+        // Verify responses in after_stop hook
+        subscriber_builder.after_stop(|agent| {
+            assert_eq!(agent.model.query_responses.len(), 1, "Should receive exactly one query response");
 
-        let specifier2 = CrateSpecifier::from_str("tokio@1.36.0").unwrap();
-        handle
-            .send(PersistCrate {
-                specifier: specifier2,
-                features: vec!["full".to_string()],
-            })
-            .await;
+            let response = &agent.model.query_responses[0];
+            assert!(response.specifier.is_some(), "Should find the latest version");
 
-        // Wait for persistence
-        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+            let spec = response.specifier.as_ref().unwrap();
+            assert_eq!(spec.name(), "tokio", "Crate name should match");
+            assert_eq!(spec.version().to_string(), "1.36.0", "Should return latest version");
+            assert_eq!(response.features, vec!["full"], "Features should match latest version");
+            assert_eq!(response.status, "pending", "Status should be pending");
+            assert!(!response.created_at.is_empty(), "Should have created_at timestamp");
 
-        // Query for latest version (version = None)
-        handle
-            .send(QueryCrate {
-                name: "tokio".to_string(),
-                version: None,
-            })
-            .await;
+            AgentReply::immediate()
+        });
 
-        // Wait for query to complete
-        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+            // Subscribe to broadcast messages before starting
+            subscriber_builder.handle().subscribe::<CrateQueryResponse>().await;
+            let subscriber_handle = subscriber_builder.start().await;
 
-        // Clean shutdown
-        handle.stop().await.unwrap();
-        runtime.shutdown_all().await.unwrap();
+            // Wait for schema initialization with longer timeout
+            tokio::time::sleep(Duration::from_millis(300)).await;
 
-        // Cleanup
-        let _ = std::fs::remove_dir_all(&test_db_path);
+            // Persist multiple versions of the same crate
+            let specifier1 = CrateSpecifier::from_str("tokio@1.35.0").unwrap();
+            handle
+                .send(PersistCrate {
+                    specifier: specifier1,
+                    features: vec![],
+                })
+                .await;
+
+            let specifier2 = CrateSpecifier::from_str("tokio@1.36.0").unwrap();
+            handle
+                .send(PersistCrate {
+                    specifier: specifier2,
+                    features: vec!["full".to_string()],
+                })
+                .await;
+
+            // Wait for persistence with longer timeout
+            tokio::time::sleep(Duration::from_millis(200)).await;
+
+            // Query for latest version (version = None)
+            handle
+                .send(QueryCrate {
+                    name: "tokio".to_string(),
+                    version: None,
+                })
+                .await;
+
+            // Wait for query to complete and broadcast with longer timeout
+            tokio::time::sleep(Duration::from_millis(200)).await;
+
+            // Clean shutdown (subscriber assertions trigger in after_stop)
+            subscriber_handle.stop().await.unwrap();
+            handle.stop().await.unwrap();
+            runtime.shutdown_all().await.unwrap();
+
+            // Cleanup with proper delay
+            cleanup_test_db(&test_db_path).await;
+        })
+        .await
+        .expect("Test should complete within timeout");
     }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn test_database_actor_query_crate_not_found() {
-        let mut runtime = ActonApp::launch();
-        let test_db_path = env::temp_dir().join("crately_test_db_query_not_found");
+        tokio::time::timeout(Duration::from_secs(15), async {
+            let mut runtime = ActonApp::launch();
+            let test_db_path = create_test_db_path("query_not_found");
 
-        // Clean up any existing test database
-        let _ = std::fs::remove_dir_all(&test_db_path);
+            // Clean up any existing test database
+            let _ = std::fs::remove_dir_all(&test_db_path);
 
         let (handle, _db_info) = DatabaseActor::spawn(&mut runtime, test_db_path.clone())
             .await
             .unwrap();
+
+        // Create TestSubscriber to verify responses
+        let mut subscriber_builder = runtime.new_agent::<TestSubscriber>().await;
+
+        // Configure handler to collect query responses
+        subscriber_builder.mutate_on::<CrateQueryResponse>(|agent, envelope| {
+            let msg = envelope.message().clone();
+            agent.model.query_responses.push(msg);
+            AgentReply::immediate()
+        });
+
+        // Verify responses in after_stop hook
+        subscriber_builder.after_stop(|agent| {
+            assert_eq!(agent.model.query_responses.len(), 1, "Should receive exactly one query response");
+
+            let response = &agent.model.query_responses[0];
+            assert!(response.specifier.is_none(), "Should not find non-existent crate");
+            assert_eq!(response.status, "not_found", "Status should be not_found");
+            assert!(response.features.is_empty(), "Features should be empty");
+            assert!(response.created_at.is_empty(), "created_at should be empty");
+
+            AgentReply::immediate()
+        });
+
+        // Subscribe to broadcast messages before starting
+        subscriber_builder.handle().subscribe::<CrateQueryResponse>().await;
+        let subscriber_handle = subscriber_builder.start().await;
 
         // Wait for schema initialization
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
@@ -777,30 +922,65 @@ mod tests {
             })
             .await;
 
-        // Wait for query to complete
+        // Wait for query to complete and broadcast
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
-        // Clean shutdown
+        // Clean shutdown (subscriber assertions trigger in after_stop)
+        subscriber_handle.stop().await.unwrap();
         handle.stop().await.unwrap();
         runtime.shutdown_all().await.unwrap();
 
         // Cleanup
-        let _ = std::fs::remove_dir_all(&test_db_path);
+        cleanup_test_db(&test_db_path).await;
+        })
+        .await
+        .expect("Test should complete within timeout");
     }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn test_database_actor_list_crates_default_pagination() {
-        use std::str::FromStr;
+        tokio::time::timeout(Duration::from_secs(15), async {
+            use std::str::FromStr;
 
-        let mut runtime = ActonApp::launch();
-        let test_db_path = env::temp_dir().join("crately_test_db_list_default");
+            let mut runtime = ActonApp::launch();
+            let test_db_path = create_test_db_path("list_default");
 
-        // Clean up any existing test database
-        let _ = std::fs::remove_dir_all(&test_db_path);
+            // Clean up any existing test database
+            let _ = std::fs::remove_dir_all(&test_db_path);
 
         let (handle, _db_info) = DatabaseActor::spawn(&mut runtime, test_db_path.clone())
             .await
             .unwrap();
+
+        // Create TestSubscriber to verify responses
+        let mut subscriber_builder = runtime.new_agent::<TestSubscriber>().await;
+
+        // Configure handler to collect list responses
+        subscriber_builder.mutate_on::<CrateListResponse>(|agent, envelope| {
+            let msg = envelope.message().clone();
+            agent.model.list_responses.push(msg);
+            AgentReply::immediate()
+        });
+
+        // Verify responses in after_stop hook
+        subscriber_builder.after_stop(|agent| {
+            assert_eq!(agent.model.list_responses.len(), 1, "Should receive exactly one list response");
+
+            let response = &agent.model.list_responses[0];
+            assert_eq!(response.crates.len(), 2, "Should list 2 crates");
+            assert_eq!(response.total_count, 2, "Total count should be 2");
+
+            // Verify crate summaries contain expected data
+            let crate_names: Vec<&str> = response.crates.iter().map(|c| c.name.as_str()).collect();
+            assert!(crate_names.contains(&"serde"), "Should contain serde");
+            assert!(crate_names.contains(&"tokio"), "Should contain tokio");
+
+            AgentReply::immediate()
+        });
+
+        // Subscribe to broadcast messages before starting
+        subscriber_builder.handle().subscribe::<CrateListResponse>().await;
+        let subscriber_handle = subscriber_builder.start().await;
 
         // Wait for schema initialization
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
@@ -833,30 +1013,66 @@ mod tests {
             })
             .await;
 
-        // Wait for list to complete
+        // Wait for list to complete and broadcast
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
-        // Clean shutdown
+        // Clean shutdown (subscriber assertions trigger in after_stop)
+        subscriber_handle.stop().await.unwrap();
         handle.stop().await.unwrap();
         runtime.shutdown_all().await.unwrap();
 
         // Cleanup
-        let _ = std::fs::remove_dir_all(&test_db_path);
+        cleanup_test_db(&test_db_path).await;
+        })
+        .await
+        .expect("Test should complete within timeout");
     }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn test_database_actor_list_crates_with_pagination() {
-        use std::str::FromStr;
+        tokio::time::timeout(Duration::from_secs(15), async {
+            use std::str::FromStr;
 
-        let mut runtime = ActonApp::launch();
-        let test_db_path = env::temp_dir().join("crately_test_db_list_paginated");
+            let mut runtime = ActonApp::launch();
+            let test_db_path = create_test_db_path("list_paginated");
 
-        // Clean up any existing test database
-        let _ = std::fs::remove_dir_all(&test_db_path);
+            // Clean up any existing test database
+            let _ = std::fs::remove_dir_all(&test_db_path);
 
         let (handle, _db_info) = DatabaseActor::spawn(&mut runtime, test_db_path.clone())
             .await
             .unwrap();
+
+        // Create TestSubscriber to verify responses
+        let mut subscriber_builder = runtime.new_agent::<TestSubscriber>().await;
+
+        // Configure handler to collect list responses
+        subscriber_builder.mutate_on::<CrateListResponse>(|agent, envelope| {
+            let msg = envelope.message().clone();
+            agent.model.list_responses.push(msg);
+            AgentReply::immediate()
+        });
+
+        // Verify responses in after_stop hook
+        subscriber_builder.after_stop(|agent| {
+            assert_eq!(agent.model.list_responses.len(), 2, "Should receive two list responses (2 pages)");
+
+            // First page should have 2 crates
+            let first_page = &agent.model.list_responses[0];
+            assert_eq!(first_page.crates.len(), 2, "First page should have 2 crates");
+            assert_eq!(first_page.total_count, 5, "Total count should be 5");
+
+            // Second page should have 2 crates
+            let second_page = &agent.model.list_responses[1];
+            assert_eq!(second_page.crates.len(), 2, "Second page should have 2 crates");
+            assert_eq!(second_page.total_count, 5, "Total count should be 5");
+
+            AgentReply::immediate()
+        });
+
+        // Subscribe to broadcast messages before starting
+        subscriber_builder.handle().subscribe::<CrateListResponse>().await;
+        let subscriber_handle = subscriber_builder.start().await;
 
         // Wait for schema initialization
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
@@ -895,28 +1111,58 @@ mod tests {
             })
             .await;
 
-        // Wait for list to complete
+        // Wait for list to complete and broadcast
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
-        // Clean shutdown
+        // Clean shutdown (subscriber assertions trigger in after_stop)
+        subscriber_handle.stop().await.unwrap();
         handle.stop().await.unwrap();
         runtime.shutdown_all().await.unwrap();
 
         // Cleanup
-        let _ = std::fs::remove_dir_all(&test_db_path);
+        cleanup_test_db(&test_db_path).await;
+        })
+        .await
+        .expect("Test should complete within timeout");
     }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn test_database_actor_list_crates_empty_database() {
-        let mut runtime = ActonApp::launch();
-        let test_db_path = env::temp_dir().join("crately_test_db_list_empty");
+        tokio::time::timeout(Duration::from_secs(15), async {
+            let mut runtime = ActonApp::launch();
+            let test_db_path = create_test_db_path("list_empty");
 
-        // Clean up any existing test database
-        let _ = std::fs::remove_dir_all(&test_db_path);
+            // Clean up any existing test database
+            let _ = std::fs::remove_dir_all(&test_db_path);
 
         let (handle, _db_info) = DatabaseActor::spawn(&mut runtime, test_db_path.clone())
             .await
             .unwrap();
+
+        // Create TestSubscriber to verify responses
+        let mut subscriber_builder = runtime.new_agent::<TestSubscriber>().await;
+
+        // Configure handler to collect list responses
+        subscriber_builder.mutate_on::<CrateListResponse>(|agent, envelope| {
+            let msg = envelope.message().clone();
+            agent.model.list_responses.push(msg);
+            AgentReply::immediate()
+        });
+
+        // Verify responses in after_stop hook
+        subscriber_builder.after_stop(|agent| {
+            assert_eq!(agent.model.list_responses.len(), 1, "Should receive exactly one list response");
+
+            let response = &agent.model.list_responses[0];
+            assert!(response.crates.is_empty(), "Should return empty crates list");
+            assert_eq!(response.total_count, 0, "Total count should be 0");
+
+            AgentReply::immediate()
+        });
+
+        // Subscribe to broadcast messages before starting
+        subscriber_builder.handle().subscribe::<CrateListResponse>().await;
+        let subscriber_handle = subscriber_builder.start().await;
 
         // Wait for schema initialization
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
@@ -929,14 +1175,18 @@ mod tests {
             })
             .await;
 
-        // Wait for list to complete
+        // Wait for list to complete and broadcast
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
-        // Clean shutdown
+        // Clean shutdown (subscriber assertions trigger in after_stop)
+        subscriber_handle.stop().await.unwrap();
         handle.stop().await.unwrap();
         runtime.shutdown_all().await.unwrap();
 
         // Cleanup
-        let _ = std::fs::remove_dir_all(&test_db_path);
+        cleanup_test_db(&test_db_path).await;
+        })
+        .await
+        .expect("Test should complete within timeout");
     }
 }
