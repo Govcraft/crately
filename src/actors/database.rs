@@ -14,9 +14,13 @@ use std::str::FromStr;
 
 use crate::crate_specifier::CrateSpecifier;
 use crate::messages::{
-    CrateListResponse, CrateQueryResponse, CrateSummary, DatabaseError, DatabaseReady,
-    ListCrates, PersistCrate, QueryCrate,
+    CrateDownloaded, CrateListResponse, CrateProcessingComplete, CrateProcessingFailed,
+    CrateQueryResponse, CrateSummary, DatabaseError, DatabaseReady, DocumentationChunked,
+    DocumentationExtracted, DocumentationVectorized, ListCrates, PersistCodeSample,
+    PersistCrate, PersistDocChunk, PersistEmbedding, QueryCrate, QuerySimilarDocs,
+    SimilarDocsResponse,
 };
+use crate::types::SearchResult;
 
 /// Information about the database connection returned at spawn time.
 ///
@@ -488,6 +492,850 @@ impl DatabaseActor {
                         broker
                             .broadcast(DatabaseError {
                                 operation: "list crates".to_string(),
+                                error: e.to_string(),
+                            })
+                            .await;
+                    }
+                }
+            })
+        });
+
+        // Subscribe to pipeline events for state tracking
+        builder.handle().subscribe::<CrateDownloaded>().await;
+        builder.handle().subscribe::<DocumentationExtracted>().await;
+        builder.handle().subscribe::<DocumentationChunked>().await;
+        builder.handle().subscribe::<DocumentationVectorized>().await;
+        builder.handle().subscribe::<CrateProcessingComplete>().await;
+        builder.handle().subscribe::<CrateProcessingFailed>().await;
+
+        // Handle CrateDownloaded - update status and record download completion
+        builder.act_on::<CrateDownloaded>(|agent, envelope| {
+            let msg = envelope.message().clone();
+            let db = agent.model.db.clone();
+            let broker = agent.broker().clone();
+
+            AgentReply::from_async(async move {
+                let name = msg.specifier.name().to_string();
+                let version = msg.specifier.version().to_string();
+                let path = msg.extracted_path.to_string_lossy().to_string();
+
+                let update_query = r#"
+                    UPDATE crate SET
+                        status = 'downloaded',
+                        status_updated_at = time::now(),
+                        download_completed_at = time::now(),
+                        download_path = $path,
+                        extraction_path = $extracted_path
+                    WHERE name = $name AND version = $version
+                "#;
+
+                match db
+                    .query(update_query)
+                    .bind(("name", name.clone()))
+                    .bind(("version", version.clone()))
+                    .bind(("path", path.clone()))
+                    .bind(("extracted_path", path.clone()))
+                    .await
+                {
+                    Ok(_) => {
+                        debug!(
+                            "Updated crate status to downloaded: {}@{}",
+                            name, version
+                        );
+                    }
+                    Err(e) => {
+                        error!("Failed to update crate download status: {}", e);
+                        broker
+                            .broadcast(DatabaseError {
+                                operation: format!(
+                                    "update download status for {}@{}",
+                                    name, version
+                                ),
+                                error: e.to_string(),
+                            })
+                            .await;
+                    }
+                }
+            })
+        });
+
+        // Handle DocumentationExtracted - update status and record extraction
+        builder.act_on::<DocumentationExtracted>(|agent, envelope| {
+            let msg = envelope.message().clone();
+            let db = agent.model.db.clone();
+            let broker = agent.broker().clone();
+
+            AgentReply::from_async(async move {
+                let name = msg.specifier.name().to_string();
+                let version = msg.specifier.version().to_string();
+                let file_count = msg.file_count;
+                let documentation_bytes = msg.documentation_bytes;
+
+                let update_query = r#"
+                    UPDATE crate SET
+                        status = 'extracted',
+                        status_updated_at = time::now(),
+                        extraction_completed_at = time::now()
+                    WHERE name = $name AND version = $version
+                "#;
+
+                match db
+                    .query(update_query)
+                    .bind(("name", name.clone()))
+                    .bind(("version", version.clone()))
+                    .await
+                {
+                    Ok(_) => {
+                        debug!(
+                            "Updated crate status to extracted: {}@{} ({} files, {} bytes)",
+                            name, version, file_count, documentation_bytes
+                        );
+                    }
+                    Err(e) => {
+                        error!("Failed to update crate extraction status: {}", e);
+                        broker
+                            .broadcast(DatabaseError {
+                                operation: format!(
+                                    "update extraction status for {}@{}",
+                                    name, version
+                                ),
+                                error: e.to_string(),
+                            })
+                            .await;
+                    }
+                }
+            })
+        });
+
+        // Handle DocumentationChunked - update status and record chunking
+        builder.act_on::<DocumentationChunked>(|agent, envelope| {
+            let msg = envelope.message().clone();
+            let db = agent.model.db.clone();
+            let broker = agent.broker().clone();
+
+            AgentReply::from_async(async move {
+                let name = msg.specifier.name().to_string();
+                let version = msg.specifier.version().to_string();
+                let chunk_count = msg.chunk_count;
+
+                let update_query = r#"
+                    UPDATE crate SET
+                        status = 'chunked',
+                        status_updated_at = time::now(),
+                        chunking_completed_at = time::now()
+                    WHERE name = $name AND version = $version
+                "#;
+
+                match db
+                    .query(update_query)
+                    .bind(("name", name.clone()))
+                    .bind(("version", version.clone()))
+                    .await
+                {
+                    Ok(_) => {
+                        debug!(
+                            "Updated crate status to chunked: {}@{} ({} chunks)",
+                            name, version, chunk_count
+                        );
+                    }
+                    Err(e) => {
+                        error!("Failed to update crate chunking status: {}", e);
+                        broker
+                            .broadcast(DatabaseError {
+                                operation: format!(
+                                    "update chunking status for {}@{}",
+                                    name, version
+                                ),
+                                error: e.to_string(),
+                            })
+                            .await;
+                    }
+                }
+            })
+        });
+
+        // Handle DocumentationVectorized - update status and record vectorization
+        builder.act_on::<DocumentationVectorized>(|agent, envelope| {
+            let msg = envelope.message().clone();
+            let db = agent.model.db.clone();
+            let broker = agent.broker().clone();
+
+            AgentReply::from_async(async move {
+                let name = msg.specifier.name().to_string();
+                let version = msg.specifier.version().to_string();
+                let vector_count = msg.vector_count;
+                let embedding_model = msg.embedding_model.clone();
+
+                let update_query = r#"
+                    UPDATE crate SET
+                        status = 'vectorized',
+                        status_updated_at = time::now(),
+                        vectorization_completed_at = time::now()
+                    WHERE name = $name AND version = $version
+                "#;
+
+                match db
+                    .query(update_query)
+                    .bind(("name", name.clone()))
+                    .bind(("version", version.clone()))
+                    .await
+                {
+                    Ok(_) => {
+                        debug!(
+                            "Updated crate status to vectorized: {}@{} ({} vectors, model: {})",
+                            name, version, vector_count, embedding_model
+                        );
+                    }
+                    Err(e) => {
+                        error!("Failed to update crate vectorization status: {}", e);
+                        broker
+                            .broadcast(DatabaseError {
+                                operation: format!(
+                                    "update vectorization status for {}@{}",
+                                    name, version
+                                ),
+                                error: e.to_string(),
+                            })
+                            .await;
+                    }
+                }
+            })
+        });
+
+        // Handle CrateProcessingComplete - update final status
+        builder.act_on::<CrateProcessingComplete>(|agent, envelope| {
+            let msg = envelope.message().clone();
+            let db = agent.model.db.clone();
+            let broker = agent.broker().clone();
+
+            AgentReply::from_async(async move {
+                let name = msg.specifier.name().to_string();
+                let version = msg.specifier.version().to_string();
+                let total_duration_ms = msg.total_duration_ms;
+
+                let update_query = r#"
+                    UPDATE crate SET
+                        status = 'complete',
+                        status_updated_at = time::now(),
+                        completed_at = time::now()
+                    WHERE name = $name AND version = $version
+                "#;
+
+                match db
+                    .query(update_query)
+                    .bind(("name", name.clone()))
+                    .bind(("version", version.clone()))
+                    .await
+                {
+                    Ok(_) => {
+                        debug!(
+                            "Updated crate status to complete: {}@{} (total duration: {}ms)",
+                            name, version, total_duration_ms
+                        );
+                    }
+                    Err(e) => {
+                        error!("Failed to update crate completion status: {}", e);
+                        broker
+                            .broadcast(DatabaseError {
+                                operation: format!(
+                                    "update completion status for {}@{}",
+                                    name, version
+                                ),
+                                error: e.to_string(),
+                            })
+                            .await;
+                    }
+                }
+            })
+        });
+
+        // Handle CrateProcessingFailed - record error details
+        builder.act_on::<CrateProcessingFailed>(|agent, envelope| {
+            let msg = envelope.message().clone();
+            let db = agent.model.db.clone();
+            let broker = agent.broker().clone();
+
+            AgentReply::from_async(async move {
+                let name = msg.specifier.name().to_string();
+                let version = msg.specifier.version().to_string();
+                let stage = msg.stage.clone();
+                let error = msg.error.clone();
+
+                let update_query = r#"
+                    UPDATE crate SET
+                        status = 'failed',
+                        status_updated_at = time::now(),
+                        error_stage = $stage,
+                        error_message = $error,
+                        error_timestamp = time::now(),
+                        retry_count = retry_count + 1
+                    WHERE name = $name AND version = $version
+                "#;
+
+                match db
+                    .query(update_query)
+                    .bind(("name", name.clone()))
+                    .bind(("version", version.clone()))
+                    .bind(("stage", stage.clone()))
+                    .bind(("error", error.clone()))
+                    .await
+                {
+                    Ok(_) => {
+                        debug!(
+                            "Updated crate status to failed: {}@{} (stage: {}, error: {})",
+                            name, version, stage, error
+                        );
+                    }
+                    Err(e) => {
+                        error!("Failed to record crate processing failure: {}", e);
+                        broker
+                            .broadcast(DatabaseError {
+                                operation: format!(
+                                    "record failure for {}@{}",
+                                    name, version
+                                ),
+                                error: e.to_string(),
+                            })
+                            .await;
+                    }
+                }
+            })
+        });
+
+        // Handle PersistDocChunk - insert documentation chunk
+        builder.mutate_on::<PersistDocChunk>(|agent, envelope| {
+            let msg = envelope.message().clone();
+            let db = agent.model.db.clone();
+            let broker = agent.broker().clone();
+
+            Box::pin(async move {
+                // Clone strings before async block to satisfy lifetime requirements
+                let name = msg.specifier.name().to_string();
+                let version = msg.specifier.version().to_string();
+
+                // First, get the crate record ID
+                let crate_query = "SELECT id FROM crate WHERE name = $name AND version = $version";
+
+                match db
+                    .query(crate_query)
+                    .bind(("name", name.clone()))
+                    .bind(("version", version.clone()))
+                    .await
+                {
+                    Ok(mut response) => {
+                        let crate_id: Result<Option<serde_json::Value>, _> = response.take(0);
+
+                        match crate_id {
+                            Ok(Some(crate_record)) => {
+                                if let Some(id) = crate_record.get("id") {
+                                    let insert_query = r#"
+                                        CREATE doc_chunk CONTENT {
+                                            crate_id: $crate_id,
+                                            chunk_index: $chunk_index,
+                                            chunk_id: $chunk_id,
+                                            content: $content,
+                                            source_file: $source_file,
+                                            content_type: $content_type,
+                                            token_count: $token_count,
+                                            char_count: $char_count,
+                                            start_line: $start_line,
+                                            end_line: $end_line,
+                                            parent_module: $parent_module,
+                                            item_type: $item_type,
+                                            item_name: $item_name
+                                        }
+                                    "#;
+
+                                    match db
+                                        .query(insert_query)
+                                        .bind(("crate_id", id.clone()))
+                                        .bind(("chunk_index", msg.chunk_index as i64))
+                                        .bind(("chunk_id", msg.chunk_id.clone()))
+                                        .bind(("content", msg.content.clone()))
+                                        .bind(("source_file", msg.source_file.clone()))
+                                        .bind(("content_type", msg.metadata.content_type.clone()))
+                                        .bind(("token_count", msg.metadata.token_count as i64))
+                                        .bind(("char_count", msg.metadata.char_count as i64))
+                                        .bind(("start_line", msg.metadata.start_line.map(|n| n as i64)))
+                                        .bind(("end_line", msg.metadata.end_line.map(|n| n as i64)))
+                                        .bind(("parent_module", msg.metadata.parent_module.clone()))
+                                        .bind(("item_type", msg.metadata.item_type.clone()))
+                                        .bind(("item_name", msg.metadata.item_name.clone()))
+                                        .await
+                                    {
+                                        Ok(_) => {
+                                            debug!("Persisted doc chunk {} for {}@{}", msg.chunk_id, name, version);
+                                        }
+                                        Err(e) => {
+                                            error!("Failed to persist doc chunk: {}", e);
+                                            broker
+                                                .broadcast(DatabaseError {
+                                                    operation: format!("persist doc chunk {}", msg.chunk_id),
+                                                    error: e.to_string(),
+                                                })
+                                                .await;
+                                        }
+                                    }
+                                } else {
+                                    error!("Crate record missing id field");
+                                }
+                            }
+                            Ok(None) => {
+                                error!(
+                                    "Crate not found for chunk: {}@{}",
+                                    name, version
+                                );
+                                broker
+                                    .broadcast(DatabaseError {
+                                        operation: format!("persist doc chunk {}", msg.chunk_id),
+                                        error: format!(
+                                            "Crate {}@{} not found in database",
+                                            name, version
+                                        ),
+                                    })
+                                    .await;
+                            }
+                            Err(e) => {
+                                error!("Failed to parse crate lookup result: {}", e);
+                                broker
+                                    .broadcast(DatabaseError {
+                                        operation: format!("persist doc chunk {}", msg.chunk_id),
+                                        error: e.to_string(),
+                                    })
+                                    .await;
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        error!("Failed to lookup crate for chunk persistence: {}", e);
+                        broker
+                            .broadcast(DatabaseError {
+                                operation: format!("persist doc chunk {}", msg.chunk_id),
+                                error: e.to_string(),
+                            })
+                            .await;
+                    }
+                }
+            })
+        });
+
+        // Handle PersistEmbedding - insert vector embedding
+        builder.mutate_on::<PersistEmbedding>(|agent, envelope| {
+            let msg = envelope.message().clone();
+            let db = agent.model.db.clone();
+            let broker = agent.broker().clone();
+
+            Box::pin(async move {
+                // Clone strings before async block to satisfy lifetime requirements
+                let name = msg.specifier.name().to_string();
+                let version = msg.specifier.version().to_string();
+
+                // Get crate ID
+                let crate_query = "SELECT id FROM crate WHERE name = $name AND version = $version";
+
+                match db
+                    .query(crate_query)
+                    .bind(("name", name.clone()))
+                    .bind(("version", version.clone()))
+                    .await
+                {
+                    Ok(mut crate_response) => {
+                        let crate_id: Result<Option<serde_json::Value>, _> = crate_response.take(0);
+
+                        if let Ok(Some(crate_record)) = crate_id {
+                            // Get chunk ID
+                            let chunk_query = "SELECT id FROM doc_chunk WHERE chunk_id = $chunk_id";
+
+                            match db
+                                .query(chunk_query)
+                                .bind(("chunk_id", msg.chunk_id.clone()))
+                                .await
+                            {
+                                Ok(mut chunk_response) => {
+                                    let chunk_id: Result<Option<serde_json::Value>, _> = chunk_response.take(0);
+
+                                    match chunk_id {
+                                        Ok(Some(chunk_record)) => {
+                                            if let (Some(crate_id_val), Some(chunk_id_val)) =
+                                                (crate_record.get("id"), chunk_record.get("id"))
+                                            {
+                                                let vector_dim = msg.vector.len();
+
+                                                let insert_query = r#"
+                                                    CREATE embedding CONTENT {
+                                                        chunk_id: $chunk_id,
+                                                        crate_id: $crate_id,
+                                                        vector: $vector,
+                                                        vector_dimension: $vector_dimension,
+                                                        model_name: $model_name,
+                                                        model_version: $model_version,
+                                                        content_hash: crypto::md5(string::concat($chunk_id, $model_name))
+                                                    }
+                                                "#;
+
+                                                match db
+                                                    .query(insert_query)
+                                                    .bind(("chunk_id", chunk_id_val.clone()))
+                                                    .bind(("crate_id", crate_id_val.clone()))
+                                                    .bind(("vector", msg.vector.clone()))
+                                                    .bind(("vector_dimension", vector_dim as i64))
+                                                    .bind(("model_name", msg.model_name.clone()))
+                                                    .bind(("model_version", msg.model_version.clone()))
+                                                    .await
+                                                {
+                                                    Ok(_) => {
+                                                        debug!(
+                                                            "Persisted embedding for chunk {} (dim: {}, model: {})",
+                                                            msg.chunk_id, vector_dim, msg.model_name
+                                                        );
+
+                                                        // Update chunk's vectorized flag
+                                                        let _ = db
+                                                            .query("UPDATE doc_chunk SET vectorized = true, vectorized_at = time::now() WHERE chunk_id = $chunk_id")
+                                                            .bind(("chunk_id", msg.chunk_id.clone()))
+                                                            .await;
+                                                    }
+                                                    Err(e) => {
+                                                        error!("Failed to persist embedding: {}", e);
+                                                        broker
+                                                            .broadcast(DatabaseError {
+                                                                operation: format!("persist embedding for {}", msg.chunk_id),
+                                                                error: e.to_string(),
+                                                            })
+                                                            .await;
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        Ok(None) => {
+                                            error!("Chunk not found: {}", msg.chunk_id);
+                                            broker
+                                                .broadcast(DatabaseError {
+                                                    operation: format!("persist embedding for {}", msg.chunk_id),
+                                                    error: format!("Chunk {} not found in database", msg.chunk_id),
+                                                })
+                                                .await;
+                                        }
+                                        Err(e) => {
+                                            error!("Failed to parse chunk lookup result: {}", e);
+                                            broker
+                                                .broadcast(DatabaseError {
+                                                    operation: format!("persist embedding for {}", msg.chunk_id),
+                                                    error: e.to_string(),
+                                                })
+                                                .await;
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    error!("Failed to lookup chunk for embedding: {}", e);
+                                    broker
+                                        .broadcast(DatabaseError {
+                                            operation: format!("persist embedding for {}", msg.chunk_id),
+                                            error: e.to_string(),
+                                        })
+                                        .await;
+                                }
+                            }
+                        } else {
+                            error!(
+                                "Crate not found for embedding: {}@{}",
+                                name, version
+                            );
+                            broker
+                                .broadcast(DatabaseError {
+                                    operation: format!("persist embedding for {}", msg.chunk_id),
+                                    error: format!(
+                                        "Crate {}@{} not found in database",
+                                        name, version
+                                    ),
+                                })
+                                .await;
+                        }
+                    }
+                    Err(e) => {
+                        error!("Failed to lookup crate for embedding persistence: {}", e);
+                        broker
+                            .broadcast(DatabaseError {
+                                operation: format!("persist embedding for {}", msg.chunk_id),
+                                error: e.to_string(),
+                            })
+                            .await;
+                    }
+                }
+            })
+        });
+
+        // Handle PersistCodeSample - insert code sample
+        builder.mutate_on::<PersistCodeSample>(|agent, envelope| {
+            let msg = envelope.message().clone();
+            let db = agent.model.db.clone();
+            let broker = agent.broker().clone();
+
+            Box::pin(async move {
+                // Clone strings before async block to satisfy lifetime requirements
+                let name = msg.specifier.name().to_string();
+                let version = msg.specifier.version().to_string();
+
+                // Get crate ID
+                let crate_query = "SELECT id FROM crate WHERE name = $name AND version = $version";
+
+                match db
+                    .query(crate_query)
+                    .bind(("name", name.clone()))
+                    .bind(("version", version.clone()))
+                    .await
+                {
+                    Ok(mut response) => {
+                        let crate_id: Result<Option<serde_json::Value>, _> = response.take(0);
+
+                        match crate_id {
+                            Ok(Some(crate_record)) => {
+                                if let Some(id) = crate_record.get("id") {
+                                    let insert_query = r#"
+                                        CREATE code_sample CONTENT {
+                                            crate_id: $crate_id,
+                                            sample_index: $sample_index,
+                                            code: $code,
+                                            language: $language,
+                                            source_file: $source_file,
+                                            doc_context: $doc_context,
+                                            parent_item: $parent_item,
+                                            sample_type: $sample_type,
+                                            tags: $tags,
+                                            line_count: $line_count
+                                        }
+                                    "#;
+
+                                    match db
+                                        .query(insert_query)
+                                        .bind(("crate_id", id.clone()))
+                                        .bind(("sample_index", msg.sample_index as i64))
+                                        .bind(("code", msg.code.clone()))
+                                        .bind(("language", msg.metadata.language.clone()))
+                                        .bind(("source_file", msg.metadata.source_file.clone()))
+                                        .bind(("doc_context", msg.metadata.doc_context.clone()))
+                                        .bind(("parent_item", msg.metadata.parent_item.clone()))
+                                        .bind(("sample_type", msg.sample_type.clone()))
+                                        .bind(("tags", msg.metadata.tags.clone()))
+                                        .bind(("line_count", msg.metadata.line_count as i64))
+                                        .await
+                                    {
+                                        Ok(_) => {
+                                            debug!(
+                                                "Persisted code sample {} for {}@{} (type: {})",
+                                                msg.sample_index,
+                                                name,
+                                                version,
+                                                msg.sample_type
+                                            );
+                                        }
+                                        Err(e) => {
+                                            error!("Failed to persist code sample: {}", e);
+                                            broker
+                                                .broadcast(DatabaseError {
+                                                    operation: format!(
+                                                        "persist code sample {} for {}@{}",
+                                                        msg.sample_index,
+                                                        name,
+                                                        version
+                                                    ),
+                                                    error: e.to_string(),
+                                                })
+                                                .await;
+                                        }
+                                    }
+                                } else {
+                                    error!("Crate record missing id field");
+                                }
+                            }
+                            Ok(None) => {
+                                error!(
+                                    "Crate not found for code sample: {}@{}",
+                                    name, version
+                                );
+                                broker
+                                    .broadcast(DatabaseError {
+                                        operation: format!(
+                                            "persist code sample for {}@{}",
+                                            name, version
+                                        ),
+                                        error: format!(
+                                            "Crate {}@{} not found in database",
+                                            name, version
+                                        ),
+                                    })
+                                    .await;
+                            }
+                            Err(e) => {
+                                error!("Failed to parse crate lookup result: {}", e);
+                                broker
+                                    .broadcast(DatabaseError {
+                                        operation: format!(
+                                            "persist code sample for {}@{}",
+                                            name, version
+                                        ),
+                                        error: e.to_string(),
+                                    })
+                                    .await;
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        error!("Failed to lookup crate for code sample persistence: {}", e);
+                        broker
+                            .broadcast(DatabaseError {
+                                operation: format!(
+                                    "persist code sample for {}@{}",
+                                    name, version
+                                ),
+                                error: e.to_string(),
+                            })
+                            .await;
+                    }
+                }
+            })
+        });
+
+        // Handle QuerySimilarDocs - vector similarity search
+        builder.mutate_on::<QuerySimilarDocs>(|agent, envelope| {
+            let msg = envelope.message().clone();
+            let db = agent.model.db.clone();
+            let broker = agent.broker().clone();
+
+            Box::pin(async move {
+                let limit = msg.limit.unwrap_or(10);
+
+                // Extract crate filter strings before async operations to satisfy lifetime requirements
+                let crate_filter_opt = msg.crate_filter.as_ref().map(|f| {
+                    (f.name().to_string(), f.version().to_string())
+                });
+
+                // Build query with optional crate filter
+                let search_query = if crate_filter_opt.is_some() {
+                    r#"
+                        SELECT
+                            embedding.chunk_id as chunk_id,
+                            doc_chunk.content as content,
+                            doc_chunk.crate_id as crate_id,
+                            vector::similarity::cosine(embedding.vector, $query_vector) AS score
+                        FROM embedding
+                        INNER JOIN doc_chunk ON doc_chunk.id = embedding.chunk_id
+                        INNER JOIN crate ON crate.id = embedding.crate_id
+                        WHERE score > 0.7 AND crate.name = $crate_name AND crate.version = $crate_version
+                        ORDER BY score DESC
+                        LIMIT $limit
+                    "#
+                } else {
+                    r#"
+                        SELECT
+                            embedding.chunk_id as chunk_id,
+                            doc_chunk.content as content,
+                            doc_chunk.crate_id as crate_id,
+                            vector::similarity::cosine(embedding.vector, $query_vector) AS score
+                        FROM embedding
+                        INNER JOIN doc_chunk ON doc_chunk.id = embedding.chunk_id
+                        WHERE score > 0.7
+                        ORDER BY score DESC
+                        LIMIT $limit
+                    "#
+                };
+
+                let mut query = db
+                    .query(search_query)
+                    .bind(("query_vector", msg.query_vector.clone()))
+                    .bind(("limit", limit as i64));
+
+                if let Some((name, version)) = crate_filter_opt {
+                    query = query
+                        .bind(("crate_name", name))
+                        .bind(("crate_version", version));
+                }
+
+                match query.await {
+                    Ok(mut response) => {
+                        let results: Result<Vec<serde_json::Value>, _> = response.take(0);
+
+                        match results {
+                            Ok(raw_results) => {
+                                let mut search_results = Vec::new();
+
+                                for result in raw_results {
+                                    // Extract crate information from the crate_id record reference
+                                    if let (Some(content), Some(score), Some(chunk_id_val)) = (
+                                        result.get("content").and_then(|v| v.as_str()),
+                                        result.get("score").and_then(|v| v.as_f64()),
+                                        result.get("chunk_id"),
+                                    ) {
+                                        // Get chunk_id string from the record reference
+                                        let chunk_id = if let Some(chunk_obj) = chunk_id_val.as_object() {
+                                            chunk_obj.get("chunk_id")
+                                                .and_then(|v| v.as_str())
+                                                .unwrap_or_default()
+                                        } else {
+                                            ""
+                                        };
+
+                                        // Get crate information
+                                        if let Some(crate_id_val) = result.get("crate_id") {
+                                            // Query to get crate details
+                                            let crate_detail_query = "SELECT name, version FROM $crate_id";
+
+                                            if let Ok(mut crate_response) = db
+                                                .query(crate_detail_query)
+                                                .bind(("crate_id", crate_id_val.clone()))
+                                                .await
+                                            {
+                                                let crate_info: Result<Option<serde_json::Value>, _> =
+                                                    crate_response.take(0);
+
+                                                if let Ok(Some(crate_data)) = crate_info {
+                                                    if let (Some(name), Some(version)) = (
+                                                        crate_data.get("name").and_then(|v| v.as_str()),
+                                                        crate_data.get("version").and_then(|v| v.as_str()),
+                                                    ) {
+                                                        let specifier_str = format!("{}@{}", name, version);
+                                                        if let Ok(specifier) =
+                                                            CrateSpecifier::from_str(&specifier_str)
+                                                        {
+                                                            search_results.push(SearchResult {
+                                                                specifier,
+                                                                chunk_id: chunk_id.to_string(),
+                                                                content: content.to_string(),
+                                                                similarity_score: score as f32,
+                                                            });
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+
+                                debug!("Vector search found {} results", search_results.len());
+
+                                broker
+                                    .broadcast(SimilarDocsResponse {
+                                        results: search_results,
+                                    })
+                                    .await;
+                            }
+                            Err(e) => {
+                                error!("Failed to parse vector search results: {}", e);
+                                broker
+                                    .broadcast(DatabaseError {
+                                        operation: "vector similarity search".to_string(),
+                                        error: e.to_string(),
+                                    })
+                                    .await;
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        error!("Vector search query failed: {}", e);
+                        broker
+                            .broadcast(DatabaseError {
+                                operation: "vector similarity search".to_string(),
                                 error: e.to_string(),
                             })
                             .await;
