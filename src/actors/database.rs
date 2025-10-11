@@ -506,13 +506,143 @@ impl DatabaseActor {
 
                 // Execute schema definition
                 let schema_sql = r#"
+                    -- Core crate metadata and processing state
                     DEFINE TABLE crate SCHEMAFULL;
-                    DEFINE FIELD name ON TABLE crate TYPE string;
-                    DEFINE FIELD version ON TABLE crate TYPE string;
-                    DEFINE FIELD features ON TABLE crate TYPE array;
-                    DEFINE FIELD created_at ON TABLE crate TYPE datetime DEFAULT time::now();
-                    DEFINE FIELD status ON TABLE crate TYPE string DEFAULT 'pending';
+
+                    -- Primary identification fields
+                    DEFINE FIELD name ON TABLE crate TYPE string
+                        ASSERT $value != NONE AND string::len($value) > 0;
+                    DEFINE FIELD version ON TABLE crate TYPE string
+                        ASSERT $value != NONE AND string::len($value) > 0;
+
+                    -- Request metadata
+                    DEFINE FIELD features ON TABLE crate TYPE array<string> DEFAULT [];
+                    DEFINE FIELD requested_at ON TABLE crate TYPE datetime DEFAULT time::now();
+
+                    -- Processing state machine
+                    DEFINE FIELD status ON TABLE crate TYPE string DEFAULT 'pending'
+                        ASSERT $value IN ['pending', 'downloading', 'downloaded', 'extracting',
+                                          'extracted', 'compiling_docs', 'docs_compiled',
+                                          'chunking', 'chunked', 'vectorizing', 'vectorized',
+                                          'complete', 'failed'];
+
+                    -- State tracking timestamps
+                    DEFINE FIELD status_updated_at ON TABLE crate TYPE datetime DEFAULT time::now();
+                    DEFINE FIELD download_started_at ON TABLE crate TYPE option<datetime>;
+                    DEFINE FIELD download_completed_at ON TABLE crate TYPE option<datetime>;
+                    DEFINE FIELD extraction_completed_at ON TABLE crate TYPE option<datetime>;
+                    DEFINE FIELD docs_completed_at ON TABLE crate TYPE option<datetime>;
+                    DEFINE FIELD chunking_completed_at ON TABLE crate TYPE option<datetime>;
+                    DEFINE FIELD vectorization_completed_at ON TABLE crate TYPE option<datetime>;
+                    DEFINE FIELD completed_at ON TABLE crate TYPE option<datetime>;
+
+                    -- Error tracking
+                    DEFINE FIELD error_message ON TABLE crate TYPE option<string>;
+                    DEFINE FIELD error_stage ON TABLE crate TYPE option<string>;
+                    DEFINE FIELD error_timestamp ON TABLE crate TYPE option<datetime>;
+                    DEFINE FIELD retry_count ON TABLE crate TYPE int DEFAULT 0;
+
+                    -- File system paths
+                    DEFINE FIELD download_path ON TABLE crate TYPE option<string>;
+                    DEFINE FIELD extraction_path ON TABLE crate TYPE option<string>;
+                    DEFINE FIELD docs_path ON TABLE crate TYPE option<string>;
+
+                    -- Metadata
+                    DEFINE FIELD cargo_metadata ON TABLE crate TYPE option<object>;
+                    DEFINE FIELD dependencies ON TABLE crate TYPE array<object> DEFAULT [];
+                    DEFINE FIELD size_bytes ON TABLE crate TYPE option<int>;
+
+                    -- Indexes
                     DEFINE INDEX idx_name_version ON TABLE crate COLUMNS name, version UNIQUE;
+                    DEFINE INDEX idx_status ON TABLE crate COLUMNS status;
+                    DEFINE INDEX idx_requested_at ON TABLE crate COLUMNS requested_at;
+
+                    -- Documentation chunks table
+                    DEFINE TABLE doc_chunk SCHEMAFULL;
+                    DEFINE FIELD crate_id ON TABLE doc_chunk TYPE record<crate>
+                        ASSERT $value != NONE;
+                    DEFINE FIELD chunk_index ON TABLE doc_chunk TYPE int
+                        ASSERT $value >= 0;
+                    DEFINE FIELD chunk_id ON TABLE doc_chunk TYPE string
+                        ASSERT $value != NONE;
+                    DEFINE FIELD content ON TABLE doc_chunk TYPE string
+                        ASSERT $value != NONE AND string::len($value) > 0;
+                    DEFINE FIELD content_type ON TABLE doc_chunk TYPE string DEFAULT 'markdown'
+                        ASSERT $value IN ['markdown', 'rust', 'toml', 'text'];
+                    DEFINE FIELD source_file ON TABLE doc_chunk TYPE string;
+                    DEFINE FIELD start_line ON TABLE doc_chunk TYPE option<int>;
+                    DEFINE FIELD end_line ON TABLE doc_chunk TYPE option<int>;
+                    DEFINE FIELD token_count ON TABLE doc_chunk TYPE int DEFAULT 0;
+                    DEFINE FIELD char_count ON TABLE doc_chunk TYPE int DEFAULT 0;
+                    DEFINE FIELD created_at ON TABLE doc_chunk TYPE datetime DEFAULT time::now();
+                    DEFINE FIELD vectorized ON TABLE doc_chunk TYPE bool DEFAULT false;
+                    DEFINE FIELD vectorized_at ON TABLE doc_chunk TYPE option<datetime>;
+                    DEFINE FIELD parent_module ON TABLE doc_chunk TYPE option<string>;
+                    DEFINE FIELD item_type ON TABLE doc_chunk TYPE option<string>;
+                    DEFINE FIELD item_name ON TABLE doc_chunk TYPE option<string>;
+                    DEFINE INDEX idx_crate_id ON TABLE doc_chunk COLUMNS crate_id;
+                    DEFINE INDEX idx_chunk_index ON TABLE doc_chunk COLUMNS chunk_index;
+                    DEFINE INDEX idx_vectorized ON TABLE doc_chunk COLUMNS vectorized;
+                    DEFINE INDEX idx_crate_chunk ON TABLE doc_chunk COLUMNS crate_id, chunk_index UNIQUE;
+
+                    -- Vector embeddings table
+                    DEFINE TABLE embedding SCHEMAFULL;
+                    DEFINE FIELD chunk_id ON TABLE embedding TYPE record<doc_chunk>
+                        ASSERT $value != NONE;
+                    DEFINE FIELD crate_id ON TABLE embedding TYPE record<crate>
+                        ASSERT $value != NONE;
+                    DEFINE FIELD vector ON TABLE embedding TYPE array<float>
+                        ASSERT $value != NONE AND array::len($value) > 0;
+                    DEFINE FIELD vector_dimension ON TABLE embedding TYPE int
+                        ASSERT $value > 0;
+                    DEFINE FIELD model_name ON TABLE embedding TYPE string DEFAULT 'text-embedding-3-small';
+                    DEFINE FIELD model_version ON TABLE embedding TYPE string;
+                    DEFINE FIELD created_at ON TABLE embedding TYPE datetime DEFAULT time::now();
+                    DEFINE FIELD content_hash ON TABLE embedding TYPE string;
+                    DEFINE INDEX idx_chunk_id ON TABLE embedding COLUMNS chunk_id UNIQUE;
+                    DEFINE INDEX idx_crate_id_emb ON TABLE embedding COLUMNS crate_id;
+                    DEFINE INDEX idx_model ON TABLE embedding COLUMNS model_name, model_version;
+                    DEFINE INDEX idx_content_hash ON TABLE embedding COLUMNS content_hash;
+
+                    -- Code samples table
+                    DEFINE TABLE code_sample SCHEMAFULL;
+                    DEFINE FIELD crate_id ON TABLE code_sample TYPE record<crate>
+                        ASSERT $value != NONE;
+                    DEFINE FIELD sample_index ON TABLE code_sample TYPE int
+                        ASSERT $value >= 0;
+                    DEFINE FIELD code ON TABLE code_sample TYPE string
+                        ASSERT $value != NONE AND string::len($value) > 0;
+                    DEFINE FIELD language ON TABLE code_sample TYPE string DEFAULT 'rust';
+                    DEFINE FIELD source_file ON TABLE code_sample TYPE string;
+                    DEFINE FIELD doc_context ON TABLE code_sample TYPE option<string>;
+                    DEFINE FIELD parent_item ON TABLE code_sample TYPE option<string>;
+                    DEFINE FIELD sample_type ON TABLE code_sample TYPE string
+                        ASSERT $value IN ['example', 'test', 'usage', 'snippet'];
+                    DEFINE FIELD tags ON TABLE code_sample TYPE array<string> DEFAULT [];
+                    DEFINE FIELD line_count ON TABLE code_sample TYPE int DEFAULT 0;
+                    DEFINE FIELD complexity_score ON TABLE code_sample TYPE option<float>;
+                    DEFINE FIELD created_at ON TABLE code_sample TYPE datetime DEFAULT time::now();
+                    DEFINE INDEX idx_crate_id_sample ON TABLE code_sample COLUMNS crate_id;
+                    DEFINE INDEX idx_sample_index ON TABLE code_sample COLUMNS sample_index;
+                    DEFINE INDEX idx_sample_type ON TABLE code_sample COLUMNS sample_type;
+                    DEFINE INDEX idx_crate_sample ON TABLE code_sample COLUMNS crate_id, sample_index UNIQUE;
+
+                    -- Processing events audit log
+                    DEFINE TABLE processing_event SCHEMAFULL;
+                    DEFINE FIELD crate_id ON TABLE processing_event TYPE record<crate>
+                        ASSERT $value != NONE;
+                    DEFINE FIELD event_type ON TABLE processing_event TYPE string
+                        ASSERT $value != NONE;
+                    DEFINE FIELD event_data ON TABLE processing_event TYPE option<object>;
+                    DEFINE FIELD timestamp ON TABLE processing_event TYPE datetime DEFAULT time::now();
+                    DEFINE FIELD actor_name ON TABLE processing_event TYPE option<string>;
+                    DEFINE FIELD actor_type ON TABLE processing_event TYPE option<string>;
+                    DEFINE FIELD success ON TABLE processing_event TYPE bool DEFAULT true;
+                    DEFINE FIELD error_message ON TABLE processing_event TYPE option<string>;
+                    DEFINE FIELD duration_ms ON TABLE processing_event TYPE option<int>;
+                    DEFINE INDEX idx_crate_id_event ON TABLE processing_event COLUMNS crate_id;
+                    DEFINE INDEX idx_timestamp ON TABLE processing_event COLUMNS timestamp;
+                    DEFINE INDEX idx_event_type ON TABLE processing_event COLUMNS event_type;
                 "#;
 
                 match db.query(schema_sql).await {
