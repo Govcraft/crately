@@ -10,7 +10,13 @@ use surrealdb::engine::local::{Db, RocksDb};
 use surrealdb::Surreal;
 use tracing::*;
 
-use crate::messages::{DatabaseError, DatabaseReady, PersistCrate, QueryCrate};
+use std::str::FromStr;
+
+use crate::crate_specifier::CrateSpecifier;
+use crate::messages::{
+    CrateListResponse, CrateQueryResponse, CrateSummary, DatabaseError, DatabaseReady,
+    ListCrates, PersistCrate, QueryCrate,
+};
 
 /// Information about the database connection returned at spawn time.
 ///
@@ -254,16 +260,16 @@ impl DatabaseActor {
                 let version_opt = msg.version.clone();
 
                 // Build query based on whether version is specified
-                let query_result = if let Some(version) = version_opt {
+                let query_result = if let Some(version) = version_opt.clone() {
                     // Query for specific version
                     db.query("SELECT * FROM crate WHERE name = $name AND version = $version")
-                        .bind(("name", name))
+                        .bind(("name", name.clone()))
                         .bind(("version", version))
                         .await
                 } else {
                     // Query for latest version (highest version number)
                     db.query("SELECT * FROM crate WHERE name = $name ORDER BY version DESC LIMIT 1")
-                        .bind(("name", name))
+                        .bind(("name", name.clone()))
                         .await
                 };
 
@@ -275,10 +281,76 @@ impl DatabaseActor {
                             Ok(Some(record)) => {
                                 let version_display = msg.version.as_deref().unwrap_or("latest");
                                 debug!("Query successful for {}@{}: {:?}", msg.name, version_display, record);
+
+                                // Extract fields from the record
+                                let name_field = record
+                                    .get("name")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or_default()
+                                    .to_string();
+                                let version_field = record
+                                    .get("version")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or_default()
+                                    .to_string();
+                                let features: Vec<String> = record
+                                    .get("features")
+                                    .and_then(|v| v.as_array())
+                                    .map(|arr| {
+                                        arr.iter()
+                                            .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                                            .collect()
+                                    })
+                                    .unwrap_or_default();
+                                let status = record
+                                    .get("status")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("unknown")
+                                    .to_string();
+                                let created_at = record
+                                    .get("created_at")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("")
+                                    .to_string();
+
+                                // Create CrateSpecifier using FromStr for type safety
+                                let specifier_str = format!("{}@{}", name_field, version_field);
+                                match CrateSpecifier::from_str(&specifier_str) {
+                                    Ok(specifier) => {
+                                        // Broadcast successful query response
+                                        broker
+                                            .broadcast(CrateQueryResponse {
+                                                specifier: Some(specifier),
+                                                features,
+                                                status,
+                                                created_at,
+                                            })
+                                            .await;
+                                    }
+                                    Err(e) => {
+                                        error!("Failed to create CrateSpecifier from database record: {}", e);
+                                        broker
+                                            .broadcast(DatabaseError {
+                                                operation: format!("query crate {}@{}", msg.name, version_display),
+                                                error: format!("Invalid crate data in database: {}", e),
+                                            })
+                                            .await;
+                                    }
+                                }
                             }
                             Ok(None) => {
                                 let version_display = msg.version.as_deref().unwrap_or("latest");
                                 debug!("No record found for {}@{}", msg.name, version_display);
+
+                                // Broadcast not-found response with None specifier
+                                broker
+                                    .broadcast(CrateQueryResponse {
+                                        specifier: None,
+                                        features: vec![],
+                                        status: "not_found".to_string(),
+                                        created_at: String::new(),
+                                    })
+                                    .await;
                             }
                             Err(e) => {
                                 error!("Failed to parse query result: {}", e);
@@ -298,6 +370,124 @@ impl DatabaseActor {
                         broker
                             .broadcast(DatabaseError {
                                 operation: format!("query crate {}@{}", msg.name, version_display),
+                                error: e.to_string(),
+                            })
+                            .await;
+                    }
+                }
+            })
+        });
+
+        // Handle ListCrates requests
+        builder.mutate_on::<ListCrates>(|agent, envelope| {
+            let msg = envelope.message().clone();
+            let db = agent.model.db.clone();
+            let broker = agent.broker().clone();
+
+            Box::pin(async move {
+                // Apply default values for pagination
+                let limit = msg.limit.unwrap_or(100);
+                let offset = msg.offset.unwrap_or(0);
+
+                debug!("Listing crates with limit={}, offset={}", limit, offset);
+
+                // Execute paginated query
+                let query_result = db
+                    .query("SELECT * FROM crate LIMIT $limit START $offset")
+                    .bind(("limit", limit))
+                    .bind(("offset", offset))
+                    .await;
+
+                match query_result {
+                    Ok(mut response) => {
+                        // Parse the results into CrateSummary structs
+                        let results: Result<Vec<serde_json::Value>, _> = response.take(0);
+
+                        match results {
+                            Ok(records) => {
+                                // Map records to CrateSummary structs
+                                let crates: Vec<CrateSummary> = records
+                                    .iter()
+                                    .map(|record| CrateSummary {
+                                        name: record
+                                            .get("name")
+                                            .and_then(|v| v.as_str())
+                                            .unwrap_or_default()
+                                            .to_string(),
+                                        version: record
+                                            .get("version")
+                                            .and_then(|v| v.as_str())
+                                            .unwrap_or_default()
+                                            .to_string(),
+                                        status: record
+                                            .get("status")
+                                            .and_then(|v| v.as_str())
+                                            .unwrap_or("unknown")
+                                            .to_string(),
+                                    })
+                                    .collect();
+
+                                debug!("Retrieved {} crates from database", crates.len());
+
+                                // Get total count for pagination metadata
+                                let count_result = db
+                                    .query("SELECT count() FROM crate GROUP ALL")
+                                    .await;
+
+                                match count_result {
+                                    Ok(mut count_response) => {
+                                        // Extract count from response
+                                        let count_value: Result<Option<serde_json::Value>, _> = count_response.take(0);
+                                        let total_count = match count_value {
+                                            Ok(Some(val)) => {
+                                                val.get("count")
+                                                    .and_then(|v| v.as_u64())
+                                                    .unwrap_or(0) as u32
+                                            }
+                                            Ok(None) => 0,
+                                            Err(e) => {
+                                                error!("Failed to parse count result: {}", e);
+                                                0
+                                            }
+                                        };
+
+                                        debug!("Total crate count: {}", total_count);
+
+                                        // Broadcast successful list response
+                                        broker
+                                            .broadcast(CrateListResponse {
+                                                crates,
+                                                total_count,
+                                            })
+                                            .await;
+                                    }
+                                    Err(e) => {
+                                        error!("Failed to get total crate count: {}", e);
+                                        broker
+                                            .broadcast(DatabaseError {
+                                                operation: "list crates (count)".to_string(),
+                                                error: e.to_string(),
+                                            })
+                                            .await;
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                error!("Failed to parse list results: {}", e);
+                                broker
+                                    .broadcast(DatabaseError {
+                                        operation: "list crates".to_string(),
+                                        error: e.to_string(),
+                                    })
+                                    .await;
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        error!("Failed to list crates: {}", e);
+                        broker
+                            .broadcast(DatabaseError {
+                                operation: "list crates".to_string(),
                                 error: e.to_string(),
                             })
                             .await;
@@ -458,5 +648,295 @@ mod tests {
         // Cleanup
         let _ = std::fs::remove_dir_all(&test_db_path_1);
         let _ = std::fs::remove_dir_all(&test_db_path_2);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_database_actor_query_crate_specific_version() {
+        use std::str::FromStr;
+
+        let mut runtime = ActonApp::launch();
+        let test_db_path = env::temp_dir().join("crately_test_db_query_specific");
+
+        // Clean up any existing test database
+        let _ = std::fs::remove_dir_all(&test_db_path);
+
+        let (handle, _db_info) = DatabaseActor::spawn(&mut runtime, test_db_path.clone())
+            .await
+            .unwrap();
+
+        // Wait for schema initialization
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+        // Persist a test crate
+        let specifier = CrateSpecifier::from_str("serde@1.0.0").unwrap();
+        handle
+            .send(PersistCrate {
+                specifier,
+                features: vec!["derive".to_string()],
+            })
+            .await;
+
+        // Wait for persistence
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+        // Query for the specific version
+        handle
+            .send(QueryCrate {
+                name: "serde".to_string(),
+                version: Some("1.0.0".to_string()),
+            })
+            .await;
+
+        // Wait for query to complete
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+        // Clean shutdown
+        handle.stop().await.unwrap();
+        runtime.shutdown_all().await.unwrap();
+
+        // Cleanup
+        let _ = std::fs::remove_dir_all(&test_db_path);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_database_actor_query_crate_latest_version() {
+        use std::str::FromStr;
+
+        let mut runtime = ActonApp::launch();
+        let test_db_path = env::temp_dir().join("crately_test_db_query_latest");
+
+        // Clean up any existing test database
+        let _ = std::fs::remove_dir_all(&test_db_path);
+
+        let (handle, _db_info) = DatabaseActor::spawn(&mut runtime, test_db_path.clone())
+            .await
+            .unwrap();
+
+        // Wait for schema initialization
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+        // Persist multiple versions of the same crate
+        let specifier1 = CrateSpecifier::from_str("tokio@1.35.0").unwrap();
+        handle
+            .send(PersistCrate {
+                specifier: specifier1,
+                features: vec![],
+            })
+            .await;
+
+        let specifier2 = CrateSpecifier::from_str("tokio@1.36.0").unwrap();
+        handle
+            .send(PersistCrate {
+                specifier: specifier2,
+                features: vec!["full".to_string()],
+            })
+            .await;
+
+        // Wait for persistence
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+        // Query for latest version (version = None)
+        handle
+            .send(QueryCrate {
+                name: "tokio".to_string(),
+                version: None,
+            })
+            .await;
+
+        // Wait for query to complete
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+        // Clean shutdown
+        handle.stop().await.unwrap();
+        runtime.shutdown_all().await.unwrap();
+
+        // Cleanup
+        let _ = std::fs::remove_dir_all(&test_db_path);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_database_actor_query_crate_not_found() {
+        let mut runtime = ActonApp::launch();
+        let test_db_path = env::temp_dir().join("crately_test_db_query_not_found");
+
+        // Clean up any existing test database
+        let _ = std::fs::remove_dir_all(&test_db_path);
+
+        let (handle, _db_info) = DatabaseActor::spawn(&mut runtime, test_db_path.clone())
+            .await
+            .unwrap();
+
+        // Wait for schema initialization
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+        // Query for a non-existent crate
+        handle
+            .send(QueryCrate {
+                name: "nonexistent-crate".to_string(),
+                version: Some("1.0.0".to_string()),
+            })
+            .await;
+
+        // Wait for query to complete
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+        // Clean shutdown
+        handle.stop().await.unwrap();
+        runtime.shutdown_all().await.unwrap();
+
+        // Cleanup
+        let _ = std::fs::remove_dir_all(&test_db_path);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_database_actor_list_crates_default_pagination() {
+        use std::str::FromStr;
+
+        let mut runtime = ActonApp::launch();
+        let test_db_path = env::temp_dir().join("crately_test_db_list_default");
+
+        // Clean up any existing test database
+        let _ = std::fs::remove_dir_all(&test_db_path);
+
+        let (handle, _db_info) = DatabaseActor::spawn(&mut runtime, test_db_path.clone())
+            .await
+            .unwrap();
+
+        // Wait for schema initialization
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+        // Persist some test crates
+        let specifier1 = CrateSpecifier::from_str("serde@1.0.0").unwrap();
+        handle
+            .send(PersistCrate {
+                specifier: specifier1,
+                features: vec![],
+            })
+            .await;
+
+        let specifier2 = CrateSpecifier::from_str("tokio@1.35.0").unwrap();
+        handle
+            .send(PersistCrate {
+                specifier: specifier2,
+                features: vec![],
+            })
+            .await;
+
+        // Wait for persistence
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+        // List crates with default pagination
+        handle
+            .send(ListCrates {
+                limit: None,
+                offset: None,
+            })
+            .await;
+
+        // Wait for list to complete
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+        // Clean shutdown
+        handle.stop().await.unwrap();
+        runtime.shutdown_all().await.unwrap();
+
+        // Cleanup
+        let _ = std::fs::remove_dir_all(&test_db_path);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_database_actor_list_crates_with_pagination() {
+        use std::str::FromStr;
+
+        let mut runtime = ActonApp::launch();
+        let test_db_path = env::temp_dir().join("crately_test_db_list_paginated");
+
+        // Clean up any existing test database
+        let _ = std::fs::remove_dir_all(&test_db_path);
+
+        let (handle, _db_info) = DatabaseActor::spawn(&mut runtime, test_db_path.clone())
+            .await
+            .unwrap();
+
+        // Wait for schema initialization
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+        // Persist multiple test crates
+        for i in 0..5 {
+            let specifier =
+                CrateSpecifier::from_str(&format!("test-crate{}@1.0.0", i)).unwrap();
+            handle
+                .send(PersistCrate {
+                    specifier,
+                    features: vec![],
+                })
+                .await;
+        }
+
+        // Wait for persistence
+        tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+
+        // List first page with limit=2
+        handle
+            .send(ListCrates {
+                limit: Some(2),
+                offset: Some(0),
+            })
+            .await;
+
+        // Wait for list to complete
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+        // List second page with limit=2, offset=2
+        handle
+            .send(ListCrates {
+                limit: Some(2),
+                offset: Some(2),
+            })
+            .await;
+
+        // Wait for list to complete
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+        // Clean shutdown
+        handle.stop().await.unwrap();
+        runtime.shutdown_all().await.unwrap();
+
+        // Cleanup
+        let _ = std::fs::remove_dir_all(&test_db_path);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_database_actor_list_crates_empty_database() {
+        let mut runtime = ActonApp::launch();
+        let test_db_path = env::temp_dir().join("crately_test_db_list_empty");
+
+        // Clean up any existing test database
+        let _ = std::fs::remove_dir_all(&test_db_path);
+
+        let (handle, _db_info) = DatabaseActor::spawn(&mut runtime, test_db_path.clone())
+            .await
+            .unwrap();
+
+        // Wait for schema initialization
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+        // List crates from empty database
+        handle
+            .send(ListCrates {
+                limit: Some(10),
+                offset: Some(0),
+            })
+            .await;
+
+        // Wait for list to complete
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+        // Clean shutdown
+        handle.stop().await.unwrap();
+        runtime.shutdown_all().await.unwrap();
+
+        // Cleanup
+        let _ = std::fs::remove_dir_all(&test_db_path);
     }
 }
