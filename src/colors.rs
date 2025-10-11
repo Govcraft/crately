@@ -2,11 +2,12 @@
 //!
 //! This module provides color detection and styling functions for console output,
 //! respecting terminal capabilities and user preferences via the NO_COLOR
-//! environment variable.
+//! environment variable, CLICOLOR, and TTY detection.
 
+use crate::cli::ColorChoice;
 use crossterm::style::{Color, ResetColor, SetForegroundColor};
 use std::env;
-use std::io::Write;
+use std::io::{IsTerminal, Write};
 
 /// Configuration for color output support.
 ///
@@ -19,31 +20,38 @@ pub struct ColorConfig {
 }
 
 impl ColorConfig {
-    /// Creates a new ColorConfig with automatic detection.
-    ///
-    /// Colors are enabled if ALL of the following are true:
-    /// - Terminal supports colors (via crossterm detection)
-    /// - NO_COLOR environment variable is not set
-    /// - User has not explicitly disabled colors via flag
+    /// Creates a new ColorConfig based on the color choice and environment.
     ///
     /// # Arguments
     ///
-    /// * `force_disable` - If true, colors are disabled regardless of terminal support
+    /// * `choice` - The user's color preference (Always, Auto, Never)
     ///
     /// # Returns
     ///
-    /// Returns a ColorConfig instance configured based on detection results.
+    /// Returns a ColorConfig instance configured based on choice and environment.
+    ///
+    /// # Color Detection Precedence (for Auto mode)
+    ///
+    /// 1. NO_COLOR environment variable (if set, colors are disabled)
+    /// 2. CLICOLOR environment variable (if set to "0", colors are disabled)
+    /// 3. TTY detection (colors disabled if stdout is not a TTY)
+    /// 4. TERM environment variable (colors disabled for "dumb" terminals)
     ///
     /// # Example
     ///
     /// ```
     /// use crately::colors::ColorConfig;
+    /// use crately::cli::ColorChoice;
     ///
-    /// let config = ColorConfig::new(false);
+    /// let config = ColorConfig::new(ColorChoice::Auto);
     /// assert!(config.is_enabled() || !config.is_enabled()); // Either state is valid
     /// ```
-    pub fn new(force_disable: bool) -> Self {
-        let enabled = !force_disable && Self::should_enable_colors();
+    pub fn new(choice: ColorChoice) -> Self {
+        let enabled = match choice {
+            ColorChoice::Always => true,
+            ColorChoice::Never => false,
+            ColorChoice::Auto => Self::should_enable_colors(),
+        };
         Self { enabled }
     }
 
@@ -58,9 +66,11 @@ impl ColorConfig {
 
     /// Determines if colors should be enabled based on environment.
     ///
-    /// Checks for:
-    /// - NO_COLOR environment variable (https://no-color.org/)
-    /// - TERM environment variable for basic terminal detection
+    /// Checks for (in order of precedence):
+    /// 1. NO_COLOR environment variable (https://no-color.org/)
+    /// 2. CLICOLOR environment variable (0 = disable colors)
+    /// 3. TTY detection (colors disabled if stdout is not a TTY)
+    /// 4. TERM environment variable for basic terminal detection
     ///
     /// # Returns
     ///
@@ -72,13 +82,27 @@ impl ColorConfig {
             return false;
         }
 
+        // Check CLICOLOR environment variable
+        // CLICOLOR=0 means disable colors
+        if let Ok(clicolor) = env::var("CLICOLOR") {
+            if clicolor == "0" {
+                return false;
+            }
+        }
+
+        // Check if stdout is a TTY
+        // Colors should be disabled when output is piped or redirected
+        if !std::io::stdout().is_terminal() {
+            return false;
+        }
+
         // Check if we're in a terminal that likely supports colors
         // This is a conservative approach that works on most platforms
         if let Ok(term) = env::var("TERM") {
             // Common terminals that support ANSI colors
             !term.is_empty() && term != "dumb"
         } else {
-            // No TERM variable, assume we support colors
+            // No TERM variable, but we're on a TTY, so assume we support colors
             // This is safe because crossterm handles fallback gracefully
             true
         }
@@ -226,47 +250,39 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_color_config_force_disable_disables_colors() {
-        let config = ColorConfig::new(true);
-        assert!(!config.is_enabled(), "Force disable should disable colors");
+    fn test_color_config_always_enables_colors() {
+        use crate::cli::ColorChoice;
+        let config = ColorConfig::new(ColorChoice::Always);
+        assert!(config.is_enabled(), "Always should enable colors");
     }
 
     #[test]
-    fn test_color_config_respects_no_color_env() {
-        // Note: We cannot safely test NO_COLOR environment variable in unit tests
+    fn test_color_config_never_disables_colors() {
+        use crate::cli::ColorChoice;
+        let config = ColorConfig::new(ColorChoice::Never);
+        assert!(!config.is_enabled(), "Never should disable colors");
+    }
+
+    #[test]
+    fn test_color_config_auto_respects_environment() {
+        use crate::cli::ColorChoice;
+        // Note: We cannot safely test environment variables in unit tests
         // because env::set_var is unsafe and can cause data races in multi-threaded tests.
         // This functionality is tested manually and in integration tests instead.
         //
-        // The logic is straightforward: if NO_COLOR exists, colors are disabled.
-        // This test documents the behavior without actually running unsafe code.
+        // The logic checks: NO_COLOR, CLICOLOR, TTY status, and TERM variable
+        // in that order of precedence.
 
-        // We can test that force_disable works correctly
-        let config = ColorConfig::new(true);
-        assert!(
-            !config.is_enabled(),
-            "Force disable should disable colors"
-        );
-    }
-
-    #[test]
-    fn test_color_config_respects_no_color_empty_value() {
-        // Note: This would require unsafe env::set_var in tests.
-        // See test_color_config_respects_no_color_env for explanation.
-        //
-        // The implementation correctly checks if NO_COLOR.is_ok(), which
-        // returns true for both empty and non-empty values.
-
-        // We can verify the force_disable path works
-        let config = ColorConfig::new(true);
-        assert!(
-            !config.is_enabled(),
-            "Force disable should work regardless of NO_COLOR"
-        );
+        // We can test that Auto mode works without panicking
+        let config = ColorConfig::new(ColorChoice::Auto);
+        // Result depends on environment, so we just verify it doesn't panic
+        let _ = config.is_enabled();
     }
 
     #[test]
     fn test_format_success_with_colors_disabled() {
-        let config = ColorConfig::new(true);
+        use crate::cli::ColorChoice;
+        let config = ColorConfig::new(ColorChoice::Never);
         let result = format_success("Success", config);
         // Should not contain ANSI escape codes
         assert_eq!(result, "Success", "Should be plain text without colors");
@@ -274,21 +290,24 @@ mod tests {
 
     #[test]
     fn test_format_error_with_colors_disabled() {
-        let config = ColorConfig::new(true);
+        use crate::cli::ColorChoice;
+        let config = ColorConfig::new(ColorChoice::Never);
         let result = format_error("Error", config);
         assert_eq!(result, "Error", "Should be plain text without colors");
     }
 
     #[test]
     fn test_format_warning_with_colors_disabled() {
-        let config = ColorConfig::new(true);
+        use crate::cli::ColorChoice;
+        let config = ColorConfig::new(ColorChoice::Never);
         let result = format_warning("Warning", config);
         assert_eq!(result, "Warning", "Should be plain text without colors");
     }
 
     #[test]
     fn test_format_progress_with_colors_disabled() {
-        let config = ColorConfig::new(true);
+        use crate::cli::ColorChoice;
+        let config = ColorConfig::new(ColorChoice::Never);
         let result = format_progress("Progress", config);
         assert_eq!(result, "Progress", "Should be plain text without colors");
     }
@@ -340,7 +359,8 @@ mod tests {
 
     #[test]
     fn test_color_config_is_copy() {
-        let config1 = ColorConfig::new(false);
+        use crate::cli::ColorChoice;
+        let config1 = ColorConfig::new(ColorChoice::Auto);
         let config2 = config1;
         // This test verifies ColorConfig implements Copy
         assert_eq!(config1.is_enabled(), config2.is_enabled());

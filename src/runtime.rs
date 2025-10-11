@@ -552,7 +552,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn test_actor_system_initialize_succeeds() {
-        let color_config = ColorConfig::new(true); // Disable colors for tests
+        let color_config = ColorConfig::new(crate::cli::ColorChoice::Never); // Disable colors for tests
         let result = ActorSystem::initialize(color_config).await;
         assert!(result.is_ok(), "ActorSystem initialization should succeed");
 
@@ -562,7 +562,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn test_actor_system_registers_all_actors() {
-        let color_config = ColorConfig::new(true);
+        let color_config = ColorConfig::new(crate::cli::ColorChoice::Never);
         let system = ActorSystem::initialize(color_config)
             .await
             .expect("Initialization should succeed");
@@ -585,7 +585,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn test_actor_system_get_actor_returns_none_for_unknown() {
-        let color_config = ColorConfig::new(true);
+        let color_config = ColorConfig::new(crate::cli::ColorChoice::Never);
         let system = ActorSystem::initialize(color_config)
             .await
             .expect("Initialization should succeed");
@@ -600,7 +600,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn test_actor_system_get_actor_clones_handle() {
-        let color_config = ColorConfig::new(true);
+        let color_config = ColorConfig::new(crate::cli::ColorChoice::Never);
         let system = ActorSystem::initialize(color_config)
             .await
             .expect("Initialization should succeed");
@@ -617,7 +617,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn test_actor_system_config_returns_loaded_config() {
-        let color_config = ColorConfig::new(true);
+        let color_config = ColorConfig::new(crate::cli::ColorChoice::Never);
         let system = ActorSystem::initialize(color_config)
             .await
             .expect("Initialization should succeed");
@@ -631,7 +631,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn test_actor_system_actors_returns_dashmap() {
-        let color_config = ColorConfig::new(true);
+        let color_config = ColorConfig::new(crate::cli::ColorChoice::Never);
         let system = ActorSystem::initialize(color_config)
             .await
             .expect("Initialization should succeed");
@@ -644,7 +644,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn test_actor_system_shutdown_cleans_up_actors() {
-        let color_config = ColorConfig::new(true);
+        let color_config = ColorConfig::new(crate::cli::ColorChoice::Never);
         let system = ActorSystem::initialize(color_config)
             .await
             .expect("Initialization should succeed");
@@ -661,7 +661,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn test_actor_system_shutdown_handles_missing_actors_gracefully() {
-        let color_config = ColorConfig::new(true);
+        let color_config = ColorConfig::new(crate::cli::ColorChoice::Never);
         let system = ActorSystem::initialize(color_config)
             .await
             .expect("Initialization should succeed");
@@ -675,7 +675,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn test_actor_system_initialize_server_actors_succeeds() {
-        let color_config = ColorConfig::new(true);
+        let color_config = ColorConfig::new(crate::cli::ColorChoice::Never);
         let mut system = ActorSystem::initialize(color_config)
             .await
             .expect("Initialization should succeed");
@@ -710,7 +710,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn test_actor_system_initialize_server_actors_is_idempotent() {
-        let color_config = ColorConfig::new(true);
+        let color_config = ColorConfig::new(crate::cli::ColorChoice::Never);
         let mut system = ActorSystem::initialize(color_config)
             .await
             .expect("Initialization should succeed");
@@ -739,7 +739,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn test_actor_system_shutdown_with_server_actors() {
-        let color_config = ColorConfig::new(true);
+        let color_config = ColorConfig::new(crate::cli::ColorChoice::Never);
         let mut system = ActorSystem::initialize(color_config)
             .await
             .expect("Initialization should succeed");
@@ -763,7 +763,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn test_actor_system_shutdown_without_server_actors() {
-        let color_config = ColorConfig::new(true);
+        let color_config = ColorConfig::new(crate::cli::ColorChoice::Never);
         let system = ActorSystem::initialize(color_config)
             .await
             .expect("Initialization should succeed");

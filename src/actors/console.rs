@@ -462,49 +462,57 @@ mod tests {
 
     #[test]
     fn test_print_success_executes_without_panic() {
-        let color_config = ColorConfig::new(true); // Disable colors for tests
+        use crate::cli::ColorChoice;
+        let color_config = ColorConfig::new(ColorChoice::Never); // Disable colors for tests
         print_success("Test success message", false, color_config);
     }
 
     #[test]
     fn test_print_success_raw_mode_executes_without_panic() {
-        let color_config = ColorConfig::new(true);
+        use crate::cli::ColorChoice;
+        let color_config = ColorConfig::new(ColorChoice::Never);
         print_success("Test success message", true, color_config);
     }
 
     #[test]
     fn test_print_error_executes_without_panic() {
-        let color_config = ColorConfig::new(true);
+        use crate::cli::ColorChoice;
+        let color_config = ColorConfig::new(ColorChoice::Never);
         print_error("Test error message", false, color_config);
     }
 
     #[test]
     fn test_print_error_raw_mode_executes_without_panic() {
-        let color_config = ColorConfig::new(true);
+        use crate::cli::ColorChoice;
+        let color_config = ColorConfig::new(ColorChoice::Never);
         print_error("Test error message", true, color_config);
     }
 
     #[test]
     fn test_print_progress_executes_without_panic() {
-        let color_config = ColorConfig::new(true);
+        use crate::cli::ColorChoice;
+        let color_config = ColorConfig::new(ColorChoice::Never);
         print_progress("Test progress message", false, color_config);
     }
 
     #[test]
     fn test_print_progress_raw_mode_executes_without_panic() {
-        let color_config = ColorConfig::new(true);
+        use crate::cli::ColorChoice;
+        let color_config = ColorConfig::new(ColorChoice::Never);
         print_progress("Test progress message", true, color_config);
     }
 
     #[test]
     fn test_print_warning_executes_without_panic() {
-        let color_config = ColorConfig::new(true);
+        use crate::cli::ColorChoice;
+        let color_config = ColorConfig::new(ColorChoice::Never);
         print_warning("Test warning message", false, color_config);
     }
 
     #[test]
     fn test_print_warning_raw_mode_executes_without_panic() {
-        let color_config = ColorConfig::new(true);
+        use crate::cli::ColorChoice;
+        let color_config = ColorConfig::new(ColorChoice::Never);
         print_warning("Test warning message", true, color_config);
     }
 
@@ -520,8 +528,9 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn test_console_actor_handles_print_success_message() {
+        use crate::cli::ColorChoice;
         let mut runtime = ActonApp::launch();
-        let color_config = ColorConfig::new(true); // Disable colors for tests
+        let color_config = ColorConfig::new(ColorChoice::Never); // Disable colors for tests
         let console = Console::spawn(&mut runtime, color_config).await.unwrap();
 
         // Send message and verify it doesn't panic
@@ -534,8 +543,9 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn test_console_actor_handles_print_error_message() {
+        use crate::cli::ColorChoice;
         let mut runtime = ActonApp::launch();
-        let color_config = ColorConfig::new(true);
+        let color_config = ColorConfig::new(ColorChoice::Never);
         let console = Console::spawn(&mut runtime, color_config).await.unwrap();
 
         console.send(PrintError("Test error".to_string())).await;
@@ -546,8 +556,9 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn test_console_actor_handles_print_progress_message() {
+        use crate::cli::ColorChoice;
         let mut runtime = ActonApp::launch();
-        let color_config = ColorConfig::new(true);
+        let color_config = ColorConfig::new(ColorChoice::Never);
         let console = Console::spawn(&mut runtime, color_config).await.unwrap();
 
         console.send(PrintProgress("Test progress".to_string())).await;
@@ -558,8 +569,9 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn test_console_actor_handles_print_warning_message() {
+        use crate::cli::ColorChoice;
         let mut runtime = ActonApp::launch();
-        let color_config = ColorConfig::new(true);
+        let color_config = ColorConfig::new(ColorChoice::Never);
         let console = Console::spawn(&mut runtime, color_config).await.unwrap();
 
         console.send(PrintWarning("Test warning".to_string())).await;
@@ -570,8 +582,9 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn test_console_actor_handles_print_separator_message() {
+        use crate::cli::ColorChoice;
         let mut runtime = ActonApp::launch();
-        let color_config = ColorConfig::new(true);
+        let color_config = ColorConfig::new(ColorChoice::Never);
         let console = Console::spawn(&mut runtime, color_config).await.unwrap();
 
         console.send(PrintSeparator).await;
@@ -582,8 +595,9 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn test_console_actor_handles_set_raw_mode_true() {
+        use crate::cli::ColorChoice;
         let mut runtime = ActonApp::launch();
-        let color_config = ColorConfig::new(true);
+        let color_config = ColorConfig::new(ColorChoice::Never);
         let console = Console::spawn(&mut runtime, color_config).await.unwrap();
 
         // Send SetRawMode(true) message
@@ -601,8 +615,9 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn test_console_actor_handles_set_raw_mode_false() {
+        use crate::cli::ColorChoice;
         let mut runtime = ActonApp::launch();
-        let color_config = ColorConfig::new(true);
+        let color_config = ColorConfig::new(ColorChoice::Never);
         let console = Console::spawn(&mut runtime, color_config).await.unwrap();
 
         // Send SetRawMode(false) message
@@ -620,8 +635,9 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn test_console_actor_handles_mode_transition() {
+        use crate::cli::ColorChoice;
         let mut runtime = ActonApp::launch();
-        let color_config = ColorConfig::new(true);
+        let color_config = ColorConfig::new(ColorChoice::Never);
         let console = Console::spawn(&mut runtime, color_config).await.unwrap();
 
         // Start in normal mode

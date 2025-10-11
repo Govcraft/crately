@@ -40,8 +40,8 @@ async fn main() -> anyhow::Result<()> {
             // Initialize XDG-compliant file logging
             let (_guard, _log_dir) = logging::init().expect("Failed to initialize logging");
 
-            // Create color configuration based on CLI flag
-            let color_config = ColorConfig::new(cli.no_color);
+            // Create color configuration based on CLI color choice
+            let color_config = ColorConfig::new(cli.color);
 
             // Initialize the actor system
             let actor_system = ActorSystem::initialize(color_config).await?;

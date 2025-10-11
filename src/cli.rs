@@ -4,6 +4,39 @@
 /// command-line arguments and managing subcommands.
 use clap::{Parser, Subcommand};
 
+/// Color output control
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ColorChoice {
+    /// Always use colors
+    Always,
+    /// Automatically detect color support (default)
+    Auto,
+    /// Never use colors
+    Never,
+}
+
+impl std::str::FromStr for ColorChoice {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "always" => Ok(Self::Always),
+            "auto" => Ok(Self::Auto),
+            "never" => Ok(Self::Never),
+            _ => Err(format!(
+                "Invalid color choice: '{}'. Valid options: always, auto, never",
+                s
+            )),
+        }
+    }
+}
+
+impl Default for ColorChoice {
+    fn default() -> Self {
+        Self::Auto
+    }
+}
+
 /// Crately - Crate documentation processing and semantic search service
 #[derive(Parser, Debug)]
 #[command(name = "crately")]
@@ -12,12 +45,19 @@ use clap::{Parser, Subcommand};
 #[command(about = "Crate documentation processing and semantic search service", long_about = None)]
 #[command(propagate_version = true)]
 pub struct Cli {
-    /// Disable colored output
+    /// Control color output
     ///
-    /// When enabled, all terminal output will be displayed without colors.
-    /// This can also be controlled via the NO_COLOR environment variable.
-    #[arg(long, global = true)]
-    pub no_color: bool,
+    /// Controls when to use colors in terminal output:
+    /// - always: Always use colors
+    /// - auto: Auto-detect color support (default)
+    /// - never: Never use colors
+    ///
+    /// Color support is auto-detected based on:
+    /// - NO_COLOR environment variable (if set, colors are disabled)
+    /// - CLICOLOR environment variable (if set to 0, colors are disabled)
+    /// - Terminal TTY status (colors disabled if output is piped)
+    #[arg(long, value_name = "WHEN", default_value = "auto", global = true)]
+    pub color: ColorChoice,
 
     /// The subcommand to execute
     #[command(subcommand)]
@@ -731,26 +771,86 @@ mod tests {
     }
 
     #[test]
-    fn test_cli_no_color_flag_default() {
+    fn test_cli_color_flag_default() {
         let cli = Cli::try_parse_from(["crately", "serve"]).expect("Failed to parse");
-        assert!(!cli.no_color, "no_color should default to false");
+        assert_eq!(
+            cli.color,
+            ColorChoice::Auto,
+            "color should default to Auto"
+        );
     }
 
     #[test]
-    fn test_cli_no_color_flag_enabled() {
+    fn test_cli_color_flag_always() {
         let cli =
-            Cli::try_parse_from(["crately", "--no-color", "serve"]).expect("Failed to parse");
-        assert!(cli.no_color, "no_color should be true when flag is set");
+            Cli::try_parse_from(["crately", "--color", "always", "serve"]).expect("Failed to parse");
+        assert_eq!(
+            cli.color,
+            ColorChoice::Always,
+            "color should be Always when flag is set"
+        );
     }
 
     #[test]
-    fn test_cli_no_color_flag_with_other_commands() {
-        let cli = Cli::try_parse_from(["crately", "--no-color", "doctor"])
+    fn test_cli_color_flag_never() {
+        let cli =
+            Cli::try_parse_from(["crately", "--color", "never", "serve"]).expect("Failed to parse");
+        assert_eq!(
+            cli.color,
+            ColorChoice::Never,
+            "color should be Never when flag is set"
+        );
+    }
+
+    #[test]
+    fn test_cli_color_flag_auto() {
+        let cli =
+            Cli::try_parse_from(["crately", "--color", "auto", "serve"]).expect("Failed to parse");
+        assert_eq!(
+            cli.color,
+            ColorChoice::Auto,
+            "color should be Auto when flag is set"
+        );
+    }
+
+    #[test]
+    fn test_cli_color_flag_with_other_commands() {
+        let cli = Cli::try_parse_from(["crately", "--color", "never", "doctor"])
             .expect("Failed to parse");
-        assert!(cli.no_color, "no_color should work with any command");
+        assert_eq!(
+            cli.color,
+            ColorChoice::Never,
+            "color should work with any command"
+        );
         match cli.command {
             Commands::Doctor(_) => {}
             _ => panic!("Expected Doctor command"),
         }
+    }
+
+    #[test]
+    fn test_cli_color_flag_case_insensitive() {
+        let cli =
+            Cli::try_parse_from(["crately", "--color", "ALWAYS", "serve"]).expect("Failed to parse");
+        assert_eq!(
+            cli.color,
+            ColorChoice::Always,
+            "color flag should be case insensitive"
+        );
+    }
+
+    #[test]
+    fn test_cli_color_flag_invalid_value() {
+        let result = Cli::try_parse_from(["crately", "--color", "invalid", "serve"]);
+        assert!(result.is_err(), "Invalid color value should cause parse error");
+    }
+
+    #[test]
+    fn test_color_choice_from_str() {
+        assert_eq!("always".parse::<ColorChoice>().unwrap(), ColorChoice::Always);
+        assert_eq!("auto".parse::<ColorChoice>().unwrap(), ColorChoice::Auto);
+        assert_eq!("never".parse::<ColorChoice>().unwrap(), ColorChoice::Never);
+        assert_eq!("ALWAYS".parse::<ColorChoice>().unwrap(), ColorChoice::Always);
+        assert!("invalid".parse::<ColorChoice>().is_err());
     }
 }
