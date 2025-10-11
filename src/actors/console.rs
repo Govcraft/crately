@@ -11,8 +11,8 @@ use acton_reactive::prelude::*;
 
 use crate::actors::config::ConfigLoaded;
 use crate::messages::{
-    ConfigReloadFailed, Init, PrintSuccess, PrintWarning, ServerReloaded, ServerStarted,
-    SetRawMode,
+    ConfigReloadFailed, Init, PrintError, PrintProgress, PrintSeparator, PrintSuccess,
+    PrintWarning, ServerReloaded, ServerStarted, SetRawMode,
 };
 use tracing::info;
 
@@ -56,14 +56,6 @@ pub struct Console {
     /// instead of just `\n` to ensure proper cursor positioning.
     raw_mode_active: bool,
 }
-
-/// Message to print an error message with the error symbol (✗)
-#[acton_message(raw)]
-pub struct PrintError(pub String);
-
-/// Message to print a progress message with the progress symbol (→)
-#[acton_message(raw)]
-pub struct PrintProgress(pub String);
 
 impl Console {
     /// Spawns, configures, and starts a new Console actor

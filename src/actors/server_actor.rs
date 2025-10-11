@@ -19,11 +19,11 @@ use tokio::sync::oneshot;
 use tracing::{debug, error, info, warn};
 
 use crate::{
-    actors::{
-        config::{Config, ConfigResponse, ReloadConfig},
-        console::{PrintError, PrintProgress},
+    actors::config::{Config, ConfigResponse, ReloadConfig},
+    messages::{
+        KeyPressed, PrintError, PrintProgress, PrintSuccess, ServerReloaded, ServerStarted,
+        StartServer, StopServer,
     },
-    messages::{KeyPressed, PrintSuccess, ServerReloaded, ServerStarted, StartServer, StopServer},
     request::CrateRequest,
     response::CrateResponse,
 };
