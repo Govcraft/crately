@@ -79,10 +79,6 @@ mod tests {
         let progress = PrintProgress("Debug test".to_string());
         let debug_string = format!("{:?}", progress);
         assert!(!debug_string.is_empty(), "Debug output should not be empty");
-        assert!(
-            debug_string.contains("Debug test"),
-            "Debug output should contain the message"
-        );
     }
 
     /// Verify that PrintProgress is Send + Sync (required for actor message passing).

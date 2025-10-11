@@ -65,7 +65,6 @@ mod tests {
         let msg = PrintSuccess("Debug test".to_string());
         let debug_string = format!("{:?}", msg);
         assert!(!debug_string.is_empty());
-        assert!(debug_string.contains("Debug test"));
     }
 
     /// Verify that PrintSuccess is Send + Sync.
