@@ -14,29 +14,433 @@ use std::path::{Path, PathBuf};
 use tracing::*;
 use xdg::BaseDirectories;
 
-use crate::messages::ConfigReloadFailed;
+use crate::messages::{ConfigReloadFailed, PipelineConfigChanged};
 
 /// Application configuration structure
 ///
-/// This struct holds all configuration values for the Crately service.
-/// It supports TOML serialization/deserialization and provides sensible defaults.
+/// This struct holds all configuration values for the Crately service including
+/// server settings and pipeline processing parameters.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Config {
     /// HTTP server port (default: 3000)
     #[serde(default = "default_port")]
     pub port: u16,
+
+    /// Pipeline processing configuration
+    #[serde(default)]
+    pub pipeline: PipelineConfig,
 }
 
 impl Default for Config {
     fn default() -> Self {
         Self {
             port: default_port(),
+            pipeline: PipelineConfig::default(),
         }
     }
 }
 
 fn default_port() -> u16 {
     3000
+}
+
+/// Pipeline processing configuration for all stages
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct PipelineConfig {
+    /// Download stage configuration
+    #[serde(default)]
+    pub download: DownloadConfig,
+
+    /// File reading stage configuration
+    #[serde(default)]
+    pub read: ReadConfig,
+
+    /// Processing stage configuration
+    #[serde(default)]
+    pub process: ProcessConfig,
+
+    /// Vectorization stage configuration
+    #[serde(default)]
+    pub vectorize: VectorizeConfig,
+}
+
+impl PipelineConfig {
+    /// Validates pipeline configuration for logical consistency
+    ///
+    /// # Errors
+    ///
+    /// Returns `ConfigError::InvalidValue` if any configuration value fails validation
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        self.download.validate()?;
+        self.read.validate()?;
+        self.process.validate()?;
+        self.vectorize.validate()?;
+        Ok(())
+    }
+}
+
+/// Configuration for the crate download stage
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DownloadConfig {
+    /// Directory path for downloaded crates (default: $XDG_DATA_HOME/crately/downloads)
+    #[serde(default = "default_download_dir")]
+    pub download_dir: PathBuf,
+
+    /// HTTP request timeout in seconds (default: 30)
+    #[serde(default = "default_download_timeout")]
+    pub timeout_secs: u64,
+
+    /// Maximum concurrent downloads (default: 4)
+    #[serde(default = "default_max_concurrent_downloads")]
+    pub max_concurrent: usize,
+
+    /// Maximum download retries (default: 3)
+    #[serde(default = "default_max_retries")]
+    pub max_retries: u32,
+
+    /// Retry delay in seconds (default: 5)
+    #[serde(default = "default_retry_delay")]
+    pub retry_delay_secs: u64,
+
+    /// crates.io API base URL (default: https://crates.io/api/v1)
+    #[serde(default = "default_crates_io_url")]
+    pub crates_io_url: String,
+}
+
+impl Default for DownloadConfig {
+    fn default() -> Self {
+        Self {
+            download_dir: default_download_dir(),
+            timeout_secs: default_download_timeout(),
+            max_concurrent: default_max_concurrent_downloads(),
+            max_retries: default_max_retries(),
+            retry_delay_secs: default_retry_delay(),
+            crates_io_url: default_crates_io_url(),
+        }
+    }
+}
+
+impl DownloadConfig {
+    /// Validates download configuration
+    ///
+    /// # Errors
+    ///
+    /// Returns `ConfigError::InvalidValue` if any value is invalid
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        if self.timeout_secs == 0 {
+            return Err(ConfigError::InvalidValue(
+                "download.timeout_secs must be > 0".to_string(),
+            ));
+        }
+        if self.max_concurrent == 0 {
+            return Err(ConfigError::InvalidValue(
+                "download.max_concurrent must be > 0".to_string(),
+            ));
+        }
+        if self.max_retries == 0 {
+            return Err(ConfigError::InvalidValue(
+                "download.max_retries must be > 0".to_string(),
+            ));
+        }
+        if self.retry_delay_secs == 0 {
+            return Err(ConfigError::InvalidValue(
+                "download.retry_delay_secs must be > 0".to_string(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+fn default_download_dir() -> PathBuf {
+    BaseDirectories::with_prefix("crately")
+        .get_data_home()
+        .map(|path| path.join("downloads"))
+        .unwrap_or_else(|| PathBuf::from("downloads"))
+}
+
+fn default_download_timeout() -> u64 {
+    30
+}
+
+fn default_max_concurrent_downloads() -> usize {
+    4
+}
+
+fn default_max_retries() -> u32 {
+    3
+}
+
+fn default_retry_delay() -> u64 {
+    5
+}
+
+fn default_crates_io_url() -> String {
+    "https://crates.io/api/v1".to_string()
+}
+
+/// Configuration for the file reading stage
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ReadConfig {
+    /// Directory path for extracted crate files (default: $XDG_DATA_HOME/crately/extracted)
+    #[serde(default = "default_extract_dir")]
+    pub extract_dir: PathBuf,
+
+    /// Maximum file size to read in bytes (default: 10MB)
+    #[serde(default = "default_max_file_size")]
+    pub max_file_size_bytes: u64,
+
+    /// File patterns to include (default: ["*.rs", "*.md", "*.toml"])
+    #[serde(default = "default_include_patterns")]
+    pub include_patterns: Vec<String>,
+
+    /// File patterns to exclude (default: ["*/target/*", "*/tests/*"])
+    #[serde(default = "default_exclude_patterns")]
+    pub exclude_patterns: Vec<String>,
+
+    /// Read operation timeout in seconds (default: 10)
+    #[serde(default = "default_read_timeout")]
+    pub timeout_secs: u64,
+}
+
+impl Default for ReadConfig {
+    fn default() -> Self {
+        Self {
+            extract_dir: default_extract_dir(),
+            max_file_size_bytes: default_max_file_size(),
+            include_patterns: default_include_patterns(),
+            exclude_patterns: default_exclude_patterns(),
+            timeout_secs: default_read_timeout(),
+        }
+    }
+}
+
+impl ReadConfig {
+    /// Validates read configuration
+    ///
+    /// # Errors
+    ///
+    /// Returns `ConfigError::InvalidValue` if any value is invalid
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        if self.max_file_size_bytes == 0 {
+            return Err(ConfigError::InvalidValue(
+                "read.max_file_size_bytes must be > 0".to_string(),
+            ));
+        }
+        if self.timeout_secs == 0 {
+            return Err(ConfigError::InvalidValue(
+                "read.timeout_secs must be > 0".to_string(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+fn default_extract_dir() -> PathBuf {
+    BaseDirectories::with_prefix("crately")
+        .get_data_home()
+        .map(|path| path.join("extracted"))
+        .unwrap_or_else(|| PathBuf::from("extracted"))
+}
+
+fn default_max_file_size() -> u64 {
+    10_485_760 // 10MB
+}
+
+fn default_include_patterns() -> Vec<String> {
+    vec![
+        "*.rs".to_string(),
+        "*.md".to_string(),
+        "*.toml".to_string(),
+    ]
+}
+
+fn default_exclude_patterns() -> Vec<String> {
+    vec!["*/target/*".to_string(), "*/tests/*".to_string()]
+}
+
+fn default_read_timeout() -> u64 {
+    10
+}
+
+/// Configuration for the processing stage
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProcessConfig {
+    /// rustdoc compilation timeout in seconds (default: 300)
+    #[serde(default = "default_compilation_timeout")]
+    pub compilation_timeout_secs: u64,
+
+    /// Maximum concurrent compilation jobs (default: 2)
+    #[serde(default = "default_max_concurrent_compilations")]
+    pub max_concurrent_compilations: usize,
+
+    /// Documentation output directory (default: $XDG_DATA_HOME/crately/docs)
+    #[serde(default = "default_docs_dir")]
+    pub docs_dir: PathBuf,
+
+    /// Text chunking size in characters (default: 1000)
+    #[serde(default = "default_chunk_size")]
+    pub chunk_size: usize,
+
+    /// Chunk overlap in characters (default: 200)
+    #[serde(default = "default_chunk_overlap")]
+    pub chunk_overlap: usize,
+
+    /// Enable source code extraction (default: true)
+    #[serde(default = "default_extract_source_code")]
+    pub extract_source_code: bool,
+}
+
+impl Default for ProcessConfig {
+    fn default() -> Self {
+        Self {
+            compilation_timeout_secs: default_compilation_timeout(),
+            max_concurrent_compilations: default_max_concurrent_compilations(),
+            docs_dir: default_docs_dir(),
+            chunk_size: default_chunk_size(),
+            chunk_overlap: default_chunk_overlap(),
+            extract_source_code: default_extract_source_code(),
+        }
+    }
+}
+
+impl ProcessConfig {
+    /// Validates process configuration
+    ///
+    /// # Errors
+    ///
+    /// Returns `ConfigError::InvalidValue` if any value is invalid
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        if self.compilation_timeout_secs == 0 {
+            return Err(ConfigError::InvalidValue(
+                "process.compilation_timeout_secs must be > 0".to_string(),
+            ));
+        }
+        if self.max_concurrent_compilations == 0 {
+            return Err(ConfigError::InvalidValue(
+                "process.max_concurrent_compilations must be > 0".to_string(),
+            ));
+        }
+        if self.chunk_size <= self.chunk_overlap {
+            return Err(ConfigError::InvalidValue(
+                "process.chunk_size must be > chunk_overlap".to_string(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+fn default_compilation_timeout() -> u64 {
+    300
+}
+
+fn default_max_concurrent_compilations() -> usize {
+    2
+}
+
+fn default_docs_dir() -> PathBuf {
+    BaseDirectories::with_prefix("crately")
+        .get_data_home()
+        .map(|path| path.join("docs"))
+        .unwrap_or_else(|| PathBuf::from("docs"))
+}
+
+fn default_chunk_size() -> usize {
+    1000
+}
+
+fn default_chunk_overlap() -> usize {
+    200
+}
+
+fn default_extract_source_code() -> bool {
+    true
+}
+
+/// Configuration for the vectorization stage
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct VectorizeConfig {
+    /// Embedding model name (default: "all-MiniLM-L6-v2")
+    #[serde(default = "default_model_name")]
+    pub model_name: String,
+
+    /// Batch size for vectorization (default: 32)
+    #[serde(default = "default_batch_size")]
+    pub batch_size: usize,
+
+    /// Vector dimension (default: 384 for all-MiniLM-L6-v2)
+    #[serde(default = "default_vector_dimension")]
+    pub vector_dimension: usize,
+
+    /// Maximum concurrent vectorization operations (default: 2)
+    #[serde(default = "default_max_concurrent_vectorize")]
+    pub max_concurrent: usize,
+
+    /// Vectorization timeout in seconds (default: 60)
+    #[serde(default = "default_vectorize_timeout")]
+    pub timeout_secs: u64,
+}
+
+impl Default for VectorizeConfig {
+    fn default() -> Self {
+        Self {
+            model_name: default_model_name(),
+            batch_size: default_batch_size(),
+            vector_dimension: default_vector_dimension(),
+            max_concurrent: default_max_concurrent_vectorize(),
+            timeout_secs: default_vectorize_timeout(),
+        }
+    }
+}
+
+impl VectorizeConfig {
+    /// Validates vectorize configuration
+    ///
+    /// # Errors
+    ///
+    /// Returns `ConfigError::InvalidValue` if any value is invalid
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        if self.batch_size == 0 {
+            return Err(ConfigError::InvalidValue(
+                "vectorize.batch_size must be > 0".to_string(),
+            ));
+        }
+        if self.vector_dimension == 0 {
+            return Err(ConfigError::InvalidValue(
+                "vectorize.vector_dimension must be > 0".to_string(),
+            ));
+        }
+        if self.max_concurrent == 0 {
+            return Err(ConfigError::InvalidValue(
+                "vectorize.max_concurrent must be > 0".to_string(),
+            ));
+        }
+        if self.timeout_secs == 0 {
+            return Err(ConfigError::InvalidValue(
+                "vectorize.timeout_secs must be > 0".to_string(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+fn default_model_name() -> String {
+    "all-MiniLM-L6-v2".to_string()
+}
+
+fn default_batch_size() -> usize {
+    32
+}
+
+fn default_vector_dimension() -> usize {
+    384
+}
+
+fn default_max_concurrent_vectorize() -> usize {
+    2
+}
+
+fn default_vectorize_timeout() -> u64 {
+    60
 }
 
 /// Message types for ConfigManager actor communication
@@ -77,6 +481,8 @@ pub enum ConfigError {
     TomlParse(toml::de::Error),
     /// Failed to serialize config to TOML
     TomlSerialize(toml::ser::Error),
+    /// Configuration value validation failed
+    InvalidValue(String),
 }
 
 impl std::fmt::Display for ConfigError {
@@ -93,6 +499,7 @@ impl std::fmt::Display for ConfigError {
             Self::FileWrite(e) => write!(f, "Failed to write config file: {}", e),
             Self::TomlParse(e) => write!(f, "Failed to parse TOML configuration: {}", e),
             Self::TomlSerialize(e) => write!(f, "Failed to serialize config to TOML: {}", e),
+            Self::InvalidValue(msg) => write!(f, "Invalid configuration value: {}", msg),
         }
     }
 }
@@ -106,6 +513,7 @@ impl std::error::Error for ConfigError {
             Self::FileWrite(e) => Some(e),
             Self::TomlParse(e) => Some(e),
             Self::TomlSerialize(e) => Some(e),
+            Self::InvalidValue(_) => None,
         }
     }
 }
@@ -272,21 +680,49 @@ impl ConfigManager {
         builder.mutate_on::<ReloadConfig>(|agent, _envelope| {
             match load_config_internal() {
                 Ok((new_config, new_config_path)) => {
+                    // Validate pipeline configuration before updating
+                    if let Err(e) = new_config.pipeline.validate() {
+                        error!("Configuration validation failed: {}", e);
+
+                        // Broadcast validation error
+                        let error_msg = ConfigReloadFailed {
+                            error: format!("Configuration validation failed: {}", e),
+                        };
+                        let broker = agent.broker().clone();
+
+                        return Box::pin(async move {
+                            broker.broadcast(error_msg).await;
+                        });
+                    }
+
                     info!("Configuration reloaded from: {}", new_config_path.display());
 
-                    // Broadcast both ConfigResponse (for ServerActor) and ConfigLoaded (for Console)
+                    // Update internal state
+                    agent.model.config = new_config.clone();
+                    agent.model.config_path = new_config_path.clone();
+
+                    // Broadcast ConfigResponse (for ServerActor)
                     let config_response = ConfigResponse {
-                        config: new_config,
+                        config: new_config.clone(),
                         config_path: new_config_path.clone(),
                     };
+
+                    // Broadcast ConfigLoaded (for Console)
                     let config_loaded = ConfigLoaded {
                         config_path: new_config_path,
                     };
+
+                    // Broadcast PipelineConfigChanged (for pipeline actors)
+                    let pipeline_changed = PipelineConfigChanged {
+                        pipeline: new_config.pipeline,
+                    };
+
                     let broker = agent.broker().clone();
 
                     Box::pin(async move {
                         broker.broadcast(config_response).await;
                         broker.broadcast(config_loaded).await;
+                        broker.broadcast(pipeline_changed).await;
                     })
                 }
                 Err(e) => {
@@ -404,11 +840,15 @@ mod tests {
     fn test_default_config_values() {
         let config = Config::default();
         assert_eq!(config.port, 3000);
+        assert_eq!(config.pipeline.download.timeout_secs, 30);
     }
 
     #[test]
     fn test_config_serialization() {
-        let config = Config { port: 8080 };
+        let config = Config {
+            port: 8080,
+            pipeline: PipelineConfig::default(),
+        };
         let toml_string = toml::to_string(&config).unwrap();
         assert!(toml_string.contains("port"));
         assert!(toml_string.contains("8080"));
@@ -431,7 +871,10 @@ mod tests {
 
     #[test]
     fn test_config_roundtrip() {
-        let original = Config { port: 9000 };
+        let original = Config {
+            port: 9000,
+            pipeline: PipelineConfig::default(),
+        };
         let toml_string = toml::to_string(&original).unwrap();
         let deserialized: Config = toml::from_str(&toml_string).unwrap();
         assert_eq!(original, deserialized);
@@ -491,7 +934,10 @@ mod tests {
         let _ = fs::create_dir_all(&temp_dir);
 
         // Create and save config
-        let original_config = Config { port: 7777 };
+        let original_config = Config {
+            port: 7777,
+            pipeline: PipelineConfig::default(),
+        };
         let save_result = save_config(&config_path, &original_config);
         assert!(save_result.is_ok());
 
@@ -537,9 +983,18 @@ mod tests {
 
     #[test]
     fn test_config_equality() {
-        let config1 = Config { port: 3000 };
-        let config2 = Config { port: 3000 };
-        let config3 = Config { port: 8080 };
+        let config1 = Config {
+            port: 3000,
+            pipeline: PipelineConfig::default(),
+        };
+        let config2 = Config {
+            port: 3000,
+            pipeline: PipelineConfig::default(),
+        };
+        let config3 = Config {
+            port: 8080,
+            pipeline: PipelineConfig::default(),
+        };
 
         assert_eq!(config1, config2);
         assert_ne!(config1, config3);
@@ -547,8 +1002,307 @@ mod tests {
 
     #[test]
     fn test_config_clone() {
-        let config1 = Config { port: 5555 };
+        let config1 = Config {
+            port: 5555,
+            pipeline: PipelineConfig::default(),
+        };
         let config2 = config1.clone();
         assert_eq!(config1, config2);
+    }
+
+    // Pipeline configuration tests
+    #[test]
+    fn test_pipeline_config_default_values() {
+        let pipeline = PipelineConfig::default();
+
+        // Download config defaults
+        assert_eq!(pipeline.download.timeout_secs, 30);
+        assert_eq!(pipeline.download.max_concurrent, 4);
+        assert_eq!(pipeline.download.max_retries, 3);
+        assert_eq!(pipeline.download.retry_delay_secs, 5);
+        assert_eq!(
+            pipeline.download.crates_io_url,
+            "https://crates.io/api/v1"
+        );
+
+        // Read config defaults
+        assert_eq!(pipeline.read.max_file_size_bytes, 10_485_760);
+        assert_eq!(pipeline.read.timeout_secs, 10);
+        assert_eq!(pipeline.read.include_patterns.len(), 3);
+        assert_eq!(pipeline.read.exclude_patterns.len(), 2);
+
+        // Process config defaults
+        assert_eq!(pipeline.process.compilation_timeout_secs, 300);
+        assert_eq!(pipeline.process.max_concurrent_compilations, 2);
+        assert_eq!(pipeline.process.chunk_size, 1000);
+        assert_eq!(pipeline.process.chunk_overlap, 200);
+        assert!(pipeline.process.extract_source_code);
+
+        // Vectorize config defaults
+        assert_eq!(pipeline.vectorize.model_name, "all-MiniLM-L6-v2");
+        assert_eq!(pipeline.vectorize.batch_size, 32);
+        assert_eq!(pipeline.vectorize.vector_dimension, 384);
+        assert_eq!(pipeline.vectorize.max_concurrent, 2);
+        assert_eq!(pipeline.vectorize.timeout_secs, 60);
+    }
+
+    #[test]
+    fn test_pipeline_config_serialization() {
+        let config = Config {
+            port: 3000,
+            pipeline: PipelineConfig::default(),
+        };
+        let toml_string = toml::to_string(&config).unwrap();
+        assert!(toml_string.contains("[pipeline.download]"));
+        assert!(toml_string.contains("[pipeline.read]"));
+        assert!(toml_string.contains("[pipeline.process]"));
+        assert!(toml_string.contains("[pipeline.vectorize]"));
+    }
+
+    #[test]
+    fn test_pipeline_config_deserialization_with_defaults() {
+        let toml_string = r#"
+            port = 3000
+            [pipeline.download]
+            timeout_secs = 60
+        "#;
+
+        let config: Config = toml::from_str(toml_string).unwrap();
+        assert_eq!(config.pipeline.download.timeout_secs, 60);
+        assert_eq!(config.pipeline.download.max_concurrent, 4); // default used
+    }
+
+    #[test]
+    fn test_pipeline_config_validation_success() {
+        let config = PipelineConfig::default();
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_download_config_validation_zero_timeout() {
+        let config = DownloadConfig {
+            timeout_secs: 0,
+            ..Default::default()
+        };
+
+        let result = config.validate();
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("download.timeout_secs must be > 0"));
+    }
+
+    #[test]
+    fn test_download_config_validation_zero_max_concurrent() {
+        let config = DownloadConfig {
+            max_concurrent: 0,
+            ..Default::default()
+        };
+
+        let result = config.validate();
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("download.max_concurrent must be > 0"));
+    }
+
+    #[test]
+    fn test_download_config_validation_zero_max_retries() {
+        let config = DownloadConfig {
+            max_retries: 0,
+            ..Default::default()
+        };
+
+        let result = config.validate();
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("download.max_retries must be > 0"));
+    }
+
+    #[test]
+    fn test_read_config_validation_zero_max_file_size() {
+        let config = ReadConfig {
+            max_file_size_bytes: 0,
+            ..Default::default()
+        };
+
+        let result = config.validate();
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("read.max_file_size_bytes must be > 0"));
+    }
+
+    #[test]
+    fn test_read_config_validation_zero_timeout() {
+        let config = ReadConfig {
+            timeout_secs: 0,
+            ..Default::default()
+        };
+
+        let result = config.validate();
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("read.timeout_secs must be > 0"));
+    }
+
+    #[test]
+    fn test_process_config_validation_zero_compilation_timeout() {
+        let config = ProcessConfig {
+            compilation_timeout_secs: 0,
+            ..Default::default()
+        };
+
+        let result = config.validate();
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("process.compilation_timeout_secs must be > 0"));
+    }
+
+    #[test]
+    fn test_process_config_validation_zero_max_concurrent_compilations() {
+        let config = ProcessConfig {
+            max_concurrent_compilations: 0,
+            ..Default::default()
+        };
+
+        let result = config.validate();
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("process.max_concurrent_compilations must be > 0"));
+    }
+
+    #[test]
+    fn test_process_config_validation_chunk_size_overlap() {
+        let config = ProcessConfig {
+            chunk_size: 100,
+            chunk_overlap: 100,
+            ..Default::default()
+        };
+
+        let result = config.validate();
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("process.chunk_size must be > chunk_overlap"));
+    }
+
+    #[test]
+    fn test_vectorize_config_validation_zero_batch_size() {
+        let config = VectorizeConfig {
+            batch_size: 0,
+            ..Default::default()
+        };
+
+        let result = config.validate();
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("vectorize.batch_size must be > 0"));
+    }
+
+    #[test]
+    fn test_vectorize_config_validation_zero_vector_dimension() {
+        let config = VectorizeConfig {
+            vector_dimension: 0,
+            ..Default::default()
+        };
+
+        let result = config.validate();
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("vectorize.vector_dimension must be > 0"));
+    }
+
+    #[test]
+    fn test_vectorize_config_validation_zero_max_concurrent() {
+        let config = VectorizeConfig {
+            max_concurrent: 0,
+            ..Default::default()
+        };
+
+        let result = config.validate();
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("vectorize.max_concurrent must be > 0"));
+    }
+
+    #[test]
+    fn test_pipeline_config_roundtrip() {
+        let original = Config {
+            port: 3000,
+            pipeline: PipelineConfig::default(),
+        };
+        let toml_string = toml::to_string(&original).unwrap();
+        let deserialized: Config = toml::from_str(&toml_string).unwrap();
+        assert_eq!(original, deserialized);
+    }
+
+    #[test]
+    fn test_config_error_invalid_value_display() {
+        let err = ConfigError::InvalidValue("test validation error".to_string());
+        assert!(err.to_string().contains("Invalid configuration value"));
+        assert!(err.to_string().contains("test validation error"));
+    }
+
+    #[test]
+    fn test_complete_config_with_all_pipeline_settings() {
+        let toml_string = r#"
+            port = 8080
+
+            [pipeline.download]
+            timeout_secs = 45
+            max_concurrent = 8
+            max_retries = 5
+            retry_delay_secs = 10
+            crates_io_url = "https://custom.crates.io/api/v1"
+
+            [pipeline.read]
+            max_file_size_bytes = 5242880
+            timeout_secs = 20
+            include_patterns = ["*.rs", "*.md"]
+            exclude_patterns = ["*/target/*"]
+
+            [pipeline.process]
+            compilation_timeout_secs = 600
+            max_concurrent_compilations = 4
+            chunk_size = 2000
+            chunk_overlap = 400
+            extract_source_code = false
+
+            [pipeline.vectorize]
+            model_name = "custom-model"
+            batch_size = 64
+            vector_dimension = 768
+            max_concurrent = 4
+            timeout_secs = 120
+        "#;
+
+        let config: Config = toml::from_str(toml_string).unwrap();
+        assert_eq!(config.port, 8080);
+        assert_eq!(config.pipeline.download.timeout_secs, 45);
+        assert_eq!(config.pipeline.download.max_concurrent, 8);
+        assert_eq!(config.pipeline.read.max_file_size_bytes, 5_242_880);
+        assert_eq!(config.pipeline.process.chunk_size, 2000);
+        assert!(!config.pipeline.process.extract_source_code);
+        assert_eq!(config.pipeline.vectorize.model_name, "custom-model");
+        assert_eq!(config.pipeline.vectorize.batch_size, 64);
     }
 }

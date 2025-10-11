@@ -89,6 +89,7 @@
 
 mod config_reload_failed;
 mod crate_downloaded;
+mod pipeline_config_changed;
 mod crate_download_failed;
 mod crate_list_response;
 mod crate_persisted;
@@ -127,6 +128,7 @@ mod stop_server;
 
 pub use config_reload_failed::ConfigReloadFailed;
 pub use crate_downloaded::CrateDownloaded;
+pub use pipeline_config_changed::PipelineConfigChanged;
 pub use crate_download_failed::{CrateDownloadFailed, DownloadErrorKind};
 pub use crate_list_response::{CrateListResponse, CrateSummary};
 pub use crate_persisted::CratePersisted;

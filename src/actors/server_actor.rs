@@ -461,7 +461,10 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn test_server_actor_start_stop_cycle() {
         let mut runtime = ActonApp::launch();
-        let config = Config { port: 0 }; // Use port 0 for random available port
+        let config = Config {
+            port: 0,
+            pipeline: crate::actors::config::PipelineConfig::default(),
+        }; // Use port 0 for random available port
         let actors = Arc::new(DashMap::new());
 
         let handle = ServerActor::spawn(&mut runtime, config, actors)
@@ -490,7 +493,10 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn test_server_actor_ignores_duplicate_start() {
         let mut runtime = ActonApp::launch();
-        let config = Config { port: 0 };
+        let config = Config {
+            port: 0,
+            pipeline: crate::actors::config::PipelineConfig::default(),
+        };
         let actors = Arc::new(DashMap::new());
 
         let handle = ServerActor::spawn(&mut runtime, config, actors)
@@ -521,7 +527,10 @@ mod tests {
         let mut runtime = ActonApp::launch();
         // Use a fixed test port that's unlikely to conflict
         let test_port = 38291;
-        let config = Config { port: test_port };
+        let config = Config {
+            port: test_port,
+            pipeline: crate::actors::config::PipelineConfig::default(),
+        };
         let actors = Arc::new(DashMap::new());
 
         let handle = ServerActor::spawn(&mut runtime, config, actors.clone())
@@ -577,7 +586,10 @@ mod tests {
 
         let mut runtime = ActonApp::launch();
         let test_port = 38292;
-        let config = Config { port: test_port };
+        let config = Config {
+            port: test_port,
+            pipeline: crate::actors::config::PipelineConfig::default(),
+        };
         let actors = Arc::new(DashMap::new());
 
         let handle = ServerActor::spawn(&mut runtime, config, actors.clone())
