@@ -1,0 +1,26 @@
+//! Actor modules for Crately.
+//!
+//! This module contains all actor implementations organized in a dedicated namespace.
+//! Each actor is defined in its own file following the actor factory pattern with `spawn` methods.
+//!
+//! # Organization Pattern
+//!
+//! All actors are located in `src/actors/` to match the organizational pattern used for
+//! `src/messages/` and `src/commands/`, providing a consistent and discoverable structure.
+//!
+//! # Actor Categories
+//!
+//! - **Core Actors** (initialized in `ActorSystem::initialize()`):
+//!   - [`Console`](console::Console) - Output formatting actor
+//!   - [`ConfigManager`](config::ConfigManager) - Configuration management with hot-reload
+//!   - [`CrateDownloader`](crate_downloader::CrateDownloader) - Crate download orchestration
+//!
+//! - **Server Actors** (initialized in `ActorSystem::initialize_server_actors()`):
+//!   - [`KeyboardHandler`](keyboard_handler::KeyboardHandler) - Interactive keyboard input
+//!   - [`ServerActor`](server_actor::ServerActor) - Axum HTTP server lifecycle management
+
+pub mod config;
+pub mod console;
+pub mod crate_downloader;
+pub mod keyboard_handler;
+pub mod server_actor;

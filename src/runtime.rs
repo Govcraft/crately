@@ -42,12 +42,14 @@ use std::sync::Arc;
 use tracing::{error, info};
 
 use crate::{
-    config::{Config, ConfigManager},
-    console::{Console, PrintProgress, PrintSuccess},
-    crate_downloader::CrateDownloader,
-    keyboard_handler::{KeyboardHandler, StopKeyboardHandler},
+    actors::{
+        config::{Config, ConfigManager},
+        console::{Console, PrintProgress, PrintSuccess},
+        crate_downloader::CrateDownloader,
+        keyboard_handler::{KeyboardHandler, StopKeyboardHandler},
+        server_actor::ServerActor,
+    },
     messages::{Init, StopServer},
-    server_actor::ServerActor,
 };
 
 /// Centralized actor system managing runtime and all actors.

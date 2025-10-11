@@ -9,7 +9,7 @@
 
 use acton_reactive::prelude::*;
 
-use crate::config::ConfigLoaded;
+use crate::actors::config::ConfigLoaded;
 use crate::messages::{ConfigReloadFailed, Init, ServerReloaded, ServerStarted, SetRawMode};
 use tracing::info;
 

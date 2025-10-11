@@ -1,18 +1,14 @@
 #![forbid(unsafe_code)]
 
+mod actors;
 mod cli;
 mod commands;
-mod config;
-mod console;
-mod crate_downloader;
 mod crate_specifier;
-mod keyboard_handler;
 mod logging;
 mod messages;
 mod request;
 mod response;
 pub mod runtime;
-mod server_actor;
 
 use clap::Parser;
 use cli::{Cli, Commands};
