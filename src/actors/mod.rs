@@ -25,4 +25,5 @@ pub mod console;
 pub mod crate_downloader;
 pub mod database;
 pub mod keyboard_handler;
+pub mod retry_coordinator;
 pub mod server_actor;

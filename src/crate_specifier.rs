@@ -4,7 +4,7 @@ use serde::{Deserialize, Deserializer, Serialize};
 use std::{fmt, str::FromStr};
 
 /// Strongly-typed crate specifier combining name and version
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
 pub struct CrateSpecifier {
     /// Crate name (e.g., "serde")
     name: String,
