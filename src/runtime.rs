@@ -38,6 +38,7 @@
 use acton_reactive::prelude::*;
 use anyhow::{Context, Result};
 use dashmap::DashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 use tracing::{error, info};
 
@@ -46,6 +47,7 @@ use crate::{
         config::{Config, ConfigManager},
         console::Console,
         crate_downloader::CrateDownloader,
+        database::DatabaseActor,
         keyboard_handler::KeyboardHandler,
         server_actor::ServerActor,
     },
@@ -71,6 +73,7 @@ use crate::{
 /// Actors are stored with consistent naming:
 /// - `"console"` - Console output formatting actor
 /// - `"config_manager"` - Configuration management actor
+/// - `"database"` - Database persistence actor
 /// - `"crate_downloader"` - Crate download orchestration actor
 /// - `"keyboard_handler"` - Keyboard event handler actor (server mode only)
 /// - `"server"` - HTTP server actor (server mode only)
@@ -92,8 +95,9 @@ impl ActorSystem {
     /// 1. Launches the acton-reactive runtime
     /// 2. Spawns the Console actor and triggers initialization
     /// 3. Spawns the ConfigManager actor and loads configuration
-    /// 4. Spawns the CrateDownloader actor
-    /// 5. Stores all actor handles in the registry
+    /// 4. Spawns the DatabaseActor for persistence operations
+    /// 5. Spawns the CrateDownloader actor
+    /// 6. Stores all actor handles in the registry
     ///
     /// # Arguments
     ///
@@ -151,6 +155,25 @@ impl ActorSystem {
             .context("Failed to spawn ConfigManager actor")?;
 
         actors.insert("config_manager".to_string(), config_manager.clone());
+
+        // Spawn DatabaseActor (for persistence)
+        let db_path = Self::get_database_path()
+            .context("Failed to determine database path")?;
+
+        let (database, db_info) = DatabaseActor::spawn(&mut runtime, db_path)
+            .await
+            .context("Failed to spawn DatabaseActor")?;
+
+        actors.insert("database".to_string(), database.clone());
+
+        // Display database initialization via Console
+        console
+            .send(PrintSuccess(format!(
+                "Database initialized {} {}",
+                crate::actors::console::LOCATION,
+                db_info.db_path.display()
+            )))
+            .await;
 
         // Spawn CrateDownloader actor
         let crate_downloader = CrateDownloader::spawn(&mut runtime)
@@ -229,6 +252,26 @@ impl ActorSystem {
     /// ```
     pub fn actors(&self) -> Arc<DashMap<String, AgentHandle>> {
         Arc::clone(&self.actors)
+    }
+
+    /// Gets the database path using XDG conventions.
+    ///
+    /// Returns the path to the database directory following XDG Base Directory
+    /// specifications. The path is typically `~/.local/share/crately/db`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - XDG directories cannot be initialized
+    /// - Database directory cannot be created
+    fn get_database_path() -> Result<PathBuf> {
+        let xdg_dirs = xdg::BaseDirectories::with_prefix("crately");
+
+        let db_dir = xdg_dirs
+            .create_data_directory("db")
+            .context("Failed to create database directory")?;
+
+        Ok(db_dir)
     }
 
     /// Gets mutable access to the runtime for spawning new actors.
@@ -436,10 +479,11 @@ impl ActorSystem {
     /// 1. Stops ServerActor (if running) - gracefully stop accepting requests
     /// 2. Stops KeyboardHandler (if running) - stop listening for input
     /// 3. Stops CrateDownloader actor - finish any pending work
-    /// 4. Stops ConfigManager actor - finish any pending work
-    /// 5. Stops Console actor - last so logging works throughout
-    /// 6. Clears actor registry
-    /// 7. Shuts down the acton-reactive runtime
+    /// 4. Stops DatabaseActor - close database connections
+    /// 5. Stops ConfigManager actor - finish any pending work
+    /// 6. Stops Console actor - last so logging works throughout
+    /// 7. Clears actor registry
+    /// 8. Shuts down the acton-reactive runtime
     ///
     /// The shutdown order ensures that the server stops first, followed by
     /// supporting actors, with logging remaining available until all other
@@ -501,6 +545,16 @@ impl ActorSystem {
                 Ok(()) => {}
                 Err(e) => {
                     error!("Failed to stop CrateDownloader actor: {:?}", e);
+                }
+            }
+        }
+
+        // Stop DatabaseActor
+        if let Some(database) = self.get_actor("database") {
+            match database.stop().await {
+                Ok(()) => {}
+                Err(e) => {
+                    error!("Failed to stop DatabaseActor: {:?}", e);
                 }
             }
         }
@@ -576,8 +630,27 @@ mod tests {
             "ConfigManager actor should be registered"
         );
         assert!(
+            system.get_actor("database").is_some(),
+            "DatabaseActor should be registered"
+        );
+        assert!(
             system.get_actor("crate_downloader").is_some(),
             "CrateDownloader actor should be registered"
+        );
+
+        system.shutdown().await.expect("Shutdown should succeed");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_actor_system_initializes_database_actor() {
+        let color_config = ColorConfig::new(crate::cli::ColorChoice::Never);
+        let system = ActorSystem::initialize(color_config)
+            .await
+            .expect("Initialization should succeed");
+
+        assert!(
+            system.get_actor("database").is_some(),
+            "DatabaseActor should be registered"
         );
 
         system.shutdown().await.expect("Shutdown should succeed");
@@ -637,7 +710,7 @@ mod tests {
             .expect("Initialization should succeed");
 
         let actors = system.actors();
-        assert_eq!(actors.len(), 3, "Should have exactly 3 actors registered");
+        assert_eq!(actors.len(), 4, "Should have exactly 4 actors registered");
 
         system.shutdown().await.expect("Shutdown should succeed");
     }
@@ -650,7 +723,7 @@ mod tests {
             .expect("Initialization should succeed");
 
         let actors_before = system.actors();
-        assert_eq!(actors_before.len(), 3, "Should start with 3 actors");
+        assert_eq!(actors_before.len(), 4, "Should start with 4 actors");
 
         // Shutdown should succeed and clean up
         system.shutdown().await.expect("Shutdown should succeed");
@@ -730,8 +803,8 @@ mod tests {
         let actors = system.actors();
         assert_eq!(
             actors.len(),
-            5,
-            "Should have exactly 5 actors (3 core + 2 server)"
+            6,
+            "Should have exactly 6 actors (4 core + 2 server)"
         );
 
         system.shutdown().await.expect("Shutdown should succeed");
