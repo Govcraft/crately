@@ -12,6 +12,7 @@ mod messages;
 mod request;
 mod response;
 pub mod runtime;
+pub mod types;
 
 use clap::Parser;
 use cli::{Cli, Commands};
