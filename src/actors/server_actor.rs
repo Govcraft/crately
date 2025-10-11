@@ -21,9 +21,9 @@ use tracing::{debug, error, info, warn};
 use crate::{
     actors::{
         config::{Config, ConfigResponse, ReloadConfig},
-        console::{PrintError, PrintProgress, PrintSuccess},
+        console::{PrintError, PrintProgress},
     },
-    messages::{KeyPressed, ServerReloaded, ServerStarted, StartServer, StopServer},
+    messages::{KeyPressed, PrintSuccess, ServerReloaded, ServerStarted, StartServer, StopServer},
     request::CrateRequest,
     response::CrateResponse,
 };

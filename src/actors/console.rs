@@ -10,7 +10,10 @@
 use acton_reactive::prelude::*;
 
 use crate::actors::config::ConfigLoaded;
-use crate::messages::{ConfigReloadFailed, Init, ServerReloaded, ServerStarted, SetRawMode};
+use crate::messages::{
+    ConfigReloadFailed, Init, PrintSuccess, PrintWarning, ServerReloaded, ServerStarted,
+    SetRawMode,
+};
 use tracing::info;
 
 /// Success symbol (✓)
@@ -54,10 +57,6 @@ pub struct Console {
     raw_mode_active: bool,
 }
 
-/// Message to print a success message with the success symbol (✓)
-#[acton_message(raw)]
-pub struct PrintSuccess(pub String);
-
 /// Message to print an error message with the error symbol (✗)
 #[acton_message(raw)]
 pub struct PrintError(pub String);
@@ -65,14 +64,6 @@ pub struct PrintError(pub String);
 /// Message to print a progress message with the progress symbol (→)
 #[acton_message(raw)]
 pub struct PrintProgress(pub String);
-
-/// Message to print a warning message with the warning symbol (⚠)
-#[acton_message(raw)]
-pub struct PrintWarning(pub String);
-
-/// Message to print a horizontal separator line
-#[acton_message(raw)]
-pub struct PrintSeparator;
 
 impl Console {
     /// Spawns, configures, and starts a new Console actor

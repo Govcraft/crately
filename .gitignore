@@ -3,3 +3,6 @@
 CLAUDE.md
 /docs
 /.agents
+.env
+.env
+.mcp.json

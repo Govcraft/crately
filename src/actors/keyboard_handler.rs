@@ -17,15 +17,7 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 use tracing::{error, info, warn};
 
-use crate::messages::{KeyPressed, SetRawMode};
-
-/// Message to stop the keyboard handler gracefully.
-#[acton_message]
-pub struct StopKeyboardHandler;
-
-/// Message sent after the keyboard handler starts to complete initialization
-#[acton_message]
-struct KeyboardHandlerStarted;
+use crate::messages::{KeyPressed, KeyboardHandlerStarted, SetRawMode, StopKeyboardHandler};
 
 /// Actor that listens for keyboard events and broadcasts them to subscribers.
 ///

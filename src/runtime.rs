@@ -44,12 +44,12 @@ use tracing::{error, info};
 use crate::{
     actors::{
         config::{Config, ConfigManager},
-        console::{Console, PrintProgress, PrintSuccess},
+        console::{Console, PrintProgress},
         crate_downloader::CrateDownloader,
-        keyboard_handler::{KeyboardHandler, StopKeyboardHandler},
+        keyboard_handler::KeyboardHandler,
         server_actor::ServerActor,
     },
-    messages::{Init, StopServer},
+    messages::{Init, PrintSuccess, StopKeyboardHandler, StopServer},
 };
 
 /// Centralized actor system managing runtime and all actors.
