@@ -21,7 +21,7 @@ use tracing::{debug, error, info, warn};
 use crate::{
     config::{Config, ConfigResponse, ReloadConfig},
     console::{PrintError, PrintProgress, PrintSuccess},
-    messages::{KeyPressed, ServerStarted, StartServer, StopServer},
+    messages::{KeyPressed, ServerReloaded, ServerStarted, StartServer, StopServer},
     request::CrateRequest,
     response::CrateResponse,
 };
@@ -303,11 +303,14 @@ impl ServerActor {
             }
 
             // Update configuration
+            let config_port = new_config.port;
             agent.model.config = new_config;
 
             // Restart the server if it was running
             if was_running {
                 let console = agent.model.actors.get("console").map(|h| h.clone());
+                let broker = agent.broker().clone();
+
                 if let Some(console) = console {
                     return AgentReply::from_async(async move {
                         console
@@ -315,6 +318,9 @@ impl ServerActor {
                                 "Reloading server with new configuration...".to_string(),
                             ))
                             .await;
+
+                        // Broadcast ServerReloaded to notify Console of successful reload
+                        broker.broadcast(ServerReloaded { port: config_port }).await;
                     });
                 }
             }

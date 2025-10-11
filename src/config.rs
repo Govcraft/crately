@@ -14,6 +14,8 @@ use std::path::{Path, PathBuf};
 use tracing::*;
 use xdg::BaseDirectories;
 
+use crate::messages::ConfigReloadFailed;
+
 /// Application configuration structure
 ///
 /// This struct holds all configuration values for the Crately service.
@@ -272,22 +274,33 @@ impl ConfigManager {
                 Ok((new_config, new_config_path)) => {
                     info!("Configuration reloaded from: {}", new_config_path.display());
 
-                    // Broadcast the new config. The ConfigManager's state remains unchanged,
-                    // but subscribers can update their own state with the new values.
-                    let response = ConfigResponse {
+                    // Broadcast both ConfigResponse (for ServerActor) and ConfigLoaded (for Console)
+                    let config_response = ConfigResponse {
                         config: new_config,
+                        config_path: new_config_path.clone(),
+                    };
+                    let config_loaded = ConfigLoaded {
                         config_path: new_config_path,
                     };
                     let broker = agent.broker().clone();
 
                     Box::pin(async move {
-                        broker.broadcast(response).await;
+                        broker.broadcast(config_response).await;
+                        broker.broadcast(config_loaded).await;
                     })
                 }
                 Err(e) => {
                     error!("Failed to reload configuration: {}", e);
-                    // Keep existing config on reload failure
-                    AgentReply::immediate()
+
+                    // Broadcast error to subscribers (Console will display to user)
+                    let error_msg = ConfigReloadFailed {
+                        error: e.to_string(),
+                    };
+                    let broker = agent.broker().clone();
+
+                    Box::pin(async move {
+                        broker.broadcast(error_msg).await;
+                    })
                 }
             }
         });

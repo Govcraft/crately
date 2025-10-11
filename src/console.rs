@@ -10,7 +10,7 @@
 use acton_reactive::prelude::*;
 
 use crate::config::ConfigLoaded;
-use crate::messages::{Init, ServerStarted, SetRawMode};
+use crate::messages::{ConfigReloadFailed, Init, ServerReloaded, ServerStarted, SetRawMode};
 use tracing::info;
 
 /// Success symbol (✓)
@@ -180,6 +180,28 @@ impl Console {
                 );
                 AgentReply::immediate()
             })
+            .act_on::<ConfigReloadFailed>(|actor, envelope| {
+                let message = envelope.message();
+                let raw_mode = actor.model.raw_mode_active;
+                print_error(
+                    &format!("Configuration reload failed {} {}", PROGRESS, message.error),
+                    raw_mode,
+                );
+                print_warning(
+                    "Server continues with previous configuration",
+                    raw_mode,
+                );
+                AgentReply::immediate()
+            })
+            .act_on::<ServerReloaded>(|actor, envelope| {
+                let message = envelope.message();
+                let raw_mode = actor.model.raw_mode_active;
+                print_success(
+                    &format!("Server reloaded {} http://127.0.0.1:{}", PROGRESS, message.port),
+                    raw_mode,
+                );
+                AgentReply::immediate()
+            })
             .act_on::<ServerStarted>(|actor, _envelope| {
                 let raw_mode = actor.model.raw_mode_active;
                 print_newline(raw_mode);
@@ -194,6 +216,8 @@ impl Console {
 
         // Subscribe to broadcast messages before starting
         builder.handle().subscribe::<ConfigLoaded>().await;
+        builder.handle().subscribe::<ConfigReloadFailed>().await;
+        builder.handle().subscribe::<ServerReloaded>().await;
         builder.handle().subscribe::<ServerStarted>().await;
 
         Ok(builder.start().await)
