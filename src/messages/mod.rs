@@ -88,14 +88,19 @@
 //! ```
 
 mod config_reload_failed;
+mod crate_persisted;
+mod database_error;
+mod database_ready;
 mod init;
 mod key_pressed;
 mod keyboard_handler_started;
+mod persist_crate;
 mod print_error;
 mod print_progress;
 mod print_separator;
 mod print_success;
 mod print_warning;
+mod query_crate;
 mod server_reloaded;
 mod server_started;
 mod set_raw_mode;
@@ -104,14 +109,19 @@ mod stop_keyboard_handler;
 mod stop_server;
 
 pub use config_reload_failed::ConfigReloadFailed;
+pub use crate_persisted::CratePersisted;
+pub use database_error::DatabaseError;
+pub use database_ready::DatabaseReady;
 pub use init::Init;
 pub use key_pressed::KeyPressed;
 pub(crate) use keyboard_handler_started::KeyboardHandlerStarted;
+pub use persist_crate::PersistCrate;
 pub use print_error::PrintError;
 pub use print_progress::PrintProgress;
 pub use print_separator::PrintSeparator;
 pub use print_success::PrintSuccess;
 pub use print_warning::PrintWarning;
+pub use query_crate::QueryCrate;
 pub use server_reloaded::ServerReloaded;
 pub use server_started::ServerStarted;
 pub use set_raw_mode::SetRawMode;
