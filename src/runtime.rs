@@ -48,12 +48,15 @@ use crate::{
         console::Console,
         crate_downloader::CrateDownloader,
         database::DatabaseActor,
-        keyboard_handler::KeyboardHandler,
         server_actor::ServerActor,
     },
     colors::ColorConfig,
     messages::{Init, PrintProgress, PrintSuccess, StopKeyboardHandler, StopServer},
 };
+
+// KeyboardHandler is only used in non-test builds (requires TTY)
+#[cfg(not(test))]
+use crate::actors::keyboard_handler::KeyboardHandler;
 
 /// Centralized actor system managing runtime and all actors.
 ///
@@ -338,13 +341,18 @@ impl ActorSystem {
 
         info!("Initializing server-specific actors");
 
-        // Spawn KeyboardHandler actor with access to actor registry
-        let keyboard_handle = KeyboardHandler::spawn(&mut self.runtime, Arc::clone(&self.actors))
-            .await
-            .context("Failed to spawn KeyboardHandler actor")?;
+        // Skip KeyboardHandler in test environments - it requires a TTY and blocks on stdin
+        // which causes test hangs when multiple tests run concurrently
+        #[cfg(not(test))]
+        {
+            // Spawn KeyboardHandler actor with access to actor registry
+            let keyboard_handle = KeyboardHandler::spawn(&mut self.runtime, Arc::clone(&self.actors))
+                .await
+                .context("Failed to spawn KeyboardHandler actor")?;
 
-        self.actors
-            .insert("keyboard_handler".to_string(), keyboard_handle.clone());
+            self.actors
+                .insert("keyboard_handler".to_string(), keyboard_handle.clone());
+        }
 
         // Spawn ServerActor
         let server_handle = ServerActor::spawn(
@@ -597,251 +605,490 @@ impl ActorSystem {
 
         Ok(())
     }
+
+    /// Test-only helper: Initialize the actor system with a custom database path.
+    ///
+    /// This method is identical to `initialize()` but accepts a custom database path
+    /// instead of using the production XDG path. This enables test isolation by allowing
+    /// each test to use a unique temporary database without lock contention.
+    ///
+    /// # Arguments
+    ///
+    /// * `color_config` - Color configuration for console output
+    /// * `db_path` - Custom database path (typically in temp directory)
+    ///
+    /// # Returns
+    ///
+    /// Returns the initialized `ActorSystem` with custom database path.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if any actor fails to spawn or initialize.
+    #[cfg(test)]
+    pub async fn initialize_with_db_path(
+        color_config: ColorConfig,
+        db_path: PathBuf,
+    ) -> Result<Self> {
+        // Launch the acton-reactive runtime
+        let mut runtime = ActonApp::launch();
+        let actors = Arc::new(DashMap::new());
+
+        // Spawn Console actor
+        let console = Console::spawn(&mut runtime, color_config)
+            .await
+            .context("Failed to spawn Console actor")?;
+        console.send(Init).await;
+
+        // Print startup banner and logging confirmation
+        let log_dir =
+            crate::logging::get_log_dir().context("Failed to determine log directory")?;
+        console
+            .send(PrintSuccess(format!(
+                "Logging initialized {} {}",
+                crate::actors::console::LOCATION,
+                log_dir.display()
+            )))
+            .await;
+
+        actors.insert("console".to_string(), console.clone());
+
+        // Spawn ConfigManager actor
+        let (config_manager, config) = ConfigManager::spawn(&mut runtime)
+            .await
+            .context("Failed to spawn ConfigManager actor")?;
+
+        actors.insert("config_manager".to_string(), config_manager.clone());
+
+        // Spawn DatabaseActor with custom path (test isolation)
+        let (database, db_info) = DatabaseActor::spawn(&mut runtime, db_path)
+            .await
+            .context("Failed to spawn DatabaseActor")?;
+
+        actors.insert("database".to_string(), database.clone());
+
+        // Display database initialization via Console
+        console
+            .send(PrintSuccess(format!(
+                "Database initialized {} {}",
+                crate::actors::console::LOCATION,
+                db_info.db_path.display()
+            )))
+            .await;
+
+        // Spawn CrateDownloader actor
+        let crate_downloader = CrateDownloader::spawn(&mut runtime)
+            .await
+            .context("Failed to spawn CrateDownloader actor")?;
+
+        actors.insert("crate_downloader".to_string(), crate_downloader.clone());
+
+        Ok(Self {
+            runtime,
+            actors,
+            config,
+            server_mode: false,
+        })
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::messages::StartServer;
+    use std::env;
 
     #[tokio::test(flavor = "multi_thread")]
     async fn test_actor_system_initialize_succeeds() {
-        let color_config = ColorConfig::new(crate::cli::ColorChoice::Never); // Disable colors for tests
-        let result = ActorSystem::initialize(color_config).await;
-        assert!(result.is_ok(), "ActorSystem initialization should succeed");
+        tokio::time::timeout(tokio::time::Duration::from_secs(10), async {
+            let color_config = ColorConfig::new(crate::cli::ColorChoice::Never);
 
-        let system = result.unwrap();
-        system.shutdown().await.expect("Shutdown should succeed");
+            // Create unique temp path for this test
+            let test_db_path = env::temp_dir().join("crately_test_runtime_initialize_succeeds");
+            let _ = std::fs::remove_dir_all(&test_db_path); // Clean slate
+
+            let result = ActorSystem::initialize_with_db_path(color_config, test_db_path.clone()).await;
+            assert!(result.is_ok(), "ActorSystem initialization should succeed");
+
+            let system = result.unwrap();
+            system.shutdown().await.expect("Shutdown should succeed");
+
+            // Cleanup
+            let _ = std::fs::remove_dir_all(&test_db_path);
+        })
+        .await
+        .expect("Test should complete within timeout");
     }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn test_actor_system_registers_all_actors() {
-        let color_config = ColorConfig::new(crate::cli::ColorChoice::Never);
-        let system = ActorSystem::initialize(color_config)
-            .await
-            .expect("Initialization should succeed");
+        tokio::time::timeout(tokio::time::Duration::from_secs(10), async {
+            let color_config = ColorConfig::new(crate::cli::ColorChoice::Never);
 
-        assert!(
-            system.get_actor("console").is_some(),
-            "Console actor should be registered"
-        );
-        assert!(
-            system.get_actor("config_manager").is_some(),
-            "ConfigManager actor should be registered"
-        );
-        assert!(
-            system.get_actor("database").is_some(),
-            "DatabaseActor should be registered"
-        );
-        assert!(
-            system.get_actor("crate_downloader").is_some(),
-            "CrateDownloader actor should be registered"
-        );
+            // Create unique temp path for this test
+            let test_db_path = env::temp_dir().join("crately_test_runtime_registers_all_actors");
+            let _ = std::fs::remove_dir_all(&test_db_path);
 
-        system.shutdown().await.expect("Shutdown should succeed");
+            let system = ActorSystem::initialize_with_db_path(color_config, test_db_path.clone())
+                .await
+                .expect("Initialization should succeed");
+
+            assert!(
+                system.get_actor("console").is_some(),
+                "Console actor should be registered"
+            );
+            assert!(
+                system.get_actor("config_manager").is_some(),
+                "ConfigManager actor should be registered"
+            );
+            assert!(
+                system.get_actor("database").is_some(),
+                "DatabaseActor should be registered"
+            );
+            assert!(
+                system.get_actor("crate_downloader").is_some(),
+                "CrateDownloader actor should be registered"
+            );
+
+            system.shutdown().await.expect("Shutdown should succeed");
+
+            // Cleanup
+            let _ = std::fs::remove_dir_all(&test_db_path);
+        })
+        .await
+        .expect("Test should complete within timeout");
     }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn test_actor_system_initializes_database_actor() {
-        let color_config = ColorConfig::new(crate::cli::ColorChoice::Never);
-        let system = ActorSystem::initialize(color_config)
-            .await
-            .expect("Initialization should succeed");
+        tokio::time::timeout(tokio::time::Duration::from_secs(10), async {
+            let color_config = ColorConfig::new(crate::cli::ColorChoice::Never);
 
-        assert!(
-            system.get_actor("database").is_some(),
-            "DatabaseActor should be registered"
-        );
+            // Create unique temp path for this test
+            let test_db_path = env::temp_dir().join("crately_test_runtime_initializes_database_actor");
+            let _ = std::fs::remove_dir_all(&test_db_path);
 
-        system.shutdown().await.expect("Shutdown should succeed");
+            let system = ActorSystem::initialize_with_db_path(color_config, test_db_path.clone())
+                .await
+                .expect("Initialization should succeed");
+
+            assert!(
+                system.get_actor("database").is_some(),
+                "DatabaseActor should be registered"
+            );
+
+            system.shutdown().await.expect("Shutdown should succeed");
+
+            // Cleanup
+            let _ = std::fs::remove_dir_all(&test_db_path);
+        })
+        .await
+        .expect("Test should complete within timeout");
     }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn test_actor_system_get_actor_returns_none_for_unknown() {
-        let color_config = ColorConfig::new(crate::cli::ColorChoice::Never);
-        let system = ActorSystem::initialize(color_config)
-            .await
-            .expect("Initialization should succeed");
+        tokio::time::timeout(tokio::time::Duration::from_secs(10), async {
+            let color_config = ColorConfig::new(crate::cli::ColorChoice::Never);
 
-        assert!(
-            system.get_actor("nonexistent").is_none(),
-            "Unknown actor should return None"
-        );
+            // Create unique temp path for this test
+            let test_db_path = env::temp_dir().join("crately_test_runtime_get_actor_returns_none");
+            let _ = std::fs::remove_dir_all(&test_db_path);
 
-        system.shutdown().await.expect("Shutdown should succeed");
+            let system = ActorSystem::initialize_with_db_path(color_config, test_db_path.clone())
+                .await
+                .expect("Initialization should succeed");
+
+            assert!(
+                system.get_actor("nonexistent").is_none(),
+                "Unknown actor should return None"
+            );
+
+            system.shutdown().await.expect("Shutdown should succeed");
+
+            // Cleanup
+            let _ = std::fs::remove_dir_all(&test_db_path);
+        })
+        .await
+        .expect("Test should complete within timeout");
     }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn test_actor_system_get_actor_clones_handle() {
-        let color_config = ColorConfig::new(crate::cli::ColorChoice::Never);
-        let system = ActorSystem::initialize(color_config)
-            .await
-            .expect("Initialization should succeed");
+        tokio::time::timeout(tokio::time::Duration::from_secs(10), async {
+            let color_config = ColorConfig::new(crate::cli::ColorChoice::Never);
 
-        let console1 = system.get_actor("console").expect("Console should exist");
-        let console2 = system.get_actor("console").expect("Console should exist");
+            // Create unique temp path for this test
+            let test_db_path = env::temp_dir().join("crately_test_runtime_get_actor_clones_handle");
+            let _ = std::fs::remove_dir_all(&test_db_path);
 
-        // Both handles should work independently
-        console1.send(Init).await;
-        console2.send(Init).await;
+            let system = ActorSystem::initialize_with_db_path(color_config, test_db_path.clone())
+                .await
+                .expect("Initialization should succeed");
 
-        system.shutdown().await.expect("Shutdown should succeed");
+            let console1 = system.get_actor("console").expect("Console should exist");
+            let console2 = system.get_actor("console").expect("Console should exist");
+
+            // Both handles should work independently
+            console1.send(Init).await;
+            console2.send(Init).await;
+
+            system.shutdown().await.expect("Shutdown should succeed");
+
+            // Cleanup
+            let _ = std::fs::remove_dir_all(&test_db_path);
+        })
+        .await
+        .expect("Test should complete within timeout");
     }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn test_actor_system_config_returns_loaded_config() {
-        let color_config = ColorConfig::new(crate::cli::ColorChoice::Never);
-        let system = ActorSystem::initialize(color_config)
-            .await
-            .expect("Initialization should succeed");
+        tokio::time::timeout(tokio::time::Duration::from_secs(10), async {
+            let color_config = ColorConfig::new(crate::cli::ColorChoice::Never);
 
-        let config = system.config();
-        // Config should have a valid port
-        assert!(config.port > 0, "Config port should be set");
+            // Create unique temp path for this test
+            let test_db_path = env::temp_dir().join("crately_test_runtime_config_returns_loaded_config");
+            let _ = std::fs::remove_dir_all(&test_db_path);
 
-        system.shutdown().await.expect("Shutdown should succeed");
+            let system = ActorSystem::initialize_with_db_path(color_config, test_db_path.clone())
+                .await
+                .expect("Initialization should succeed");
+
+            let config = system.config();
+            // Config should have a valid port
+            assert!(config.port > 0, "Config port should be set");
+
+            system.shutdown().await.expect("Shutdown should succeed");
+
+            // Cleanup
+            let _ = std::fs::remove_dir_all(&test_db_path);
+        })
+        .await
+        .expect("Test should complete within timeout");
     }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn test_actor_system_actors_returns_dashmap() {
-        let color_config = ColorConfig::new(crate::cli::ColorChoice::Never);
-        let system = ActorSystem::initialize(color_config)
-            .await
-            .expect("Initialization should succeed");
+        tokio::time::timeout(tokio::time::Duration::from_secs(10), async {
+            let color_config = ColorConfig::new(crate::cli::ColorChoice::Never);
 
-        let actors = system.actors();
-        assert_eq!(actors.len(), 4, "Should have exactly 4 actors registered");
+            // Create unique temp path for this test
+            let test_db_path = env::temp_dir().join("crately_test_runtime_actors_returns_dashmap");
+            let _ = std::fs::remove_dir_all(&test_db_path);
 
-        system.shutdown().await.expect("Shutdown should succeed");
+            let system = ActorSystem::initialize_with_db_path(color_config, test_db_path.clone())
+                .await
+                .expect("Initialization should succeed");
+
+            let actors = system.actors();
+            assert_eq!(actors.len(), 4, "Should have exactly 4 actors registered");
+
+            system.shutdown().await.expect("Shutdown should succeed");
+
+            // Cleanup
+            let _ = std::fs::remove_dir_all(&test_db_path);
+        })
+        .await
+        .expect("Test should complete within timeout");
     }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn test_actor_system_shutdown_cleans_up_actors() {
-        let color_config = ColorConfig::new(crate::cli::ColorChoice::Never);
-        let system = ActorSystem::initialize(color_config)
-            .await
-            .expect("Initialization should succeed");
+        tokio::time::timeout(tokio::time::Duration::from_secs(10), async {
+            let color_config = ColorConfig::new(crate::cli::ColorChoice::Never);
 
-        let actors_before = system.actors();
-        assert_eq!(actors_before.len(), 4, "Should start with 4 actors");
+            // Create unique temp path for this test
+            let test_db_path = env::temp_dir().join("crately_test_runtime_shutdown_cleans_up_actors");
+            let _ = std::fs::remove_dir_all(&test_db_path);
 
-        // Shutdown should succeed and clean up
-        system.shutdown().await.expect("Shutdown should succeed");
+            let system = ActorSystem::initialize_with_db_path(color_config, test_db_path.clone())
+                .await
+                .expect("Initialization should succeed");
 
-        // After shutdown, the system is consumed, so we can't check the state
-        // This test verifies that shutdown completes without errors
+            let actors_before = system.actors();
+            assert_eq!(actors_before.len(), 4, "Should start with 4 actors");
+
+            // Shutdown should succeed and clean up
+            system.shutdown().await.expect("Shutdown should succeed");
+
+            // Cleanup
+            let _ = std::fs::remove_dir_all(&test_db_path);
+
+            // After shutdown, the system is consumed, so we can't check the state
+            // This test verifies that shutdown completes without errors
+        })
+        .await
+        .expect("Test should complete within timeout");
     }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn test_actor_system_shutdown_handles_missing_actors_gracefully() {
-        let color_config = ColorConfig::new(crate::cli::ColorChoice::Never);
-        let system = ActorSystem::initialize(color_config)
-            .await
-            .expect("Initialization should succeed");
+        tokio::time::timeout(tokio::time::Duration::from_secs(10), async {
+            let color_config = ColorConfig::new(crate::cli::ColorChoice::Never);
 
-        // Manually remove an actor to simulate an edge case
-        system.actors.remove("crate_downloader");
+            // Create unique temp path for this test
+            let test_db_path = env::temp_dir().join("crately_test_runtime_shutdown_handles_missing_actors");
+            let _ = std::fs::remove_dir_all(&test_db_path);
 
-        // Shutdown should still succeed even with missing actor
-        system.shutdown().await.expect("Shutdown should succeed");
+            let system = ActorSystem::initialize_with_db_path(color_config, test_db_path.clone())
+                .await
+                .expect("Initialization should succeed");
+
+            // Manually remove an actor to simulate an edge case
+            system.actors.remove("crate_downloader");
+
+            // Shutdown should still succeed even with missing actor
+            system.shutdown().await.expect("Shutdown should succeed");
+
+            // Cleanup
+            let _ = std::fs::remove_dir_all(&test_db_path);
+        })
+        .await
+        .expect("Test should complete within timeout");
     }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn test_actor_system_initialize_server_actors_succeeds() {
-        let color_config = ColorConfig::new(crate::cli::ColorChoice::Never);
-        let mut system = ActorSystem::initialize(color_config)
-            .await
-            .expect("Initialization should succeed");
+        tokio::time::timeout(tokio::time::Duration::from_secs(10), async {
+            let color_config = ColorConfig::new(crate::cli::ColorChoice::Never);
 
-        // Server mode should initially be false
-        assert!(!system.server_mode, "Server mode should be false initially");
+            // Create unique temp path for this test
+            let test_db_path = env::temp_dir().join("crately_test_runtime_initialize_server_actors_succeeds");
+            let _ = std::fs::remove_dir_all(&test_db_path);
 
-        // Initialize server actors
-        system
-            .initialize_server_actors()
-            .await
-            .expect("Server actor initialization should succeed");
+            let mut system = ActorSystem::initialize_with_db_path(color_config, test_db_path.clone())
+                .await
+                .expect("Initialization should succeed");
 
-        // Server mode should now be true
-        assert!(
-            system.server_mode,
-            "Server mode should be true after initialization"
-        );
+            // Server mode should initially be false
+            assert!(!system.server_mode, "Server mode should be false initially");
 
-        // Both server actors should be registered
-        assert!(
-            system.get_actor("keyboard_handler").is_some(),
-            "KeyboardHandler should be registered"
-        );
-        assert!(
-            system.get_actor("server").is_some(),
-            "ServerActor should be registered"
-        );
+            // Initialize server actors
+            system
+                .initialize_server_actors()
+                .await
+                .expect("Server actor initialization should succeed");
 
-        system.shutdown().await.expect("Shutdown should succeed");
+            // Server mode should now be true
+            assert!(
+                system.server_mode,
+                "Server mode should be true after initialization"
+            );
+
+            // ServerActor should be registered
+            // Note: KeyboardHandler is skipped in test mode (requires TTY)
+            assert!(
+                system.get_actor("server").is_some(),
+                "ServerActor should be registered"
+            );
+
+            system.shutdown().await.expect("Shutdown should succeed");
+
+            // Cleanup
+            let _ = std::fs::remove_dir_all(&test_db_path);
+        })
+        .await
+        .expect("Test should complete within timeout");
     }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn test_actor_system_initialize_server_actors_is_idempotent() {
-        let color_config = ColorConfig::new(crate::cli::ColorChoice::Never);
-        let mut system = ActorSystem::initialize(color_config)
-            .await
-            .expect("Initialization should succeed");
+        tokio::time::timeout(tokio::time::Duration::from_secs(10), async {
+            let color_config = ColorConfig::new(crate::cli::ColorChoice::Never);
 
-        // Initialize server actors twice
-        system
-            .initialize_server_actors()
-            .await
-            .expect("First initialization should succeed");
+            // Create unique temp path for this test
+            let test_db_path = env::temp_dir().join("crately_test_runtime_initialize_server_actors_is_idempotent");
+            let _ = std::fs::remove_dir_all(&test_db_path);
 
-        system
-            .initialize_server_actors()
-            .await
-            .expect("Second initialization should succeed");
+            let mut system = ActorSystem::initialize_with_db_path(color_config, test_db_path.clone())
+                .await
+                .expect("Initialization should succeed");
 
-        // Should still only have one of each actor
-        let actors = system.actors();
-        assert_eq!(
-            actors.len(),
-            6,
-            "Should have exactly 6 actors (4 core + 2 server)"
-        );
+            // Initialize server actors twice
+            system
+                .initialize_server_actors()
+                .await
+                .expect("First initialization should succeed");
 
-        system.shutdown().await.expect("Shutdown should succeed");
+            system
+                .initialize_server_actors()
+                .await
+                .expect("Second initialization should succeed");
+
+            // Should still only have one of each actor
+            // Note: In test mode, KeyboardHandler is skipped (requires TTY)
+            let actors = system.actors();
+            assert_eq!(
+                actors.len(),
+                5,
+                "Should have exactly 5 actors (4 core + 1 server, keyboard_handler skipped in tests)"
+            );
+
+            system.shutdown().await.expect("Shutdown should succeed");
+
+            // Cleanup
+            let _ = std::fs::remove_dir_all(&test_db_path);
+        })
+        .await
+        .expect("Test should complete within timeout");
     }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn test_actor_system_shutdown_with_server_actors() {
-        let color_config = ColorConfig::new(crate::cli::ColorChoice::Never);
-        let mut system = ActorSystem::initialize(color_config)
-            .await
-            .expect("Initialization should succeed");
+        tokio::time::timeout(tokio::time::Duration::from_secs(10), async {
+            let color_config = ColorConfig::new(crate::cli::ColorChoice::Never);
 
-        // Initialize server actors
-        system
-            .initialize_server_actors()
-            .await
-            .expect("Server actor initialization should succeed");
+            // Create unique temp path for this test
+            let test_db_path = env::temp_dir().join("crately_test_runtime_shutdown_with_server_actors");
+            let _ = std::fs::remove_dir_all(&test_db_path);
 
-        // Start the server
-        let server = system.get_actor("server").expect("Server should exist");
-        server.send(StartServer).await;
+            let mut system = ActorSystem::initialize_with_db_path(color_config, test_db_path.clone())
+                .await
+                .expect("Initialization should succeed");
 
-        // Give server time to start
-        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+            // Initialize server actors
+            system
+                .initialize_server_actors()
+                .await
+                .expect("Server actor initialization should succeed");
 
-        // Shutdown should cleanly stop all actors including server actors
-        system.shutdown().await.expect("Shutdown should succeed");
+            // Start the server
+            let server = system.get_actor("server").expect("Server should exist");
+            server.send(StartServer).await;
+
+            // Give server time to start
+            tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+            // Shutdown should cleanly stop all actors including server actors
+            system.shutdown().await.expect("Shutdown should succeed");
+
+            // Cleanup
+            let _ = std::fs::remove_dir_all(&test_db_path);
+        })
+        .await
+        .expect("Test should complete within timeout");
     }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn test_actor_system_shutdown_without_server_actors() {
-        let color_config = ColorConfig::new(crate::cli::ColorChoice::Never);
-        let system = ActorSystem::initialize(color_config)
-            .await
-            .expect("Initialization should succeed");
+        tokio::time::timeout(tokio::time::Duration::from_secs(10), async {
+            let color_config = ColorConfig::new(crate::cli::ColorChoice::Never);
 
-        // Shutdown should succeed without server actors initialized
-        system.shutdown().await.expect("Shutdown should succeed");
+            // Create unique temp path for this test
+            let test_db_path = env::temp_dir().join("crately_test_runtime_shutdown_without_server_actors");
+            let _ = std::fs::remove_dir_all(&test_db_path);
+
+            let system = ActorSystem::initialize_with_db_path(color_config, test_db_path.clone())
+                .await
+                .expect("Initialization should succeed");
+
+            // Shutdown should succeed without server actors initialized
+            system.shutdown().await.expect("Shutdown should succeed");
+
+            // Cleanup
+            let _ = std::fs::remove_dir_all(&test_db_path);
+        })
+        .await
+        .expect("Test should complete within timeout");
     }
 }
