@@ -2,6 +2,7 @@
 
 mod actors;
 mod cli;
+mod colors;
 mod commands;
 mod crate_specifier;
 mod logging;
@@ -13,6 +14,7 @@ pub mod runtime;
 use clap::Parser;
 use cli::{Cli, Commands};
 
+use crate::colors::ColorConfig;
 use crate::runtime::ActorSystem;
 
 #[tokio::main]
@@ -38,8 +40,11 @@ async fn main() -> anyhow::Result<()> {
             // Initialize XDG-compliant file logging
             let (_guard, _log_dir) = logging::init().expect("Failed to initialize logging");
 
+            // Create color configuration based on CLI flag
+            let color_config = ColorConfig::new(cli.no_color);
+
             // Initialize the actor system
-            let actor_system = ActorSystem::initialize().await?;
+            let actor_system = ActorSystem::initialize(color_config).await?;
 
             // Run the serve command with the initialized actor system
             commands::serve::run(actor_system).await?;

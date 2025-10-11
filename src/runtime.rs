@@ -49,6 +49,7 @@ use crate::{
         keyboard_handler::KeyboardHandler,
         server_actor::ServerActor,
     },
+    colors::ColorConfig,
     messages::{Init, PrintProgress, PrintSuccess, StopKeyboardHandler, StopServer},
 };
 
@@ -94,6 +95,10 @@ impl ActorSystem {
     /// 4. Spawns the CrateDownloader actor
     /// 5. Stores all actor handles in the registry
     ///
+    /// # Arguments
+    ///
+    /// * `color_config` - Color configuration for console output
+    ///
     /// # Returns
     ///
     /// Returns the initialized `ActorSystem` ready for use by commands.
@@ -109,19 +114,21 @@ impl ActorSystem {
     ///
     /// ```no_run
     /// use crately::runtime::ActorSystem;
+    /// use crately::colors::ColorConfig;
     ///
     /// # async fn example() -> anyhow::Result<()> {
-    /// let system = ActorSystem::initialize().await?;
+    /// let color_config = ColorConfig::new(false);
+    /// let system = ActorSystem::initialize(color_config).await?;
     /// # Ok(())
     /// # }
     /// ```
-    pub async fn initialize() -> Result<Self> {
+    pub async fn initialize(color_config: ColorConfig) -> Result<Self> {
         // Launch the acton-reactive runtime
         let mut runtime = ActonApp::launch();
         let actors = Arc::new(DashMap::new());
 
         // Spawn Console actor
-        let console = Console::spawn(&mut runtime)
+        let console = Console::spawn(&mut runtime, color_config)
             .await
             .context("Failed to spawn Console actor")?;
         console.send(Init).await;
@@ -544,7 +551,8 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn test_actor_system_initialize_succeeds() {
-        let result = ActorSystem::initialize().await;
+        let color_config = ColorConfig::new(true); // Disable colors for tests
+        let result = ActorSystem::initialize(color_config).await;
         assert!(result.is_ok(), "ActorSystem initialization should succeed");
 
         let system = result.unwrap();
@@ -553,7 +561,8 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn test_actor_system_registers_all_actors() {
-        let system = ActorSystem::initialize()
+        let color_config = ColorConfig::new(true);
+        let system = ActorSystem::initialize(color_config)
             .await
             .expect("Initialization should succeed");
 
@@ -575,7 +584,8 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn test_actor_system_get_actor_returns_none_for_unknown() {
-        let system = ActorSystem::initialize()
+        let color_config = ColorConfig::new(true);
+        let system = ActorSystem::initialize(color_config)
             .await
             .expect("Initialization should succeed");
 
@@ -589,7 +599,8 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn test_actor_system_get_actor_clones_handle() {
-        let system = ActorSystem::initialize()
+        let color_config = ColorConfig::new(true);
+        let system = ActorSystem::initialize(color_config)
             .await
             .expect("Initialization should succeed");
 
@@ -605,7 +616,8 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn test_actor_system_config_returns_loaded_config() {
-        let system = ActorSystem::initialize()
+        let color_config = ColorConfig::new(true);
+        let system = ActorSystem::initialize(color_config)
             .await
             .expect("Initialization should succeed");
 
@@ -618,7 +630,8 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn test_actor_system_actors_returns_dashmap() {
-        let system = ActorSystem::initialize()
+        let color_config = ColorConfig::new(true);
+        let system = ActorSystem::initialize(color_config)
             .await
             .expect("Initialization should succeed");
 
@@ -630,7 +643,8 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn test_actor_system_shutdown_cleans_up_actors() {
-        let system = ActorSystem::initialize()
+        let color_config = ColorConfig::new(true);
+        let system = ActorSystem::initialize(color_config)
             .await
             .expect("Initialization should succeed");
 
@@ -646,7 +660,8 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn test_actor_system_shutdown_handles_missing_actors_gracefully() {
-        let system = ActorSystem::initialize()
+        let color_config = ColorConfig::new(true);
+        let system = ActorSystem::initialize(color_config)
             .await
             .expect("Initialization should succeed");
 
@@ -659,7 +674,8 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn test_actor_system_initialize_server_actors_succeeds() {
-        let mut system = ActorSystem::initialize()
+        let color_config = ColorConfig::new(true);
+        let mut system = ActorSystem::initialize(color_config)
             .await
             .expect("Initialization should succeed");
 
@@ -693,7 +709,8 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn test_actor_system_initialize_server_actors_is_idempotent() {
-        let mut system = ActorSystem::initialize()
+        let color_config = ColorConfig::new(true);
+        let mut system = ActorSystem::initialize(color_config)
             .await
             .expect("Initialization should succeed");
 
@@ -721,7 +738,8 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn test_actor_system_shutdown_with_server_actors() {
-        let mut system = ActorSystem::initialize()
+        let color_config = ColorConfig::new(true);
+        let mut system = ActorSystem::initialize(color_config)
             .await
             .expect("Initialization should succeed");
 
@@ -744,7 +762,8 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn test_actor_system_shutdown_without_server_actors() {
-        let system = ActorSystem::initialize()
+        let color_config = ColorConfig::new(true);
+        let system = ActorSystem::initialize(color_config)
             .await
             .expect("Initialization should succeed");
 

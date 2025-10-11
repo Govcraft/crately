@@ -12,6 +12,13 @@ use clap::{Parser, Subcommand};
 #[command(about = "Crate documentation processing and semantic search service", long_about = None)]
 #[command(propagate_version = true)]
 pub struct Cli {
+    /// Disable colored output
+    ///
+    /// When enabled, all terminal output will be displayed without colors.
+    /// This can also be controlled via the NO_COLOR environment variable.
+    #[arg(long, global = true)]
+    pub no_color: bool,
+
     /// The subcommand to execute
     #[command(subcommand)]
     pub command: Commands,
@@ -720,6 +727,30 @@ mod tests {
                 assert_eq!(args.parallel, Some(50), "parallel should be 50");
             }
             _ => panic!("Expected Warm command"),
+        }
+    }
+
+    #[test]
+    fn test_cli_no_color_flag_default() {
+        let cli = Cli::try_parse_from(["crately", "serve"]).expect("Failed to parse");
+        assert!(!cli.no_color, "no_color should default to false");
+    }
+
+    #[test]
+    fn test_cli_no_color_flag_enabled() {
+        let cli =
+            Cli::try_parse_from(["crately", "--no-color", "serve"]).expect("Failed to parse");
+        assert!(cli.no_color, "no_color should be true when flag is set");
+    }
+
+    #[test]
+    fn test_cli_no_color_flag_with_other_commands() {
+        let cli = Cli::try_parse_from(["crately", "--no-color", "doctor"])
+            .expect("Failed to parse");
+        assert!(cli.no_color, "no_color should work with any command");
+        match cli.command {
+            Commands::Doctor(_) => {}
+            _ => panic!("Expected Doctor command"),
         }
     }
 }

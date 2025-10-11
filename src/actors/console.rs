@@ -10,6 +10,7 @@
 use acton_reactive::prelude::*;
 
 use crate::actors::config::ConfigLoaded;
+use crate::colors::{format_error, format_progress, format_success, format_warning, ColorConfig};
 use crate::messages::{
     ConfigReloadFailed, Init, PrintError, PrintProgress, PrintSeparator, PrintSuccess,
     PrintWarning, ServerReloaded, ServerStarted, SetRawMode,
@@ -55,6 +56,8 @@ pub struct Console {
     /// When raw mode is active, console output must use `\r\n` for line endings
     /// instead of just `\n` to ensure proper cursor positioning.
     raw_mode_active: bool,
+    /// Color configuration for terminal output
+    color_config: ColorConfig,
 }
 
 impl Console {
@@ -70,6 +73,7 @@ impl Console {
     /// # Arguments
     ///
     /// * `runtime` - Mutable reference to the acton-reactive runtime
+    /// * `color_config` - Color configuration for terminal output
     ///
     /// # Returns
     ///
@@ -89,14 +93,16 @@ impl Console {
     /// ```no_run
     /// use acton_reactive::prelude::*;
     /// use crately::console::Console;
+    /// use crately::colors::ColorConfig;
     /// use crately::messages::Init;
     ///
     /// #[tokio::main]
     /// async fn main() -> anyhow::Result<()> {
     ///     let mut runtime = ActonApp::launch();
+    ///     let color_config = ColorConfig::new(false);
     ///
     ///     // Spawn the Console actor for visual output
-    ///     let console = Console::spawn(&mut runtime).await?;
+    ///     let console = Console::spawn(&mut runtime, color_config).await?;
     ///
     ///     // Trigger initialization sequence
     ///     console.send(Init).await;
@@ -105,7 +111,10 @@ impl Console {
     ///     Ok(())
     /// }
     /// ```
-    pub async fn spawn(runtime: &mut AgentRuntime) -> anyhow::Result<AgentHandle> {
+    pub async fn spawn(
+        runtime: &mut AgentRuntime,
+        color_config: ColorConfig,
+    ) -> anyhow::Result<AgentHandle> {
         let mut builder = runtime
             .new_agent_with_name::<Console>("console".to_string())
             .await;
@@ -113,6 +122,7 @@ impl Console {
         // Initialize with raw mode inactive by default
         builder.model = Console {
             raw_mode_active: false,
+            color_config,
         };
 
         builder
@@ -129,22 +139,38 @@ impl Console {
             })
             .act_on::<PrintSuccess>(|actor, envelope| {
                 let message = envelope.message();
-                print_success(&message.0, actor.model.raw_mode_active);
+                print_success(
+                    &message.0,
+                    actor.model.raw_mode_active,
+                    actor.model.color_config,
+                );
                 AgentReply::immediate()
             })
             .act_on::<PrintError>(|actor, envelope| {
                 let message = envelope.message();
-                print_error(&message.0, actor.model.raw_mode_active);
+                print_error(
+                    &message.0,
+                    actor.model.raw_mode_active,
+                    actor.model.color_config,
+                );
                 AgentReply::immediate()
             })
             .act_on::<PrintProgress>(|actor, envelope| {
                 let message = envelope.message();
-                print_progress(&message.0, actor.model.raw_mode_active);
+                print_progress(
+                    &message.0,
+                    actor.model.raw_mode_active,
+                    actor.model.color_config,
+                );
                 AgentReply::immediate()
             })
             .act_on::<PrintWarning>(|actor, envelope| {
                 let message = envelope.message();
-                print_warning(&message.0, actor.model.raw_mode_active);
+                print_warning(
+                    &message.0,
+                    actor.model.raw_mode_active,
+                    actor.model.color_config,
+                );
                 AgentReply::immediate()
             })
             .act_on::<PrintSeparator>(|actor, _envelope| {
@@ -160,28 +186,34 @@ impl Console {
                         message.config_path.display()
                     ),
                     agent.model.raw_mode_active,
+                    agent.model.color_config,
                 );
                 AgentReply::immediate()
             })
             .act_on::<ConfigReloadFailed>(|actor, envelope| {
                 let message = envelope.message();
                 let raw_mode = actor.model.raw_mode_active;
+                let color_config = actor.model.color_config;
                 print_error(
                     &format!("Configuration reload failed {} {}", PROGRESS, message.error),
                     raw_mode,
+                    color_config,
                 );
                 print_warning(
                     "Server continues with previous configuration",
                     raw_mode,
+                    color_config,
                 );
                 AgentReply::immediate()
             })
             .act_on::<ServerReloaded>(|actor, envelope| {
                 let message = envelope.message();
                 let raw_mode = actor.model.raw_mode_active;
+                let color_config = actor.model.color_config;
                 print_success(
                     &format!("Server reloaded {} http://127.0.0.1:{}", PROGRESS, message.port),
                     raw_mode,
+                    color_config,
                 );
                 AgentReply::immediate()
             })
@@ -277,8 +309,10 @@ pub fn print_banner(version: &str, raw_mode: bool) {
 ///
 /// * `message` - The success message to display
 /// * `raw_mode` - Whether terminal raw mode is active
-fn print_success(message: &str, raw_mode: bool) {
-    print_line(&format!("{} {}", SUCCESS, message), raw_mode);
+/// * `color_config` - Color configuration for output
+fn print_success(message: &str, raw_mode: bool, color_config: ColorConfig) {
+    let formatted = format_success(message, color_config);
+    print_line(&format!("{} {}", SUCCESS, formatted), raw_mode);
 }
 
 /// Prints an error message with the error symbol (✗).
@@ -290,8 +324,10 @@ fn print_success(message: &str, raw_mode: bool) {
 ///
 /// * `message` - The error message to display
 /// * `raw_mode` - Whether terminal raw mode is active
-fn print_error(message: &str, raw_mode: bool) {
-    print_line(&format!("{} {}", ERROR, message), raw_mode);
+/// * `color_config` - Color configuration for output
+fn print_error(message: &str, raw_mode: bool, color_config: ColorConfig) {
+    let formatted = format_error(message, color_config);
+    print_line(&format!("{} {}", ERROR, formatted), raw_mode);
 }
 
 /// Prints a progress message with the progress symbol (→).
@@ -303,8 +339,10 @@ fn print_error(message: &str, raw_mode: bool) {
 ///
 /// * `message` - The progress message to display
 /// * `raw_mode` - Whether terminal raw mode is active
-fn print_progress(message: &str, raw_mode: bool) {
-    print_line(&format!("{} {}", PROGRESS, message), raw_mode);
+/// * `color_config` - Color configuration for output
+fn print_progress(message: &str, raw_mode: bool, color_config: ColorConfig) {
+    let formatted = format_progress(message, color_config);
+    print_line(&format!("{} {}", PROGRESS, formatted), raw_mode);
 }
 
 /// Prints a warning message with the warning symbol (⚠).
@@ -316,8 +354,10 @@ fn print_progress(message: &str, raw_mode: bool) {
 ///
 /// * `message` - The warning message to display
 /// * `raw_mode` - Whether terminal raw mode is active
-fn print_warning(message: &str, raw_mode: bool) {
-    print_line(&format!("{} {}", WARNING, message), raw_mode);
+/// * `color_config` - Color configuration for output
+fn print_warning(message: &str, raw_mode: bool, color_config: ColorConfig) {
+    let formatted = format_warning(message, color_config);
+    print_line(&format!("{} {}", WARNING, formatted), raw_mode);
 }
 
 /// Prints a horizontal separator line.
@@ -418,42 +458,50 @@ mod tests {
 
     #[test]
     fn test_print_success_executes_without_panic() {
-        print_success("Test success message", false);
+        let color_config = ColorConfig::new(true); // Disable colors for tests
+        print_success("Test success message", false, color_config);
     }
 
     #[test]
     fn test_print_success_raw_mode_executes_without_panic() {
-        print_success("Test success message", true);
+        let color_config = ColorConfig::new(true);
+        print_success("Test success message", true, color_config);
     }
 
     #[test]
     fn test_print_error_executes_without_panic() {
-        print_error("Test error message", false);
+        let color_config = ColorConfig::new(true);
+        print_error("Test error message", false, color_config);
     }
 
     #[test]
     fn test_print_error_raw_mode_executes_without_panic() {
-        print_error("Test error message", true);
+        let color_config = ColorConfig::new(true);
+        print_error("Test error message", true, color_config);
     }
 
     #[test]
     fn test_print_progress_executes_without_panic() {
-        print_progress("Test progress message", false);
+        let color_config = ColorConfig::new(true);
+        print_progress("Test progress message", false, color_config);
     }
 
     #[test]
     fn test_print_progress_raw_mode_executes_without_panic() {
-        print_progress("Test progress message", true);
+        let color_config = ColorConfig::new(true);
+        print_progress("Test progress message", true, color_config);
     }
 
     #[test]
     fn test_print_warning_executes_without_panic() {
-        print_warning("Test warning message", false);
+        let color_config = ColorConfig::new(true);
+        print_warning("Test warning message", false, color_config);
     }
 
     #[test]
     fn test_print_warning_raw_mode_executes_without_panic() {
-        print_warning("Test warning message", true);
+        let color_config = ColorConfig::new(true);
+        print_warning("Test warning message", true, color_config);
     }
 
     #[test]
@@ -469,7 +517,8 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn test_console_actor_handles_print_success_message() {
         let mut runtime = ActonApp::launch();
-        let console = Console::spawn(&mut runtime).await.unwrap();
+        let color_config = ColorConfig::new(true); // Disable colors for tests
+        let console = Console::spawn(&mut runtime, color_config).await.unwrap();
 
         // Send message and verify it doesn't panic
         console.send(PrintSuccess("Test message".to_string())).await;
@@ -482,7 +531,8 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn test_console_actor_handles_print_error_message() {
         let mut runtime = ActonApp::launch();
-        let console = Console::spawn(&mut runtime).await.unwrap();
+        let color_config = ColorConfig::new(true);
+        let console = Console::spawn(&mut runtime, color_config).await.unwrap();
 
         console.send(PrintError("Test error".to_string())).await;
 
@@ -493,7 +543,8 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn test_console_actor_handles_print_progress_message() {
         let mut runtime = ActonApp::launch();
-        let console = Console::spawn(&mut runtime).await.unwrap();
+        let color_config = ColorConfig::new(true);
+        let console = Console::spawn(&mut runtime, color_config).await.unwrap();
 
         console.send(PrintProgress("Test progress".to_string())).await;
 
@@ -504,7 +555,8 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn test_console_actor_handles_print_warning_message() {
         let mut runtime = ActonApp::launch();
-        let console = Console::spawn(&mut runtime).await.unwrap();
+        let color_config = ColorConfig::new(true);
+        let console = Console::spawn(&mut runtime, color_config).await.unwrap();
 
         console.send(PrintWarning("Test warning".to_string())).await;
 
@@ -515,7 +567,8 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn test_console_actor_handles_print_separator_message() {
         let mut runtime = ActonApp::launch();
-        let console = Console::spawn(&mut runtime).await.unwrap();
+        let color_config = ColorConfig::new(true);
+        let console = Console::spawn(&mut runtime, color_config).await.unwrap();
 
         console.send(PrintSeparator).await;
 
@@ -526,7 +579,8 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn test_console_actor_handles_set_raw_mode_true() {
         let mut runtime = ActonApp::launch();
-        let console = Console::spawn(&mut runtime).await.unwrap();
+        let color_config = ColorConfig::new(true);
+        let console = Console::spawn(&mut runtime, color_config).await.unwrap();
 
         // Send SetRawMode(true) message
         console.send(SetRawMode(true)).await;
@@ -544,7 +598,8 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn test_console_actor_handles_set_raw_mode_false() {
         let mut runtime = ActonApp::launch();
-        let console = Console::spawn(&mut runtime).await.unwrap();
+        let color_config = ColorConfig::new(true);
+        let console = Console::spawn(&mut runtime, color_config).await.unwrap();
 
         // Send SetRawMode(false) message
         console.send(SetRawMode(false)).await;
@@ -562,7 +617,8 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn test_console_actor_handles_mode_transition() {
         let mut runtime = ActonApp::launch();
-        let console = Console::spawn(&mut runtime).await.unwrap();
+        let color_config = ColorConfig::new(true);
+        let console = Console::spawn(&mut runtime, color_config).await.unwrap();
 
         // Start in normal mode
         console.send(PrintSuccess("Normal mode 1".to_string())).await;
