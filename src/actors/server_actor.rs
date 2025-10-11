@@ -21,8 +21,8 @@ use tracing::{debug, error, info, warn};
 use crate::{
     actors::config::{Config, ConfigResponse, ReloadConfig},
     messages::{
-        KeyPressed, PrintError, PrintProgress, PrintSuccess, ServerReloaded, ServerStarted,
-        StartServer, StopServer,
+        KeyPressed, PersistCrate, PrintError, PrintProgress, PrintSuccess, ServerReloaded,
+        ServerStarted, StartServer, StopServer,
     },
     request::CrateRequest,
     response::CrateResponse,
@@ -54,19 +54,25 @@ async fn handle_crate_request(
         specifier.version()
     );
 
-    // TODO: Send download request to CrateDownloader actor
-    // Access the crate downloader actor from the registry
-    if let Some(_crate_downloader) = state.actors.get("crate_downloader") {
-        // Future: send DownloadCrate message to the actor
+    // Send persistence request to DatabaseActor
+    if let Some(database) = state.actors.get("database") {
+        database
+            .send(PersistCrate {
+                specifier: payload.specifier.clone(),
+                features: payload.features.clone(),
+            })
+            .await;
+    } else {
+        warn!("DatabaseActor not found in registry, skipping persistence");
     }
 
-    // For now, just echo back with a success message
+    // Return success response
     let response = CrateResponse {
         name: specifier.name().to_string(),
         version: specifier.version().to_string(),
         features: payload.features.clone(),
         message: format!(
-            "Successfully processed crate {} with {} feature(s)",
+            "Successfully received crate {} with {} feature(s)",
             specifier,
             payload.features.len()
         ),

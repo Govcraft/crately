@@ -12,8 +12,8 @@ use acton_reactive::prelude::*;
 use crate::actors::config::ConfigLoaded;
 use crate::colors::{format_error, format_progress, format_success, format_warning, ColorConfig};
 use crate::messages::{
-    ConfigReloadFailed, Init, PrintError, PrintProgress, PrintSeparator, PrintSuccess,
-    PrintWarning, ServerReloaded, ServerStarted, SetRawMode,
+    ConfigReloadFailed, CratePersisted, DatabaseError, Init, PrintError, PrintProgress,
+    PrintSeparator, PrintSuccess, PrintWarning, ServerReloaded, ServerStarted, SetRawMode,
 };
 use tracing::info;
 
@@ -230,6 +230,27 @@ impl Console {
                 print_line("Press 'r' to reload configuration", raw_mode);
                 print_newline(raw_mode);
                 AgentReply::immediate()
+            })
+            .act_on::<CratePersisted>(|actor, envelope| {
+                let msg = envelope.message();
+                print_success(
+                    &format!(
+                        "Persisted crate: {}@{} (record: {})",
+                        msg.name, msg.version, msg.record_id
+                    ),
+                    actor.model.raw_mode_active,
+                    actor.model.color_config,
+                );
+                AgentReply::immediate()
+            })
+            .act_on::<DatabaseError>(|actor, envelope| {
+                let msg = envelope.message();
+                print_error(
+                    &format!("Database error during {}: {}", msg.operation, msg.error),
+                    actor.model.raw_mode_active,
+                    actor.model.color_config,
+                );
+                AgentReply::immediate()
             });
 
         // Subscribe to broadcast messages before starting
@@ -237,6 +258,8 @@ impl Console {
         builder.handle().subscribe::<ConfigReloadFailed>().await;
         builder.handle().subscribe::<ServerReloaded>().await;
         builder.handle().subscribe::<ServerStarted>().await;
+        builder.handle().subscribe::<CratePersisted>().await;
+        builder.handle().subscribe::<DatabaseError>().await;
 
         Ok(builder.start().await)
     }
