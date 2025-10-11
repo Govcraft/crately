@@ -23,8 +23,11 @@ pub const SUCCESS: &str = "✓";
 /// Error symbol (✗)
 pub const ERROR: &str = "✗";
 
-/// Progress symbol (→)
-pub const PROGRESS: &str = "→";
+/// Progress symbol (⋯) - indicates ongoing operations
+pub const PROGRESS: &str = "⋯";
+
+/// Location symbol (→) - shows relationships, context, and location
+pub const LOCATION: &str = "→";
 
 /// Warning symbol (⚠)
 pub const WARNING: &str = "⚠";
@@ -182,7 +185,7 @@ impl Console {
                 print_success(
                     &format!(
                         "Configuration loaded {} {}",
-                        PROGRESS,
+                        LOCATION,
                         message.config_path.display()
                     ),
                     agent.model.raw_mode_active,
@@ -195,7 +198,7 @@ impl Console {
                 let raw_mode = actor.model.raw_mode_active;
                 let color_config = actor.model.color_config;
                 print_error(
-                    &format!("Configuration reload failed {} {}", PROGRESS, message.error),
+                    &format!("Configuration reload failed {} {}", LOCATION, message.error),
                     raw_mode,
                     color_config,
                 );
@@ -211,7 +214,7 @@ impl Console {
                 let raw_mode = actor.model.raw_mode_active;
                 let color_config = actor.model.color_config;
                 print_success(
-                    &format!("Server reloaded {} http://127.0.0.1:{}", PROGRESS, message.port),
+                    &format!("Server reloaded {} http://127.0.0.1:{}", LOCATION, message.port),
                     raw_mode,
                     color_config,
                 );
@@ -330,7 +333,7 @@ fn print_error(message: &str, raw_mode: bool, color_config: ColorConfig) {
     print_line(&format!("{} {}", ERROR, formatted), raw_mode);
 }
 
-/// Prints a progress message with the progress symbol (→).
+/// Prints a progress message with the progress symbol (⋯).
 ///
 /// This is a private helper function used by the Console actor's message handlers.
 /// External code should send `PrintProgress` messages to the Console actor instead.
@@ -380,7 +383,8 @@ mod tests {
     fn test_constants_are_defined() {
         assert_eq!(SUCCESS, "✓");
         assert_eq!(ERROR, "✗");
-        assert_eq!(PROGRESS, "→");
+        assert_eq!(PROGRESS, "⋯");
+        assert_eq!(LOCATION, "→");
         assert_eq!(WARNING, "⚠");
     }
 

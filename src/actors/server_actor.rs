@@ -242,7 +242,8 @@ impl ServerActor {
 
                 if let Some(console) = console.as_ref() {
                     console
-                        .send(PrintSuccess(format!("Server listening → http://{}", addr)))
+                        .send(PrintSuccess(format!("Server listening {} http://{}",
+                            crate::actors::console::LOCATION, addr)))
                         .await;
                 }
 

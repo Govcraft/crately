@@ -137,7 +137,8 @@ impl ActorSystem {
         let log_dir = crate::logging::get_log_dir().context("Failed to determine log directory")?;
         console
             .send(PrintSuccess(format!(
-                "Logging initialized → {}",
+                "Logging initialized {} {}",
+                crate::actors::console::LOCATION,
                 log_dir.display()
             )))
             .await;

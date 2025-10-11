@@ -2,7 +2,7 @@
 
 use acton_reactive::prelude::*;
 
-/// Message to print a progress message with the progress symbol (→).
+/// Message to print a progress message with the progress symbol (⋯).
 ///
 /// This message instructs the Console actor to display a progress message to the user
 /// with appropriate formatting and the progress symbol. The Console actor handles
@@ -14,7 +14,7 @@ use acton_reactive::prelude::*;
 ///
 /// - **Be Informative**: Describe what operation is in progress
 /// - **Be Timely**: Provide updates at meaningful stages of operations
-/// - **Be Consistent**: Use the progress symbol (→) for visual distinction
+/// - **Be Consistent**: Use the progress symbol (⋯) for visual distinction
 /// - **Be Non-Blocking**: All output goes through the Console actor for proper formatting
 ///
 /// # Usage
