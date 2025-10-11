@@ -88,12 +88,15 @@
 //! ```
 
 mod config_reload_failed;
+mod crate_list_response;
 mod crate_persisted;
+mod crate_query_response;
 mod database_error;
 mod database_ready;
 mod init;
 mod key_pressed;
 mod keyboard_handler_started;
+mod list_crates;
 mod persist_crate;
 mod print_error;
 mod print_progress;
@@ -109,12 +112,15 @@ mod stop_keyboard_handler;
 mod stop_server;
 
 pub use config_reload_failed::ConfigReloadFailed;
+pub use crate_list_response::{CrateListResponse, CrateSummary};
 pub use crate_persisted::CratePersisted;
+pub use crate_query_response::CrateQueryResponse;
 pub use database_error::DatabaseError;
 pub use database_ready::DatabaseReady;
 pub use init::Init;
 pub use key_pressed::KeyPressed;
 pub(crate) use keyboard_handler_started::KeyboardHandlerStarted;
+pub use list_crates::ListCrates;
 pub use persist_crate::PersistCrate;
 pub use print_error::PrintError;
 pub use print_progress::PrintProgress;

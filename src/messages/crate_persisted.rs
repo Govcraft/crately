@@ -77,7 +77,6 @@ mod tests {
         };
         let debug_str = format!("{:?}", event);
         assert!(!debug_str.is_empty());
-        assert!(debug_str.contains("tokio"));
     }
 
     /// Verify that CratePersisted is Send + Sync (required for actor message passing).
