@@ -12,6 +12,10 @@ keywords = ["documentation", "search", "crates", "vectorization", "semantic-sear
 categories = ["development-tools", "web-programming::http-server"]
 rust-version = "1.85"
 
+[lib]
+name = "crately"
+path = "src/lib.rs"
+
 [dependencies]
 acton-reactive = "5.0.0"
 axum = { version = "0.8.6", features = ["tokio", "tracing", "tower-log", "macros", "json", "http2"] }
