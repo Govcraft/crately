@@ -12,8 +12,9 @@ use acton_reactive::prelude::*;
 use crate::actors::config::ConfigLoaded;
 use crate::colors::{format_error, format_progress, format_success, format_warning, ColorConfig};
 use crate::messages::{
-    ConfigReloadFailed, CratePersisted, DatabaseError, Init, PrintError, PrintProgress,
-    PrintSeparator, PrintSuccess, PrintWarning, ServerReloaded, ServerStarted, SetRawMode,
+    ConfigReloadFailed, CrateListResponse, CratePersisted, CrateQueryResponse, DatabaseError,
+    Init, PrintError, PrintProgress, PrintSeparator, PrintSuccess, PrintWarning, ServerReloaded,
+    ServerStarted, SetRawMode,
 };
 use tracing::info;
 
@@ -251,6 +252,85 @@ impl Console {
                     actor.model.color_config,
                 );
                 AgentReply::immediate()
+            })
+            .act_on::<CrateQueryResponse>(|actor, envelope| {
+                let msg = envelope.message();
+                let raw_mode = actor.model.raw_mode_active;
+                let color_config = actor.model.color_config;
+
+                if let Some(specifier) = &msg.specifier {
+                    // Crate found - display success with details
+                    print_success(
+                        &format!(
+                            "Found crate: {}@{}",
+                            specifier.name(),
+                            specifier.version()
+                        ),
+                        raw_mode,
+                        color_config,
+                    );
+
+                    // Display additional details
+                    print_line(
+                        &format!("  {} Status: {}", LOCATION, msg.status),
+                        raw_mode,
+                    );
+
+                    if !msg.features.is_empty() {
+                        print_line(
+                            &format!("  {} Features: {}", LOCATION, msg.features.join(", ")),
+                            raw_mode,
+                        );
+                    }
+
+                    if !msg.created_at.is_empty() {
+                        print_line(
+                            &format!("  {} Created: {}", LOCATION, msg.created_at),
+                            raw_mode,
+                        );
+                    }
+                } else {
+                    // Crate not found
+                    print_warning("Crate not found in database", raw_mode, color_config);
+                }
+
+                AgentReply::immediate()
+            })
+            .act_on::<CrateListResponse>(|actor, envelope| {
+                let msg = envelope.message();
+                let raw_mode = actor.model.raw_mode_active;
+                let color_config = actor.model.color_config;
+
+                if msg.crates.is_empty() {
+                    print_warning("No crates found in database", raw_mode, color_config);
+                } else {
+                    print_success(
+                        &format!(
+                            "Found {} crate{} (total: {})",
+                            msg.crates.len(),
+                            if msg.crates.len() == 1 { "" } else { "s" },
+                            msg.total_count
+                        ),
+                        raw_mode,
+                        color_config,
+                    );
+
+                    // Display each crate summary
+                    for crate_summary in &msg.crates {
+                        print_line(
+                            &format!(
+                                "  {} {}@{} [{}]",
+                                LOCATION,
+                                crate_summary.name,
+                                crate_summary.version,
+                                crate_summary.status
+                            ),
+                            raw_mode,
+                        );
+                    }
+                }
+
+                AgentReply::immediate()
             });
 
         // Subscribe to broadcast messages before starting
@@ -260,6 +340,8 @@ impl Console {
         builder.handle().subscribe::<ServerStarted>().await;
         builder.handle().subscribe::<CratePersisted>().await;
         builder.handle().subscribe::<DatabaseError>().await;
+        builder.handle().subscribe::<CrateQueryResponse>().await;
+        builder.handle().subscribe::<CrateListResponse>().await;
 
         Ok(builder.start().await)
     }
