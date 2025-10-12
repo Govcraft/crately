@@ -51,11 +51,13 @@ use crate::{
         downloader_actor::DownloaderActor,
         file_reader_actor::FileReaderActor,
         processor_actor::ProcessorActor,
+        retry_coordinator::RetryCoordinator,
         server_actor::ServerActor,
         vectorizer_actor::VectorizerActor,
     },
     colors::ColorConfig,
     messages::{Init, PrintProgress, PrintSuccess, StopKeyboardHandler, StopServer},
+    retry_policy::RetryPolicy,
 };
 
 // KeyboardHandler is only used in non-test builds (requires TTY)
@@ -81,6 +83,7 @@ use crate::actors::keyboard_handler::KeyboardHandler;
 /// - `"console"` - Console output formatting actor
 /// - `"config_manager"` - Configuration management actor
 /// - `"database"` - Database persistence actor
+/// - `"retry_coordinator"` - Retry coordination actor for pipeline error recovery
 /// - `"coordinator"` - Crate processing pipeline coordinator actor
 /// - `"downloader"` - Stateless crate download worker actor
 /// - `"file_reader"` - Stateless documentation extraction worker actor
@@ -107,12 +110,13 @@ impl ActorSystem {
     /// 2. Spawns the Console actor and triggers initialization
     /// 3. Spawns the ConfigManager actor and loads configuration
     /// 4. Spawns the DatabaseActor for persistence operations
-    /// 5. Spawns the CrateCoordinatorActor for pipeline coordination
-    /// 6. Spawns the DownloaderActor for crate downloads
-    /// 7. Spawns the FileReaderActor for documentation extraction
-    /// 8. Spawns the ProcessorActor for documentation chunking
-    /// 9. Spawns the VectorizerActor for embedding generation
-    /// 10. Stores all actor handles in the registry
+    /// 5. Spawns the RetryCoordinator for automatic retry management
+    /// 6. Spawns the CrateCoordinatorActor for pipeline coordination
+    /// 7. Spawns the DownloaderActor for crate downloads
+    /// 8. Spawns the FileReaderActor for documentation extraction
+    /// 9. Spawns the ProcessorActor for documentation chunking
+    /// 10. Spawns the VectorizerActor for embedding generation
+    /// 11. Stores all actor handles in the registry
     ///
     /// # Arguments
     ///
@@ -187,6 +191,21 @@ impl ActorSystem {
                 "Database initialized {} {}",
                 crate::actors::console::LOCATION,
                 db_info.db_path.display()
+            )))
+            .await;
+
+        // Spawn RetryCoordinator with retry policy configuration
+        let retry_policy = RetryPolicy::default();
+        let retry_coordinator = RetryCoordinator::spawn(&mut runtime, retry_policy)
+            .await
+            .context("Failed to spawn RetryCoordinator")?;
+
+        actors.insert("retry_coordinator".to_string(), retry_coordinator.clone());
+
+        console
+            .send(PrintSuccess(format!(
+                "Retry coordinator initialized {}",
+                crate::actors::console::SUCCESS
             )))
             .await;
 
@@ -570,16 +589,17 @@ impl ActorSystem {
     /// 5. Stops FileReaderActor - finish any pending work
     /// 6. Stops DownloaderActor - finish any pending work
     /// 7. Stops CrateCoordinatorActor - finish coordination work
-    /// 8. Stops DatabaseActor - close database connections
-    /// 9. Stops ConfigManager actor - finish any pending work
-    /// 10. Stops Console actor - last so logging works throughout
-    /// 11. Clears actor registry
-    /// 12. Shuts down the acton-reactive runtime
+    /// 8. Stops RetryCoordinator - finish any pending retry scheduling
+    /// 9. Stops DatabaseActor - close database connections
+    /// 10. Stops ConfigManager actor - finish any pending work
+    /// 11. Stops Console actor - last so logging works throughout
+    /// 12. Clears actor registry
+    /// 13. Shuts down the acton-reactive runtime
     ///
     /// The shutdown order ensures that the server stops first, followed by
-    /// workers, then coordinator, then supporting actors, with logging
-    /// remaining available until all other actors have completed their
-    /// shutdown procedures.
+    /// workers, then coordinators (including retry), then supporting actors,
+    /// with logging remaining available until all other actors have completed
+    /// their shutdown procedures.
     ///
     /// # Errors
     ///
@@ -677,6 +697,16 @@ impl ActorSystem {
                 Ok(()) => {}
                 Err(e) => {
                     error!("Failed to stop CrateCoordinatorActor: {:?}", e);
+                }
+            }
+        }
+
+        // Stop RetryCoordinator
+        if let Some(retry_coordinator) = self.get_actor("retry_coordinator") {
+            match retry_coordinator.stop().await {
+                Ok(()) => {}
+                Err(e) => {
+                    error!("Failed to stop RetryCoordinator: {:?}", e);
                 }
             }
         }
@@ -796,6 +826,21 @@ impl ActorSystem {
                 "Database initialized {} {}",
                 crate::actors::console::LOCATION,
                 db_info.db_path.display()
+            )))
+            .await;
+
+        // Spawn RetryCoordinator with retry policy configuration
+        let retry_policy = RetryPolicy::default();
+        let retry_coordinator = RetryCoordinator::spawn(&mut runtime, retry_policy)
+            .await
+            .context("Failed to spawn RetryCoordinator")?;
+
+        actors.insert("retry_coordinator".to_string(), retry_coordinator.clone());
+
+        console
+            .send(PrintSuccess(format!(
+                "Retry coordinator initialized {}",
+                crate::actors::console::SUCCESS
             )))
             .await;
 
@@ -1072,7 +1117,7 @@ mod tests {
                 .expect("Initialization should succeed");
 
             let actors = system.actors();
-            assert_eq!(actors.len(), 8, "Should have exactly 8 actors registered");
+            assert_eq!(actors.len(), 9, "Should have exactly 9 actors registered (8 core + retry_coordinator)");
 
             system.shutdown().await.expect("Shutdown should succeed");
 
@@ -1097,7 +1142,7 @@ mod tests {
                 .expect("Initialization should succeed");
 
             let actors_before = system.actors();
-            assert_eq!(actors_before.len(), 8, "Should start with 8 actors");
+            assert_eq!(actors_before.len(), 9, "Should start with 9 actors (8 core + retry_coordinator)");
 
             // Shutdown should succeed and clean up
             system.shutdown().await.expect("Shutdown should succeed");
@@ -1211,8 +1256,8 @@ mod tests {
             let actors = system.actors();
             assert_eq!(
                 actors.len(),
-                9,
-                "Should have exactly 9 actors (8 core + 1 server, keyboard_handler skipped in tests)"
+                10,
+                "Should have exactly 10 actors (9 core including retry_coordinator + 1 server, keyboard_handler skipped in tests)"
             );
 
             system.shutdown().await.expect("Shutdown should succeed");
