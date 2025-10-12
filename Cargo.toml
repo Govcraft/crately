@@ -16,6 +16,9 @@ rust-version = "1.85"
 name = "crately"
 path = "src/lib.rs"
 
+[features]
+rocksdb = ["surrealdb/kv-rocksdb"]
+
 [dependencies]
 acton-reactive = "5.0.0"
 axum = { version = "0.8.6", features = ["tokio", "tracing", "tower-log", "macros", "json", "http2"] }
@@ -29,7 +32,7 @@ mti = { version = "1.0.0", features = ["serde", "instrument"] }
 semver = { version = "1.0", features = ["serde"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-surrealdb = { version = "2.3.10", features = ["rustls", "protocol-ws", "kv-rocksdb"] }
+surrealdb = { version = "2.3.10", features = ["rustls", "protocol-ws", "kv-mem"], default-features = false }
 toml = "0.8"
 tokio = { version = "1.41", features = ["full"] }
 tower = { version = "0.5.2", features = ["full"] }

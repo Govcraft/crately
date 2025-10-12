@@ -6,8 +6,13 @@
 use acton_reactive::prelude::*;
 use anyhow::Context;
 use std::path::PathBuf;
-use surrealdb::engine::local::{Db, RocksDb};
 use surrealdb::Surreal;
+use surrealdb::engine::local::Db;
+#[cfg(not(feature = "rocksdb"))]
+use surrealdb::engine::local::Mem;
+#[cfg(feature = "rocksdb")]
+use surrealdb::engine::local::RocksDb;
+
 use tracing::*;
 
 use std::str::FromStr;
@@ -142,9 +147,25 @@ impl DatabaseActor {
         runtime: &mut AgentRuntime,
         db_path: PathBuf,
     ) -> anyhow::Result<(AgentHandle, DatabaseInfo)> {
-        // Connect to embedded RocksDB
-        info!("Connecting to database: {}", db_path.display());
+        // Connect to database (in-memory for tests, RocksDB for production)
+        #[cfg(not(feature = "rocksdb"))]
+        {
+            info!(
+                "Connecting to in-memory database for test: {}",
+                db_path.display()
+            );
+        }
+        #[cfg(feature = "rocksdb")]
+        {
+            info!("Connecting to RocksDB database: {}", db_path.display());
+        }
 
+        #[cfg(not(feature = "rocksdb"))]
+        let db = Surreal::new::<Mem>(())
+            .await
+            .context("Failed to create in-memory database for testing")?;
+
+        #[cfg(feature = "rocksdb")]
         let db = Surreal::new::<RocksDb>(db_path.clone())
             .await
             .with_context(|| {
@@ -182,9 +203,8 @@ impl DatabaseActor {
         );
 
         // Create agent configuration
-        let agent_config =
-            AgentConfig::new(Ern::with_root("database").unwrap(), None, None)
-                .context("Failed to create DatabaseActor agent configuration")?;
+        let agent_config = AgentConfig::new(Ern::with_root("database").unwrap(), None, None)
+            .context("Failed to create DatabaseActor agent configuration")?;
 
         // Create the DatabaseActor model with the established connection
         let database_actor = DatabaseActor { db };
@@ -424,20 +444,20 @@ impl DatabaseActor {
                                 debug!("Retrieved {} crates from database", crates.len());
 
                                 // Get total count for pagination metadata
-                                let count_result = db
-                                    .query("SELECT count() FROM crate GROUP ALL")
-                                    .await;
+                                let count_result =
+                                    db.query("SELECT count() FROM crate GROUP ALL").await;
 
                                 match count_result {
                                     Ok(mut count_response) => {
                                         // Extract count from response
-                                        let count_value: Result<Option<serde_json::Value>, _> = count_response.take(0);
+                                        let count_value: Result<Option<serde_json::Value>, _> =
+                                            count_response.take(0);
                                         let total_count = match count_value {
-                                            Ok(Some(val)) => {
-                                                val.get("count")
-                                                    .and_then(|v| v.as_u64())
-                                                    .unwrap_or(0) as u32
-                                            }
+                                            Ok(Some(val)) => val
+                                                .get("count")
+                                                .and_then(|v| v.as_u64())
+                                                .unwrap_or(0)
+                                                as u32,
                                             Ok(None) => 0,
                                             Err(e) => {
                                                 error!("Failed to parse count result: {}", e);
@@ -495,10 +515,19 @@ impl DatabaseActor {
         builder.handle().subscribe::<CrateDownloaded>().await;
         builder.handle().subscribe::<CrateDownloadFailed>().await;
         builder.handle().subscribe::<DocumentationExtracted>().await;
-        builder.handle().subscribe::<DocumentationExtractionFailed>().await;
+        builder
+            .handle()
+            .subscribe::<DocumentationExtractionFailed>()
+            .await;
         builder.handle().subscribe::<DocumentationChunked>().await;
-        builder.handle().subscribe::<DocumentationVectorized>().await;
-        builder.handle().subscribe::<CrateProcessingComplete>().await;
+        builder
+            .handle()
+            .subscribe::<DocumentationVectorized>()
+            .await;
+        builder
+            .handle()
+            .subscribe::<CrateProcessingComplete>()
+            .await;
         builder.handle().subscribe::<CrateProcessingFailed>().await;
 
         // Handle CrateReceived - create initial crate record with pending status
@@ -582,10 +611,7 @@ impl DatabaseActor {
                     .await
                 {
                     Ok(_) => {
-                        debug!(
-                            "Updated crate status to downloaded: {}@{}",
-                            name, version
-                        );
+                        debug!("Updated crate status to downloaded: {}@{}", name, version);
                     }
                     Err(e) => {
                         error!("Failed to update crate download status: {}", e);
@@ -630,7 +656,10 @@ impl DatabaseActor {
                     .query(update_query)
                     .bind(("name", name.clone()))
                     .bind(("version", version.clone()))
-                    .bind(("error_message", format!("{}: {}", error_kind, error_message)))
+                    .bind((
+                        "error_message",
+                        format!("{}: {}", error_kind, error_message),
+                    ))
                     .await
                 {
                     Ok(_) => {
@@ -1212,10 +1241,7 @@ impl DatabaseActor {
                         error!("Failed to record crate processing failure: {}", e);
                         broker
                             .broadcast(DatabaseError {
-                                operation: format!(
-                                    "record failure for {}@{}",
-                                    name, version
-                                ),
+                                operation: format!("record failure for {}@{}", name, version),
                                 error: e.to_string(),
                             })
                             .await;
@@ -1278,7 +1304,10 @@ impl DatabaseActor {
                                         .bind(("content_type", msg.metadata.content_type.clone()))
                                         .bind(("token_count", msg.metadata.token_count as i64))
                                         .bind(("char_count", msg.metadata.char_count as i64))
-                                        .bind(("start_line", msg.metadata.start_line.map(|n| n as i64)))
+                                        .bind((
+                                            "start_line",
+                                            msg.metadata.start_line.map(|n| n as i64),
+                                        ))
                                         .bind(("end_line", msg.metadata.end_line.map(|n| n as i64)))
                                         .bind(("parent_module", msg.metadata.parent_module.clone()))
                                         .bind(("item_type", msg.metadata.item_type.clone()))
@@ -1286,13 +1315,19 @@ impl DatabaseActor {
                                         .await
                                     {
                                         Ok(_) => {
-                                            debug!("Persisted doc chunk {} for {}@{}", msg.chunk_id, name, version);
+                                            debug!(
+                                                "Persisted doc chunk {} for {}@{}",
+                                                msg.chunk_id, name, version
+                                            );
                                         }
                                         Err(e) => {
                                             error!("Failed to persist doc chunk: {}", e);
                                             broker
                                                 .broadcast(DatabaseError {
-                                                    operation: format!("persist doc chunk {}", msg.chunk_id),
+                                                    operation: format!(
+                                                        "persist doc chunk {}",
+                                                        msg.chunk_id
+                                                    ),
                                                     error: e.to_string(),
                                                 })
                                                 .await;
@@ -1303,10 +1338,7 @@ impl DatabaseActor {
                                 }
                             }
                             Ok(None) => {
-                                error!(
-                                    "Crate not found for chunk: {}@{}",
-                                    name, version
-                                );
+                                error!("Crate not found for chunk: {}@{}", name, version);
                                 broker
                                     .broadcast(DatabaseError {
                                         operation: format!("persist doc chunk {}", msg.chunk_id),
@@ -1690,10 +1722,7 @@ impl DatabaseActor {
                                         Ok(_) => {
                                             debug!(
                                                 "Persisted code sample {} for {}@{} (type: {})",
-                                                msg.sample_index,
-                                                name,
-                                                version,
-                                                msg.sample_type
+                                                msg.sample_index, name, version, msg.sample_type
                                             );
                                         }
                                         Err(e) => {
@@ -1702,9 +1731,7 @@ impl DatabaseActor {
                                                 .broadcast(DatabaseError {
                                                     operation: format!(
                                                         "persist code sample {} for {}@{}",
-                                                        msg.sample_index,
-                                                        name,
-                                                        version
+                                                        msg.sample_index, name, version
                                                     ),
                                                     error: e.to_string(),
                                                 })
@@ -1716,10 +1743,7 @@ impl DatabaseActor {
                                 }
                             }
                             Ok(None) => {
-                                error!(
-                                    "Crate not found for code sample: {}@{}",
-                                    name, version
-                                );
+                                error!("Crate not found for code sample: {}@{}", name, version);
                                 broker
                                     .broadcast(DatabaseError {
                                         operation: format!(
@@ -1751,10 +1775,7 @@ impl DatabaseActor {
                         error!("Failed to lookup crate for code sample persistence: {}", e);
                         broker
                             .broadcast(DatabaseError {
-                                operation: format!(
-                                    "persist code sample for {}@{}",
-                                    name, version
-                                ),
+                                operation: format!("persist code sample for {}@{}", name, version),
                                 error: e.to_string(),
                             })
                             .await;
@@ -1910,15 +1931,15 @@ impl DatabaseActor {
             })
         });
 
-        // Add after_start hook to create schema and broadcast ready event
-        builder.after_start(|agent| {
+        // Add before_start hook to initialize schema synchronously
+        // This blocks start() from completing until schema initialization finishes
+        builder.before_start(|agent| {
             let db = agent.model.db.clone();
             let broker = agent.broker().clone();
 
             AgentReply::from_async(async move {
                 info!("Initializing database schema...");
 
-                // Execute schema definition
                 let schema_sql = r#"
                     -- Core crate metadata and processing state
                     DEFINE TABLE crate SCHEMAFULL;
@@ -2065,9 +2086,7 @@ impl DatabaseActor {
                         info!("Database schema initialized successfully");
 
                         // Broadcast DatabaseReady event
-                        broker
-                            .broadcast(DatabaseReady)
-                            .await;
+                        broker.broadcast(DatabaseReady).await;
                     }
                     Err(e) => {
                         error!("Failed to initialize database schema: {}", e);
@@ -2196,10 +2215,7 @@ mod tests {
 
             // Stop actor gracefully
             let stop_result = handle.stop().await;
-            assert!(
-                stop_result.is_ok(),
-                "DatabaseActor should stop gracefully"
-            );
+            assert!(stop_result.is_ok(), "DatabaseActor should stop gracefully");
 
             runtime.shutdown_all().await.unwrap();
 
@@ -2271,7 +2287,11 @@ mod tests {
 
             // Verify responses in after_stop hook
             subscriber_builder.after_stop(|agent| {
-                assert_eq!(agent.model.query_responses.len(), 1, "Should receive exactly one query response");
+                assert_eq!(
+                    agent.model.query_responses.len(),
+                    1,
+                    "Should receive exactly one query response"
+                );
 
                 let response = &agent.model.query_responses[0];
                 assert!(response.specifier.is_some(), "Should find the crate");
@@ -2281,13 +2301,19 @@ mod tests {
                 assert_eq!(spec.version().to_string(), "1.0.0", "Version should match");
                 assert_eq!(response.features, vec!["derive"], "Features should match");
                 assert_eq!(response.status, "pending", "Status should be pending");
-                assert!(!response.created_at.is_empty(), "Should have created_at timestamp");
+                assert!(
+                    !response.created_at.is_empty(),
+                    "Should have created_at timestamp"
+                );
 
                 AgentReply::immediate()
             });
 
             // Subscribe to broadcast messages before starting
-            subscriber_builder.handle().subscribe::<CrateQueryResponse>().await;
+            subscriber_builder
+                .handle()
+                .subscribe::<CrateQueryResponse>()
+                .await;
             let subscriber_handle = subscriber_builder.start().await;
 
             // Wait for schema initialization with longer timeout for safety
@@ -2340,35 +2366,56 @@ mod tests {
                 .await
                 .unwrap();
 
-        // Create TestSubscriber to verify responses
-        let mut subscriber_builder = runtime.new_agent::<TestSubscriber>().await;
+            // Create TestSubscriber to verify responses
+            let mut subscriber_builder = runtime.new_agent::<TestSubscriber>().await;
 
-        // Configure handler to collect query responses
-        subscriber_builder.mutate_on::<CrateQueryResponse>(|agent, envelope| {
-            let msg = envelope.message().clone();
-            agent.model.query_responses.push(msg);
-            AgentReply::immediate()
-        });
+            // Configure handler to collect query responses
+            subscriber_builder.mutate_on::<CrateQueryResponse>(|agent, envelope| {
+                let msg = envelope.message().clone();
+                agent.model.query_responses.push(msg);
+                AgentReply::immediate()
+            });
 
-        // Verify responses in after_stop hook
-        subscriber_builder.after_stop(|agent| {
-            assert_eq!(agent.model.query_responses.len(), 1, "Should receive exactly one query response");
+            // Verify responses in after_stop hook
+            subscriber_builder.after_stop(|agent| {
+                assert_eq!(
+                    agent.model.query_responses.len(),
+                    1,
+                    "Should receive exactly one query response"
+                );
 
-            let response = &agent.model.query_responses[0];
-            assert!(response.specifier.is_some(), "Should find the latest version");
+                let response = &agent.model.query_responses[0];
+                assert!(
+                    response.specifier.is_some(),
+                    "Should find the latest version"
+                );
 
-            let spec = response.specifier.as_ref().unwrap();
-            assert_eq!(spec.name(), "tokio", "Crate name should match");
-            assert_eq!(spec.version().to_string(), "1.36.0", "Should return latest version");
-            assert_eq!(response.features, vec!["full"], "Features should match latest version");
-            assert_eq!(response.status, "pending", "Status should be pending");
-            assert!(!response.created_at.is_empty(), "Should have created_at timestamp");
+                let spec = response.specifier.as_ref().unwrap();
+                assert_eq!(spec.name(), "tokio", "Crate name should match");
+                assert_eq!(
+                    spec.version().to_string(),
+                    "1.36.0",
+                    "Should return latest version"
+                );
+                assert_eq!(
+                    response.features,
+                    vec!["full"],
+                    "Features should match latest version"
+                );
+                assert_eq!(response.status, "pending", "Status should be pending");
+                assert!(
+                    !response.created_at.is_empty(),
+                    "Should have created_at timestamp"
+                );
 
-            AgentReply::immediate()
-        });
+                AgentReply::immediate()
+            });
 
             // Subscribe to broadcast messages before starting
-            subscriber_builder.handle().subscribe::<CrateQueryResponse>().await;
+            subscriber_builder
+                .handle()
+                .subscribe::<CrateQueryResponse>()
+                .await;
             let subscriber_handle = subscriber_builder.start().await;
 
             // Wait for schema initialization with longer timeout
@@ -2426,58 +2473,68 @@ mod tests {
             // Clean up any existing test database
             let _ = std::fs::remove_dir_all(&test_db_path);
 
-        let (handle, _db_info) = DatabaseActor::spawn(&mut runtime, test_db_path.clone())
-            .await
-            .unwrap();
+            let (handle, _db_info) = DatabaseActor::spawn(&mut runtime, test_db_path.clone())
+                .await
+                .unwrap();
 
-        // Create TestSubscriber to verify responses
-        let mut subscriber_builder = runtime.new_agent::<TestSubscriber>().await;
+            // Create TestSubscriber to verify responses
+            let mut subscriber_builder = runtime.new_agent::<TestSubscriber>().await;
 
-        // Configure handler to collect query responses
-        subscriber_builder.mutate_on::<CrateQueryResponse>(|agent, envelope| {
-            let msg = envelope.message().clone();
-            agent.model.query_responses.push(msg);
-            AgentReply::immediate()
-        });
+            // Configure handler to collect query responses
+            subscriber_builder.mutate_on::<CrateQueryResponse>(|agent, envelope| {
+                let msg = envelope.message().clone();
+                agent.model.query_responses.push(msg);
+                AgentReply::immediate()
+            });
 
-        // Verify responses in after_stop hook
-        subscriber_builder.after_stop(|agent| {
-            assert_eq!(agent.model.query_responses.len(), 1, "Should receive exactly one query response");
+            // Verify responses in after_stop hook
+            subscriber_builder.after_stop(|agent| {
+                assert_eq!(
+                    agent.model.query_responses.len(),
+                    1,
+                    "Should receive exactly one query response"
+                );
 
-            let response = &agent.model.query_responses[0];
-            assert!(response.specifier.is_none(), "Should not find non-existent crate");
-            assert_eq!(response.status, "not_found", "Status should be not_found");
-            assert!(response.features.is_empty(), "Features should be empty");
-            assert!(response.created_at.is_empty(), "created_at should be empty");
+                let response = &agent.model.query_responses[0];
+                assert!(
+                    response.specifier.is_none(),
+                    "Should not find non-existent crate"
+                );
+                assert_eq!(response.status, "not_found", "Status should be not_found");
+                assert!(response.features.is_empty(), "Features should be empty");
+                assert!(response.created_at.is_empty(), "created_at should be empty");
 
-            AgentReply::immediate()
-        });
+                AgentReply::immediate()
+            });
 
-        // Subscribe to broadcast messages before starting
-        subscriber_builder.handle().subscribe::<CrateQueryResponse>().await;
-        let subscriber_handle = subscriber_builder.start().await;
+            // Subscribe to broadcast messages before starting
+            subscriber_builder
+                .handle()
+                .subscribe::<CrateQueryResponse>()
+                .await;
+            let subscriber_handle = subscriber_builder.start().await;
 
-        // Wait for schema initialization
-        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+            // Wait for schema initialization
+            tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
-        // Query for a non-existent crate
-        handle
-            .send(QueryCrate {
-                name: "nonexistent-crate".to_string(),
-                version: Some("1.0.0".to_string()),
-            })
-            .await;
+            // Query for a non-existent crate
+            handle
+                .send(QueryCrate {
+                    name: "nonexistent-crate".to_string(),
+                    version: Some("1.0.0".to_string()),
+                })
+                .await;
 
-        // Wait for query to complete and broadcast
-        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+            // Wait for query to complete and broadcast
+            tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
-        // Clean shutdown (subscriber assertions trigger in after_stop)
-        subscriber_handle.stop().await.unwrap();
-        handle.stop().await.unwrap();
-        runtime.shutdown_all().await.unwrap();
+            // Clean shutdown (subscriber assertions trigger in after_stop)
+            subscriber_handle.stop().await.unwrap();
+            handle.stop().await.unwrap();
+            runtime.shutdown_all().await.unwrap();
 
-        // Cleanup
-        cleanup_test_db(&test_db_path).await;
+            // Cleanup
+            cleanup_test_db(&test_db_path).await;
         })
         .await
         .expect("Test should complete within timeout");
@@ -2494,81 +2551,89 @@ mod tests {
             // Clean up any existing test database
             let _ = std::fs::remove_dir_all(&test_db_path);
 
-        let (handle, _db_info) = DatabaseActor::spawn(&mut runtime, test_db_path.clone())
-            .await
-            .unwrap();
+            let (handle, _db_info) = DatabaseActor::spawn(&mut runtime, test_db_path.clone())
+                .await
+                .unwrap();
 
-        // Create TestSubscriber to verify responses
-        let mut subscriber_builder = runtime.new_agent::<TestSubscriber>().await;
+            // Create TestSubscriber to verify responses
+            let mut subscriber_builder = runtime.new_agent::<TestSubscriber>().await;
 
-        // Configure handler to collect list responses
-        subscriber_builder.mutate_on::<CrateListResponse>(|agent, envelope| {
-            let msg = envelope.message().clone();
-            agent.model.list_responses.push(msg);
-            AgentReply::immediate()
-        });
+            // Configure handler to collect list responses
+            subscriber_builder.mutate_on::<CrateListResponse>(|agent, envelope| {
+                let msg = envelope.message().clone();
+                agent.model.list_responses.push(msg);
+                AgentReply::immediate()
+            });
 
-        // Verify responses in after_stop hook
-        subscriber_builder.after_stop(|agent| {
-            assert_eq!(agent.model.list_responses.len(), 1, "Should receive exactly one list response");
+            // Verify responses in after_stop hook
+            subscriber_builder.after_stop(|agent| {
+                assert_eq!(
+                    agent.model.list_responses.len(),
+                    1,
+                    "Should receive exactly one list response"
+                );
 
-            let response = &agent.model.list_responses[0];
-            assert_eq!(response.crates.len(), 2, "Should list 2 crates");
-            assert_eq!(response.total_count, 2, "Total count should be 2");
+                let response = &agent.model.list_responses[0];
+                assert_eq!(response.crates.len(), 2, "Should list 2 crates");
+                assert_eq!(response.total_count, 2, "Total count should be 2");
 
-            // Verify crate summaries contain expected data
-            let crate_names: Vec<&str> = response.crates.iter().map(|c| c.name.as_str()).collect();
-            assert!(crate_names.contains(&"serde"), "Should contain serde");
-            assert!(crate_names.contains(&"tokio"), "Should contain tokio");
+                // Verify crate summaries contain expected data
+                let crate_names: Vec<&str> =
+                    response.crates.iter().map(|c| c.name.as_str()).collect();
+                assert!(crate_names.contains(&"serde"), "Should contain serde");
+                assert!(crate_names.contains(&"tokio"), "Should contain tokio");
 
-            AgentReply::immediate()
-        });
+                AgentReply::immediate()
+            });
 
-        // Subscribe to broadcast messages before starting
-        subscriber_builder.handle().subscribe::<CrateListResponse>().await;
-        let subscriber_handle = subscriber_builder.start().await;
+            // Subscribe to broadcast messages before starting
+            subscriber_builder
+                .handle()
+                .subscribe::<CrateListResponse>()
+                .await;
+            let subscriber_handle = subscriber_builder.start().await;
 
-        // Wait for schema initialization
-        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+            // Wait for schema initialization
+            tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
-        // Persist some test crates
-        let specifier1 = CrateSpecifier::from_str("serde@1.0.0").unwrap();
-        handle
-            .send(PersistCrate {
-                specifier: specifier1,
-                features: vec![],
-            })
-            .await;
+            // Persist some test crates
+            let specifier1 = CrateSpecifier::from_str("serde@1.0.0").unwrap();
+            handle
+                .send(PersistCrate {
+                    specifier: specifier1,
+                    features: vec![],
+                })
+                .await;
 
-        let specifier2 = CrateSpecifier::from_str("tokio@1.35.0").unwrap();
-        handle
-            .send(PersistCrate {
-                specifier: specifier2,
-                features: vec![],
-            })
-            .await;
+            let specifier2 = CrateSpecifier::from_str("tokio@1.35.0").unwrap();
+            handle
+                .send(PersistCrate {
+                    specifier: specifier2,
+                    features: vec![],
+                })
+                .await;
 
-        // Wait for persistence
-        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+            // Wait for persistence
+            tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
-        // List crates with default pagination
-        handle
-            .send(ListCrates {
-                limit: None,
-                offset: None,
-            })
-            .await;
+            // List crates with default pagination
+            handle
+                .send(ListCrates {
+                    limit: None,
+                    offset: None,
+                })
+                .await;
 
-        // Wait for list to complete and broadcast
-        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+            // Wait for list to complete and broadcast
+            tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
-        // Clean shutdown (subscriber assertions trigger in after_stop)
-        subscriber_handle.stop().await.unwrap();
-        handle.stop().await.unwrap();
-        runtime.shutdown_all().await.unwrap();
+            // Clean shutdown (subscriber assertions trigger in after_stop)
+            subscriber_handle.stop().await.unwrap();
+            handle.stop().await.unwrap();
+            runtime.shutdown_all().await.unwrap();
 
-        // Cleanup
-        cleanup_test_db(&test_db_path).await;
+            // Cleanup
+            cleanup_test_db(&test_db_path).await;
         })
         .await
         .expect("Test should complete within timeout");
@@ -2585,88 +2650,103 @@ mod tests {
             // Clean up any existing test database
             let _ = std::fs::remove_dir_all(&test_db_path);
 
-        let (handle, _db_info) = DatabaseActor::spawn(&mut runtime, test_db_path.clone())
-            .await
-            .unwrap();
+            let (handle, _db_info) = DatabaseActor::spawn(&mut runtime, test_db_path.clone())
+                .await
+                .unwrap();
 
-        // Create TestSubscriber to verify responses
-        let mut subscriber_builder = runtime.new_agent::<TestSubscriber>().await;
+            // Create TestSubscriber to verify responses
+            let mut subscriber_builder = runtime.new_agent::<TestSubscriber>().await;
 
-        // Configure handler to collect list responses
-        subscriber_builder.mutate_on::<CrateListResponse>(|agent, envelope| {
-            let msg = envelope.message().clone();
-            agent.model.list_responses.push(msg);
-            AgentReply::immediate()
-        });
+            // Configure handler to collect list responses
+            subscriber_builder.mutate_on::<CrateListResponse>(|agent, envelope| {
+                let msg = envelope.message().clone();
+                agent.model.list_responses.push(msg);
+                AgentReply::immediate()
+            });
 
-        // Verify responses in after_stop hook
-        subscriber_builder.after_stop(|agent| {
-            assert_eq!(agent.model.list_responses.len(), 2, "Should receive two list responses (2 pages)");
+            // Verify responses in after_stop hook
+            subscriber_builder.after_stop(|agent| {
+                assert_eq!(
+                    agent.model.list_responses.len(),
+                    2,
+                    "Should receive two list responses (2 pages)"
+                );
 
-            // First page should have 2 crates
-            let first_page = &agent.model.list_responses[0];
-            assert_eq!(first_page.crates.len(), 2, "First page should have 2 crates");
-            assert_eq!(first_page.total_count, 5, "Total count should be 5");
+                // First page should have 2 crates
+                let first_page = &agent.model.list_responses[0];
+                assert_eq!(
+                    first_page.crates.len(),
+                    2,
+                    "First page should have 2 crates"
+                );
+                assert_eq!(first_page.total_count, 5, "Total count should be 5");
 
-            // Second page should have 2 crates
-            let second_page = &agent.model.list_responses[1];
-            assert_eq!(second_page.crates.len(), 2, "Second page should have 2 crates");
-            assert_eq!(second_page.total_count, 5, "Total count should be 5");
+                // Second page should have 2 crates
+                let second_page = &agent.model.list_responses[1];
+                assert_eq!(
+                    second_page.crates.len(),
+                    2,
+                    "Second page should have 2 crates"
+                );
+                assert_eq!(second_page.total_count, 5, "Total count should be 5");
 
-            AgentReply::immediate()
-        });
+                AgentReply::immediate()
+            });
 
-        // Subscribe to broadcast messages before starting
-        subscriber_builder.handle().subscribe::<CrateListResponse>().await;
-        let subscriber_handle = subscriber_builder.start().await;
+            // Subscribe to broadcast messages before starting
+            subscriber_builder
+                .handle()
+                .subscribe::<CrateListResponse>()
+                .await;
+            let subscriber_handle = subscriber_builder.start().await;
 
-        // Wait for schema initialization
-        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+            // Wait for schema initialization
+            tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
-        // Persist multiple test crates
-        for i in 0..5 {
-            let specifier =
-                CrateSpecifier::from_str(&format!("test-crate{}@1.0.0", i)).unwrap();
+            // Persist multiple test crates
+            for i in 0..5 {
+                let specifier =
+                    CrateSpecifier::from_str(&format!("test-crate{}@1.0.0", i)).unwrap();
+                handle
+                    .send(PersistCrate {
+                        specifier,
+                        features: vec![],
+                    })
+                    .await;
+            }
+
+            // Wait for persistence
+            tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+
+            // List first page with limit=2
             handle
-                .send(PersistCrate {
-                    specifier,
-                    features: vec![],
+                .send(ListCrates {
+                    limit: Some(2),
+                    offset: Some(0),
                 })
                 .await;
-        }
 
-        // Wait for persistence
-        tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+            // Wait for list to complete
+            tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
-        // List first page with limit=2
-        handle
-            .send(ListCrates {
-                limit: Some(2),
-                offset: Some(0),
-            })
-            .await;
+            // List second page with limit=2, offset=2
+            handle
+                .send(ListCrates {
+                    limit: Some(2),
+                    offset: Some(2),
+                })
+                .await;
 
-        // Wait for list to complete
-        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+            // Wait for list to complete and broadcast
+            tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
-        // List second page with limit=2, offset=2
-        handle
-            .send(ListCrates {
-                limit: Some(2),
-                offset: Some(2),
-            })
-            .await;
+            // Clean shutdown (subscriber assertions trigger in after_stop)
+            subscriber_handle.stop().await.unwrap();
+            handle.stop().await.unwrap();
+            runtime.shutdown_all().await.unwrap();
 
-        // Wait for list to complete and broadcast
-        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-
-        // Clean shutdown (subscriber assertions trigger in after_stop)
-        subscriber_handle.stop().await.unwrap();
-        handle.stop().await.unwrap();
-        runtime.shutdown_all().await.unwrap();
-
-        // Cleanup
-        cleanup_test_db(&test_db_path).await;
+            // Cleanup
+            cleanup_test_db(&test_db_path).await;
         })
         .await
         .expect("Test should complete within timeout");
@@ -2681,56 +2761,66 @@ mod tests {
             // Clean up any existing test database
             let _ = std::fs::remove_dir_all(&test_db_path);
 
-        let (handle, _db_info) = DatabaseActor::spawn(&mut runtime, test_db_path.clone())
-            .await
-            .unwrap();
+            let (handle, _db_info) = DatabaseActor::spawn(&mut runtime, test_db_path.clone())
+                .await
+                .unwrap();
 
-        // Create TestSubscriber to verify responses
-        let mut subscriber_builder = runtime.new_agent::<TestSubscriber>().await;
+            // Create TestSubscriber to verify responses
+            let mut subscriber_builder = runtime.new_agent::<TestSubscriber>().await;
 
-        // Configure handler to collect list responses
-        subscriber_builder.mutate_on::<CrateListResponse>(|agent, envelope| {
-            let msg = envelope.message().clone();
-            agent.model.list_responses.push(msg);
-            AgentReply::immediate()
-        });
+            // Configure handler to collect list responses
+            subscriber_builder.mutate_on::<CrateListResponse>(|agent, envelope| {
+                let msg = envelope.message().clone();
+                agent.model.list_responses.push(msg);
+                AgentReply::immediate()
+            });
 
-        // Verify responses in after_stop hook
-        subscriber_builder.after_stop(|agent| {
-            assert_eq!(agent.model.list_responses.len(), 1, "Should receive exactly one list response");
+            // Verify responses in after_stop hook
+            subscriber_builder.after_stop(|agent| {
+                assert_eq!(
+                    agent.model.list_responses.len(),
+                    1,
+                    "Should receive exactly one list response"
+                );
 
-            let response = &agent.model.list_responses[0];
-            assert!(response.crates.is_empty(), "Should return empty crates list");
-            assert_eq!(response.total_count, 0, "Total count should be 0");
+                let response = &agent.model.list_responses[0];
+                assert!(
+                    response.crates.is_empty(),
+                    "Should return empty crates list"
+                );
+                assert_eq!(response.total_count, 0, "Total count should be 0");
 
-            AgentReply::immediate()
-        });
+                AgentReply::immediate()
+            });
 
-        // Subscribe to broadcast messages before starting
-        subscriber_builder.handle().subscribe::<CrateListResponse>().await;
-        let subscriber_handle = subscriber_builder.start().await;
+            // Subscribe to broadcast messages before starting
+            subscriber_builder
+                .handle()
+                .subscribe::<CrateListResponse>()
+                .await;
+            let subscriber_handle = subscriber_builder.start().await;
 
-        // Wait for schema initialization
-        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+            // Wait for schema initialization
+            tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
-        // List crates from empty database
-        handle
-            .send(ListCrates {
-                limit: Some(10),
-                offset: Some(0),
-            })
-            .await;
+            // List crates from empty database
+            handle
+                .send(ListCrates {
+                    limit: Some(10),
+                    offset: Some(0),
+                })
+                .await;
 
-        // Wait for list to complete and broadcast
-        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+            // Wait for list to complete and broadcast
+            tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
-        // Clean shutdown (subscriber assertions trigger in after_stop)
-        subscriber_handle.stop().await.unwrap();
-        handle.stop().await.unwrap();
-        runtime.shutdown_all().await.unwrap();
+            // Clean shutdown (subscriber assertions trigger in after_stop)
+            subscriber_handle.stop().await.unwrap();
+            handle.stop().await.unwrap();
+            runtime.shutdown_all().await.unwrap();
 
-        // Cleanup
-        cleanup_test_db(&test_db_path).await;
+            // Cleanup
+            cleanup_test_db(&test_db_path).await;
         })
         .await
         .expect("Test should complete within timeout");

@@ -1,10 +1,13 @@
 //! Simple utility to query the crately database
 //!
 //! Run with: cargo run --example query_db
-
-use surrealdb::engine::local::RocksDb;
-use surrealdb::sql::Thing;
 use surrealdb::Surreal;
+#[cfg(not(feature = "rocksdb"))]
+use surrealdb::engine::local::Mem;
+
+#[cfg(feature = "rocksdb")]
+use surrealdb::engine::local::rocksdb;
+use surrealdb::sql::Thing;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -17,7 +20,11 @@ async fn main() -> anyhow::Result<()> {
     println!("Connecting to database: {}", db_path.display());
 
     // Connect to database
+    #[cfg(feature = "rocksdb")]
     let db = Surreal::new::<RocksDb>(db_path).await?;
+
+    #[cfg(not(feature = "rocksdb"))]
+    let db = Surreal::new::<Mem>(()).await?;
 
     // Use namespace and database
     db.use_ns("crately").use_db("production").await?;
@@ -124,7 +131,10 @@ async fn main() -> anyhow::Result<()> {
             println!("  Embedding ID: {}", embedding.id);
             println!("    Chunk: {}", embedding.chunk_id);
             println!("    Crate: {}", embedding.crate_id);
-            println!("    Model: {} (v{})", embedding.model_name, embedding.model_version);
+            println!(
+                "    Model: {} (v{})",
+                embedding.model_name, embedding.model_version
+            );
             println!("    Dimensions: {}", embedding.vector_dimension);
             if let Some(created_at) = &embedding.created_at {
                 println!("    Created: {}", created_at);
