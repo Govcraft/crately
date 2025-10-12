@@ -1033,6 +1033,7 @@ dependencies = [
  "semver",
  "serde",
  "serde_json",
+ "sha2",
  "surrealdb",
  "tar",
  "thiserror 2.0.17",
