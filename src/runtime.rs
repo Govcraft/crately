@@ -229,10 +229,14 @@ impl ActorSystem {
             )))
             .await;
 
-        // Spawn CrateCoordinatorActor with coordinator configuration
-        let coordinator = CrateCoordinatorActor::spawn(&mut runtime, config.pipeline.coordinator.clone())
-            .await
-            .context("Failed to spawn CrateCoordinatorActor")?;
+        // Spawn CrateCoordinatorActor with coordinator configuration and retry coordinator handle
+        let coordinator = CrateCoordinatorActor::spawn(
+            &mut runtime,
+            config.pipeline.coordinator.clone(),
+            retry_coordinator.clone(),
+        )
+        .await
+        .context("Failed to spawn CrateCoordinatorActor")?;
 
         actors.insert("coordinator".to_string(), coordinator.clone());
 
@@ -884,10 +888,14 @@ impl ActorSystem {
             )))
             .await;
 
-        // Spawn CrateCoordinatorActor with test configuration
-        let coordinator = CrateCoordinatorActor::spawn(&mut runtime, config.pipeline.coordinator.clone())
-            .await
-            .context("Failed to spawn CrateCoordinatorActor")?;
+        // Spawn CrateCoordinatorActor with test configuration and retry coordinator handle
+        let coordinator = CrateCoordinatorActor::spawn(
+            &mut runtime,
+            config.pipeline.coordinator.clone(),
+            retry_coordinator.clone(),
+        )
+        .await
+        .context("Failed to spawn CrateCoordinatorActor")?;
 
         actors.insert("coordinator".to_string(), coordinator.clone());
 

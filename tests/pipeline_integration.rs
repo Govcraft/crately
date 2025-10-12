@@ -27,6 +27,8 @@ use std::path::PathBuf;
 use std::str::FromStr;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::time::Duration;
+use crately::actors::retry_coordinator::RetryCoordinator;
+use crately::retry_policy::RetryPolicy;
 
 /// Helper: Create a unique test database path using test name and timestamp
 /// to prevent lock contention between parallel tests.
@@ -106,7 +108,13 @@ async fn test_pipeline_complete_flow_from_crate_received_to_persistence() {
             .expect("DatabaseActor should spawn");
 
         let coordinator_config = CoordinatorConfig::default();
-        let coordinator = CrateCoordinatorActor::spawn(&mut runtime, coordinator_config)
+
+        // Spawn RetryCoordinator first
+        let retry_policy = RetryPolicy::default();
+        let retry_coordinator = RetryCoordinator::spawn(&mut runtime, retry_policy)
+            .await
+            .expect("RetryCoordinator should spawn");
+        let coordinator = CrateCoordinatorActor::spawn(&mut runtime, coordinator_config, retry_coordinator.clone())
             .await
             .expect("CrateCoordinatorActor should spawn");
 
@@ -331,7 +339,13 @@ async fn test_pipeline_error_propagation_download_failure_with_retry() {
             .expect("DatabaseActor should spawn");
 
         let coordinator_config = CoordinatorConfig::default();
-        let coordinator = CrateCoordinatorActor::spawn(&mut runtime, coordinator_config)
+
+        // Spawn RetryCoordinator first
+        let retry_policy = RetryPolicy::default();
+        let retry_coordinator = RetryCoordinator::spawn(&mut runtime, retry_policy)
+            .await
+            .expect("RetryCoordinator should spawn");
+        let coordinator = CrateCoordinatorActor::spawn(&mut runtime, coordinator_config, retry_coordinator.clone())
             .await
             .expect("CrateCoordinatorActor should spawn");
 
@@ -466,7 +480,13 @@ async fn test_pipeline_error_propagation_extraction_failure() {
             .expect("DatabaseActor should spawn");
 
         let coordinator_config = CoordinatorConfig::default();
-        let coordinator = CrateCoordinatorActor::spawn(&mut runtime, coordinator_config)
+
+        // Spawn RetryCoordinator first
+        let retry_policy = RetryPolicy::default();
+        let retry_coordinator = RetryCoordinator::spawn(&mut runtime, retry_policy)
+            .await
+            .expect("RetryCoordinator should spawn");
+        let coordinator = CrateCoordinatorActor::spawn(&mut runtime, coordinator_config, retry_coordinator.clone())
             .await
             .expect("CrateCoordinatorActor should spawn");
 
@@ -612,7 +632,13 @@ async fn test_pipeline_concurrent_crate_processing() {
             .expect("DatabaseActor should spawn");
 
         let coordinator_config = CoordinatorConfig::default();
-        let coordinator = CrateCoordinatorActor::spawn(&mut runtime, coordinator_config)
+
+        // Spawn RetryCoordinator first
+        let retry_policy = RetryPolicy::default();
+        let retry_coordinator = RetryCoordinator::spawn(&mut runtime, retry_policy)
+            .await
+            .expect("RetryCoordinator should spawn");
+        let coordinator = CrateCoordinatorActor::spawn(&mut runtime, coordinator_config, retry_coordinator.clone())
             .await
             .expect("CrateCoordinatorActor should spawn");
 
@@ -794,7 +820,13 @@ async fn test_pipeline_http_post_endpoint_triggers_processing() {
             .expect("DatabaseActor should spawn");
 
         let coordinator_config = CoordinatorConfig::default();
-        let coordinator = CrateCoordinatorActor::spawn(&mut runtime, coordinator_config)
+
+        // Spawn RetryCoordinator first
+        let retry_policy = RetryPolicy::default();
+        let retry_coordinator = RetryCoordinator::spawn(&mut runtime, retry_policy)
+            .await
+            .expect("RetryCoordinator should spawn");
+        let coordinator = CrateCoordinatorActor::spawn(&mut runtime, coordinator_config, retry_coordinator.clone())
             .await
             .expect("CrateCoordinatorActor should spawn");
 

@@ -5,11 +5,13 @@
 //! implements timeout detection for stuck pipelines.
 
 use crate::actors::config::CoordinatorConfig;
+use crate::actors::retry_coordinator::ScheduleRetry;
 use crate::crate_specifier::CrateSpecifier;
+use crate::errors::{DownloadError, ExtractionError, PipelineError};
 use crate::messages::{
     CheckProcessingTimeouts, CrateDownloadFailed, CrateDownloaded, CrateProcessingComplete,
     CrateProcessingFailed, CrateReceived, DocumentationChunked, DocumentationExtracted,
-    DocumentationExtractionFailed, DocumentationVectorized, RetryCrateProcessing,
+    DocumentationExtractionFailed, DocumentationVectorized,
 };
 use acton_reactive::prelude::*;
 use std::collections::HashMap;
@@ -134,19 +136,22 @@ pub struct CrateCoordinatorActor {
     config: CoordinatorConfig,
     /// In-memory state tracking
     processing_states: HashMap<CrateSpecifier, CrateProcessingState>,
+    /// Handle to RetryCoordinator for delegating retry scheduling
+    retry_coordinator: AgentHandle,
 }
 
 impl CrateCoordinatorActor {
     /// Spawns a new CrateCoordinatorActor
     ///
     /// This actor subscribes to all pipeline events to track processing state,
-    /// coordinates state transitions, handles retries with exponential backoff,
+    /// coordinates state transitions, delegates retry scheduling to RetryCoordinator,
     /// and broadcasts CrateProcessingComplete when all stages finish successfully.
     ///
     /// # Arguments
     ///
     /// * `runtime` - The agent runtime for actor management
     /// * `config` - Coordinator configuration
+    /// * `retry_coordinator` - Handle to the RetryCoordinator for delegating retry scheduling
     ///
     /// # Returns
     ///
@@ -161,21 +166,25 @@ impl CrateCoordinatorActor {
     /// # async fn example() -> anyhow::Result<()> {
     /// let mut runtime = ActonApp::launch();
     /// let config = CoordinatorConfig::default();
-    /// let handle = CrateCoordinatorActor::spawn(&mut runtime, config).await?;
+    /// // Assume retry_coordinator handle is available
+    /// # let retry_coordinator = unimplemented!();
+    /// let handle = CrateCoordinatorActor::spawn(&mut runtime, config, retry_coordinator).await?;
     /// # Ok(())
     /// # }
     /// ```
-    #[instrument(skip(runtime))]
+    #[instrument(skip(runtime, retry_coordinator))]
     pub async fn spawn(
         runtime: &mut AgentRuntime,
         config: CoordinatorConfig,
+        retry_coordinator: AgentHandle,
     ) -> anyhow::Result<AgentHandle> {
         let mut builder = runtime.new_agent::<CrateCoordinatorActor>().await;
 
-        // Initialize with custom configuration
+        // Initialize with custom configuration and retry coordinator
         builder.model = Self {
             config,
             processing_states: HashMap::new(),
+            retry_coordinator,
         };
 
         // Handle CrateReceived - initialize tracking and transition to Downloading
@@ -217,7 +226,7 @@ impl CrateCoordinatorActor {
             AgentReply::immediate()
         });
 
-        // Handle CrateDownloadFailed - handle download failure
+        // Handle CrateDownloadFailed - delegate retry scheduling to RetryCoordinator
         builder.mutate_on::<CrateDownloadFailed>(|agent, envelope| {
             let msg = envelope.message().clone();
             let specifier = msg.specifier.clone();
@@ -231,58 +240,32 @@ impl CrateCoordinatorActor {
 
                 state.increment_retry();
 
-                let retry_count = state.retry_count;
-                let max_retries = agent.model.config.max_retries;
                 let features = state.features.clone();
+                let retry_coordinator = agent.model.retry_coordinator.clone();
 
-                if retry_count < max_retries {
-                    // Schedule retry with exponential backoff
-                    let delay_secs = agent.model.config.retry_backoff_secs * (2_u64.pow(retry_count));
-                    let delay = Duration::from_secs(delay_secs);
+                // Delegate retry scheduling to RetryCoordinator
+                // Convert error string to structured PipelineError
+                let pipeline_error = PipelineError::Download(DownloadError::NetworkFailure {
+                    specifier: specifier.clone(),
+                    details: error.clone(),
+                    retryable: true,
+                });
 
-                    warn!(
-                        specifier = %specifier,
-                        retry_count = retry_count,
-                        max_retries = max_retries,
-                        delay_secs = delay_secs,
-                        "Scheduling download retry"
-                    );
+                debug!(
+                    specifier = %specifier,
+                    error = %error,
+                    "Delegating download retry to RetryCoordinator"
+                );
 
-                    let broker = agent.broker().clone();
-
-                    return AgentReply::from_async(async move {
-                        tokio::time::sleep(delay).await;
-
-                        broker
-                            .broadcast(RetryCrateProcessing {
-                                specifier,
-                                features,
-                                retry_attempt: retry_count,
-                            })
-                            .await;
-                    });
-                } else {
-                    // Max retries exceeded
-                    state.update_status(ProcessingStatus::Failed);
-                    error!(
-                        specifier = %specifier,
-                        retry_count = retry_count,
-                        max_retries = max_retries,
-                        "Max download retries exceeded, marking as failed"
-                    );
-
-                    let broker = agent.broker().clone();
-
-                    return AgentReply::from_async(async move {
-                        broker
-                            .broadcast(CrateProcessingFailed {
-                                specifier,
-                                stage: "downloading".to_string(),
-                                error,
-                            })
-                            .await;
-                    });
-                }
+                return AgentReply::from_async(async move {
+                    retry_coordinator
+                        .send(ScheduleRetry {
+                            specifier,
+                            features,
+                            error: pipeline_error,
+                        })
+                        .await;
+                });
             }
 
             AgentReply::immediate()
@@ -307,7 +290,7 @@ impl CrateCoordinatorActor {
             AgentReply::immediate()
         });
 
-        // Handle DocumentationExtractionFailed - handle extraction failure
+        // Handle DocumentationExtractionFailed - delegate retry scheduling to RetryCoordinator
         builder.mutate_on::<DocumentationExtractionFailed>(|agent, envelope| {
             let msg = envelope.message().clone();
             let specifier = msg.specifier.clone();
@@ -321,58 +304,31 @@ impl CrateCoordinatorActor {
 
                 state.increment_retry();
 
-                let retry_count = state.retry_count;
-                let max_retries = agent.model.config.max_retries;
                 let features = state.features.clone();
+                let retry_coordinator = agent.model.retry_coordinator.clone();
 
-                if retry_count < max_retries {
-                    // Schedule retry with exponential backoff
-                    let delay_secs = agent.model.config.retry_backoff_secs * (2_u64.pow(retry_count));
-                    let delay = Duration::from_secs(delay_secs);
+                // Delegate retry scheduling to RetryCoordinator
+                // Convert error string to structured PipelineError
+                let pipeline_error = PipelineError::Extraction(ExtractionError::ArchiveCorrupted {
+                    specifier: specifier.clone(),
+                    details: error.clone(),
+                });
 
-                    warn!(
-                        specifier = %specifier,
-                        retry_count = retry_count,
-                        max_retries = max_retries,
-                        delay_secs = delay_secs,
-                        "Scheduling extraction retry"
-                    );
+                debug!(
+                    specifier = %specifier,
+                    error = %error,
+                    "Delegating extraction retry to RetryCoordinator"
+                );
 
-                    let broker = agent.broker().clone();
-
-                    return AgentReply::from_async(async move {
-                        tokio::time::sleep(delay).await;
-
-                        broker
-                            .broadcast(RetryCrateProcessing {
-                                specifier,
-                                features,
-                                retry_attempt: retry_count,
-                            })
-                            .await;
-                    });
-                } else {
-                    // Max retries exceeded
-                    state.update_status(ProcessingStatus::Failed);
-                    error!(
-                        specifier = %specifier,
-                        retry_count = retry_count,
-                        max_retries = max_retries,
-                        "Max extraction retries exceeded, marking as failed"
-                    );
-
-                    let broker = agent.broker().clone();
-
-                    return AgentReply::from_async(async move {
-                        broker
-                            .broadcast(CrateProcessingFailed {
-                                specifier,
-                                stage: "extracting".to_string(),
-                                error,
-                            })
-                            .await;
-                    });
-                }
+                return AgentReply::from_async(async move {
+                    retry_coordinator
+                        .send(ScheduleRetry {
+                            specifier,
+                            features,
+                            error: pipeline_error,
+                        })
+                        .await;
+                });
             }
 
             AgentReply::immediate()
@@ -437,6 +393,32 @@ impl CrateCoordinatorActor {
                         })
                         .await;
                 });
+            }
+
+            AgentReply::immediate()
+        });
+
+        // Handle CrateProcessingFailed - mark as permanently failed
+        builder.mutate_on::<CrateProcessingFailed>(|agent, envelope| {
+            let msg = envelope.message();
+            let specifier = &msg.specifier;
+
+            if let Some(state) = agent.model.processing_states.get_mut(specifier) {
+                state.update_with_error(ProcessingStatus::Failed, msg.error.clone());
+
+                // Verify we're in a terminal failure state
+                debug_assert!(
+                    state.status.is_terminal() && state.status.is_failure(),
+                    "Failed should be both terminal and a failure state"
+                );
+
+                warn!(
+                    specifier = %specifier,
+                    stage = %msg.stage,
+                    error = %msg.error,
+                    retry_count = state.retry_count,
+                    "Crate processing failed permanently"
+                );
             }
 
             AgentReply::immediate()
@@ -596,10 +578,19 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn test_spawn_coordinator() {
+        use crate::actors::retry_coordinator::RetryCoordinator;
+        use crate::retry_policy::RetryPolicy;
+
         let mut runtime = ActonApp::launch();
         let config = CoordinatorConfig::default();
 
-        let _handle = CrateCoordinatorActor::spawn(&mut runtime, config)
+        // Spawn RetryCoordinator first
+        let retry_policy = RetryPolicy::default();
+        let retry_coordinator = RetryCoordinator::spawn(&mut runtime, retry_policy)
+            .await
+            .expect("Failed to spawn RetryCoordinator");
+
+        let _handle = CrateCoordinatorActor::spawn(&mut runtime, config, retry_coordinator)
             .await
             .expect("Failed to spawn CrateCoordinatorActor");
 
@@ -608,10 +599,19 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn test_coordinator_tracks_crate_received() {
+        use crate::actors::retry_coordinator::RetryCoordinator;
+        use crate::retry_policy::RetryPolicy;
+
         let mut runtime = ActonApp::launch();
         let config = CoordinatorConfig::default();
 
-        let handle = CrateCoordinatorActor::spawn(&mut runtime, config)
+        // Spawn RetryCoordinator first
+        let retry_policy = RetryPolicy::default();
+        let retry_coordinator = RetryCoordinator::spawn(&mut runtime, retry_policy)
+            .await
+            .expect("Failed to spawn RetryCoordinator");
+
+        let handle = CrateCoordinatorActor::spawn(&mut runtime, config, retry_coordinator)
             .await
             .expect("Failed to spawn CrateCoordinatorActor");
 
@@ -624,7 +624,7 @@ mod tests {
             .await;
 
         // Give time for processing
-        tokio::time::sleep(Duration::from_millis(10)).await;
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
 
         runtime.shutdown_all().await.expect("Failed to shutdown");
     }
