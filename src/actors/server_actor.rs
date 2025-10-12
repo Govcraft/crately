@@ -21,18 +21,20 @@ use tracing::{debug, error, info, warn};
 use crate::{
     actors::config::{Config, ConfigResponse, ReloadConfig},
     messages::{
-        KeyPressed, PersistCrate, PrintError, PrintProgress, PrintSuccess, ServerReloaded,
+        CrateReceived, KeyPressed, PrintError, PrintProgress, PrintSuccess, ServerReloaded,
         ServerStarted, StartServer, StopServer,
     },
     request::CrateRequest,
     response::CrateResponse,
 };
 
-/// Shared application state containing actor handles
+/// Shared application state containing actor handles and broker
 #[derive(Clone)]
 struct AppState {
     /// Thread-safe map of actor handles accessible by name
     actors: Arc<DashMap<String, AgentHandle>>,
+    /// Broker handle for event broadcasting
+    broker: AgentHandle,
 }
 
 /// Handle HTTP POST requests to the /crate endpoint
@@ -54,25 +56,22 @@ async fn handle_crate_request(
         specifier.version()
     );
 
-    // Send persistence request to DatabaseActor
-    if let Some(database) = state.actors.get("database") {
-        database
-            .send(PersistCrate {
-                specifier: payload.specifier.clone(),
-                features: payload.features.clone(),
-            })
-            .await;
-    } else {
-        warn!("DatabaseActor not found in registry, skipping persistence");
-    }
+    // Broadcast CrateReceived event to initiate the processing pipeline
+    state
+        .broker
+        .broadcast(CrateReceived {
+            specifier: payload.specifier.clone(),
+            features: payload.features.clone(),
+        })
+        .await;
 
-    // Return success response
+    // Return acceptance response
     let response = CrateResponse {
         name: specifier.name().to_string(),
         version: specifier.version().to_string(),
         features: payload.features.clone(),
         message: format!(
-            "Successfully received crate {} with {} feature(s)",
+            "Crate processing initiated for {} with {} feature(s)",
             specifier,
             payload.features.len()
         ),
@@ -222,10 +221,13 @@ impl ServerActor {
             let config = agent.model.config.clone();
             let actors = Arc::clone(&agent.model.actors);
             let console = actors.get("console").map(|h| h.clone());
-            let broker = agent.broker().clone();
+            let broker = agent.handle().clone();
 
             // Create shared application state
-            let app_state = AppState { actors };
+            let app_state = AppState {
+                actors,
+                broker: broker.clone(),
+            };
 
             // Build the router
             let app = Router::new()
@@ -626,5 +628,199 @@ mod tests {
             .shutdown_all()
             .await
             .expect("Runtime should shutdown");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_crate_request_broadcasts_crate_received_event() {
+        let mut runtime = ActonApp::launch();
+        let test_port = 38293;
+        let config = Config {
+            port: test_port,
+            pipeline: crate::actors::config::PipelineConfig::default(),
+        };
+        let actors = Arc::new(DashMap::new());
+
+        let handle = ServerActor::spawn(&mut runtime, config, actors.clone())
+            .await
+            .expect("Should spawn server");
+
+        // Create a channel to receive events
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+
+        // Create a test subscriber for CrateReceived events
+        let mut subscriber_builder = runtime.new_agent::<TestSubscriber>().await;
+
+        subscriber_builder.model = TestSubscriber { event_tx: Some(tx) };
+
+        subscriber_builder.act_on::<CrateReceived>(|agent, envelope| {
+            let msg = envelope.message().clone();
+            if let Some(tx) = &agent.model.event_tx {
+                let _ = tx.send(msg);
+            }
+            AgentReply::immediate()
+        });
+
+        let subscriber = subscriber_builder.start().await;
+        subscriber.subscribe::<CrateReceived>().await;
+
+        // Start the server
+        handle.send(StartServer).await;
+        tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+
+        // Send HTTP POST request
+        let client = reqwest::Client::new();
+        let response = client
+            .post(format!("http://127.0.0.1:{}/crate", test_port))
+            .json(&serde_json::json!({
+                "name": "serde",
+                "version": "1.0.0",
+                "features": ["derive"]
+            }))
+            .send()
+            .await
+            .expect("HTTP request should succeed");
+
+        assert!(response.status().is_success(), "Should return 200 OK");
+
+        // Verify the event was broadcast and received by subscriber
+        let event = tokio::time::timeout(
+            tokio::time::Duration::from_secs(2),
+            rx.recv()
+        )
+        .await
+        .expect("Should receive event within timeout")
+        .expect("Channel should not be closed");
+
+        assert_eq!(event.specifier.name(), "serde");
+        assert_eq!(
+            event.specifier.version(),
+            &semver::Version::parse("1.0.0").unwrap()
+        );
+        assert_eq!(event.features, vec!["derive"]);
+
+        // Verify response format
+        let body: CrateResponse = response.json().await.expect("Should parse response");
+        assert_eq!(body.name, "serde");
+        assert_eq!(body.version, "1.0.0");
+        assert_eq!(body.features, vec!["derive"]);
+        assert!(
+            body.message.contains("processing initiated"),
+            "Message should indicate processing was initiated"
+        );
+
+        // Cleanup
+        handle.send(StopServer).await;
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+        subscriber.stop().await.expect("Should stop subscriber");
+        handle.stop().await.expect("Should stop server");
+        runtime
+            .shutdown_all()
+            .await
+            .expect("Runtime should shutdown");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_multiple_crate_requests_broadcast_multiple_events() {
+        let mut runtime = ActonApp::launch();
+        let test_port = 38294;
+        let config = Config {
+            port: test_port,
+            pipeline: crate::actors::config::PipelineConfig::default(),
+        };
+        let actors = Arc::new(DashMap::new());
+
+        let handle = ServerActor::spawn(&mut runtime, config, actors.clone())
+            .await
+            .expect("Should spawn server");
+
+        // Create a channel to receive events
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+
+        // Create test subscriber
+        let mut subscriber_builder = runtime.new_agent::<TestSubscriber>().await;
+
+        subscriber_builder.model = TestSubscriber { event_tx: Some(tx) };
+
+        subscriber_builder.act_on::<CrateReceived>(|agent, envelope| {
+            let msg = envelope.message().clone();
+            if let Some(tx) = &agent.model.event_tx {
+                let _ = tx.send(msg);
+            }
+            AgentReply::immediate()
+        });
+
+        let subscriber = subscriber_builder.start().await;
+        subscriber.subscribe::<CrateReceived>().await;
+
+        // Start server
+        handle.send(StartServer).await;
+        tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+
+        // Send multiple requests
+        let client = reqwest::Client::new();
+        let crates = vec![
+            ("serde", "1.0.0", vec!["derive"]),
+            ("tokio", "1.35.0", vec!["full"]),
+            ("axum", "0.7.0", vec!["macros"]),
+        ];
+
+        for (name, version, features) in &crates {
+            client
+                .post(format!("http://127.0.0.1:{}/crate", test_port))
+                .json(&serde_json::json!({
+                    "name": name,
+                    "version": version,
+                    "features": features
+                }))
+                .send()
+                .await
+                .expect("HTTP request should succeed");
+        }
+
+        // Collect all events
+        let mut received_events = Vec::new();
+        for _ in 0..3 {
+            let event = tokio::time::timeout(
+                tokio::time::Duration::from_secs(2),
+                rx.recv()
+            )
+            .await
+            .expect("Should receive event within timeout")
+            .expect("Channel should not be closed");
+            received_events.push(event);
+        }
+
+        // Verify all events were received
+        assert_eq!(
+            received_events.len(),
+            3,
+            "Should receive three CrateReceived events"
+        );
+
+        // Verify event details
+        let event_names: Vec<&str> = received_events
+            .iter()
+            .map(|e| e.specifier.name())
+            .collect();
+
+        assert!(event_names.contains(&"serde"));
+        assert!(event_names.contains(&"tokio"));
+        assert!(event_names.contains(&"axum"));
+
+        // Cleanup
+        handle.send(StopServer).await;
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+        subscriber.stop().await.expect("Should stop subscriber");
+        handle.stop().await.expect("Should stop server");
+        runtime
+            .shutdown_all()
+            .await
+            .expect("Runtime should shutdown");
+    }
+
+    /// Test helper actor for receiving CrateReceived events
+    #[acton_actor]
+    struct TestSubscriber {
+        event_tx: Option<tokio::sync::mpsc::UnboundedSender<CrateReceived>>,
     }
 }
