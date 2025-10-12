@@ -9,10 +9,10 @@ use crate::actors::retry_coordinator::ScheduleRetry;
 use crate::crate_specifier::CrateSpecifier;
 use crate::errors::{DownloadError, ExtractionError, PipelineError};
 use crate::messages::{
-    CheckProcessingTimeouts, CrateDownloadFailed, CrateDownloaded, CrateProcessingComplete,
-    CrateProcessingFailed, CrateReceived, DocChunkPersisted, DocumentationChunked,
-    DocumentationExtracted, DocumentationExtractionFailed, DocumentationVectorized,
-    EmbeddingPersisted,
+    CheckProcessingTimeouts, ChunksPersistenceComplete, CrateDownloadFailed, CrateDownloaded,
+    CrateProcessingComplete, CrateProcessingFailed, CrateReceived, DocChunkPersisted,
+    DocumentationChunked, DocumentationExtracted, DocumentationExtractionFailed,
+    DocumentationVectorized, EmbeddingPersisted, EmbeddingsPersistenceComplete,
 };
 use acton_reactive::prelude::*;
 use std::collections::{HashMap, HashSet};
@@ -91,6 +91,8 @@ pub struct CrateProcessingState {
     pub expected_vectors: Option<u32>,
     /// Set of chunk IDs for which embeddings have been persisted successfully
     pub persisted_vectors: HashSet<String>,
+    /// Embedding model name (captured from DocumentationVectorized)
+    pub embedding_model: Option<String>,
 }
 
 impl CrateProcessingState {
@@ -109,6 +111,7 @@ impl CrateProcessingState {
             persisted_chunks: HashSet::new(),
             expected_vectors: None,
             persisted_vectors: HashSet::new(),
+            embedding_model: None,
         }
     }
 
@@ -396,9 +399,22 @@ impl CrateCoordinatorActor {
                         debug!(
                             specifier = %specifier,
                             total_chunks = expected,
-                            "All chunks persisted, transitioning to vectorizing"
+                            "All chunks persisted, broadcasting completion and transitioning to vectorizing"
                         );
                         state.update_status(ProcessingStatus::Vectorizing);
+
+                        let specifier_clone = specifier.clone();
+                        let broker = agent.broker().clone();
+
+                        // Broadcast ChunksPersistenceComplete to notify DatabaseActor
+                        return AgentReply::from_async(async move {
+                            broker
+                                .broadcast(ChunksPersistenceComplete {
+                                    specifier: specifier_clone,
+                                    chunk_count: expected,
+                                })
+                                .await;
+                        });
                     }
                 }
             }
@@ -434,13 +450,13 @@ impl CrateCoordinatorActor {
                         debug!(
                             specifier = %specifier,
                             total_embeddings = expected,
-                            "All embeddings persisted, transitioning to complete"
+                            "All embeddings persisted, broadcasting completion and transitioning to complete"
                         );
-                        state.update_status(ProcessingStatus::Complete);
 
                         let total_duration_ms = state.total_duration_ms();
                         let features = state.features.clone();
                         let specifier_clone = specifier.clone();
+                        let embedding_model = state.embedding_model.clone().unwrap_or_else(|| "unknown".to_string());
 
                         info!(
                             specifier = %specifier,
@@ -448,10 +464,20 @@ impl CrateCoordinatorActor {
                             "Crate processing completed successfully"
                         );
 
+                        state.update_status(ProcessingStatus::Complete);
+
                         let broker = agent.broker().clone();
 
-                        // Broadcast completion event
+                        // Broadcast EmbeddingsPersistenceComplete first, then CrateProcessingComplete
                         return AgentReply::from_async(async move {
+                            broker
+                                .broadcast(EmbeddingsPersistenceComplete {
+                                    specifier: specifier_clone.clone(),
+                                    vector_count: expected,
+                                    embedding_model,
+                                })
+                                .await;
+
                             broker
                                 .broadcast(CrateProcessingComplete {
                                     specifier: specifier_clone,
@@ -476,10 +502,13 @@ impl CrateCoordinatorActor {
             if let Some(state) = agent.model.processing_states.get_mut(specifier) {
                 // Set expected vector count for persistence tracking
                 state.expected_vectors = Some(msg.vector_count);
+                // Store embedding model name for later broadcast
+                state.embedding_model = Some(msg.embedding_model.clone());
                 // Keep status as Vectorizing to track in-progress persistence
                 debug!(
                     specifier = %specifier,
                     vector_count = msg.vector_count,
+                    embedding_model = %msg.embedding_model,
                     status = ?state.status,
                     "Vectorization completed, waiting for embedding persistence"
                 );

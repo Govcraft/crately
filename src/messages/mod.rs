@@ -88,6 +88,7 @@
 //! ```
 
 mod check_processing_timeouts;
+mod chunks_persistence_complete;
 mod config_reload_failed;
 mod crate_downloaded;
 mod pipeline_config_changed;
@@ -107,6 +108,7 @@ mod documentation_extracted;
 mod documentation_extraction_failed;
 mod documentation_vectorized;
 mod embedding_persisted;
+mod embeddings_persistence_complete;
 mod init;
 mod key_pressed;
 mod keyboard_handler_started;
@@ -135,6 +137,7 @@ mod stop_keyboard_handler;
 mod stop_server;
 
 pub use check_processing_timeouts::CheckProcessingTimeouts;
+pub use chunks_persistence_complete::ChunksPersistenceComplete;
 pub use config_reload_failed::ConfigReloadFailed;
 pub use crate_downloaded::CrateDownloaded;
 pub use pipeline_config_changed::PipelineConfigChanged;
@@ -154,6 +157,7 @@ pub use documentation_extracted::DocumentationExtracted;
 pub use documentation_extraction_failed::{DocumentationExtractionFailed, ExtractionErrorKind};
 pub use documentation_vectorized::DocumentationVectorized;
 pub use embedding_persisted::EmbeddingPersisted;
+pub use embeddings_persistence_complete::EmbeddingsPersistenceComplete;
 pub use init::Init;
 pub use key_pressed::KeyPressed;
 pub(crate) use keyboard_handler_started::KeyboardHandlerStarted;

@@ -21,14 +21,11 @@ use crate::crate_specifier::CrateSpecifier;
 use crate::messages::{
     ChunksPersistenceComplete, CrateDownloadFailed, CrateDownloaded, CrateListResponse,
     CrateProcessingComplete, CrateProcessingFailed, CrateQueryResponse, CrateReceived,
-    CrateSummary, DatabaseError, DatabaseReady, DocChunkPersisted, DocumentationExtracted,
-    DocumentationExtractionFailed, EmbeddingPersisted, EmbeddingsPersistenceComplete, ListCrates,
-    PersistCodeSample, PersistCrate, PersistDocChunk, PersistEmbedding, PrintWarning, QueryCrate,
-    QuerySimilarDocs, SimilarDocsResponse,
+    CrateSummary, DatabaseError, DatabaseReady, DatabaseWarning, DocChunkPersisted,
+    DocumentationExtracted, DocumentationExtractionFailed, EmbeddingPersisted,
+    EmbeddingsPersistenceComplete, ListCrates, PersistCodeSample, PersistCrate, PersistDocChunk,
+    PersistEmbedding, PrintWarning, QueryCrate, QuerySimilarDocs, SimilarDocsResponse,
 };
-
-#[cfg(test)]
-use crate::messages::{DocumentationChunked, DocumentationVectorized};
 use crate::types::SearchResult;
 
 /// Information about the database connection returned at spawn time.
@@ -897,8 +894,8 @@ impl DatabaseActor {
             })
         });
 
-        // Handle ChunksPersistenceComplete - update status to chunked after confirmed persistence
-        builder.act_on::<ChunksPersistenceComplete>(|agent, envelope| {
+        // Handle DocumentationChunked - validate chunks exist, then update status
+        builder.act_on::<DocumentationChunked>(|agent, envelope| {
             let msg = envelope.message().clone();
             let db = agent.model.db.clone();
             let broker = agent.broker().clone();
@@ -906,35 +903,120 @@ impl DatabaseActor {
             AgentReply::from_async(async move {
                 let name = msg.specifier.name().to_string();
                 let version = msg.specifier.version().to_string();
-                let chunk_count = msg.chunk_count;
+                let expected_chunk_count = msg.chunk_count;
 
-                // Update status to 'chunked' - persistence already confirmed by CrateCoordinatorActor
-                let update_query = r#"
-                    UPDATE crate SET
-                        status = 'chunked',
-                        status_updated_at = time::now(),
-                        chunking_completed_at = time::now()
-                    WHERE name = $name AND version = $version
+                // VALIDATION: Verify doc_chunks actually exist before updating status
+                let validation_query = r#"
+                    SELECT VALUE count() FROM doc_chunk
+                    WHERE crate_id.name = $name AND crate_id.version = $version
                 "#;
 
                 match db
-                    .query(update_query)
+                    .query(validation_query)
                     .bind(("name", name.clone()))
                     .bind(("version", version.clone()))
                     .await
                 {
-                    Ok(_) => {
-                        debug!(
-                            "Updated crate status to chunked: {}@{} ({} chunks confirmed)",
-                            name, version, chunk_count
-                        );
+                    Ok(mut response) => {
+                        let actual_count: Result<Option<i64>, _> = response.take(0);
+
+                        match actual_count {
+                            Ok(Some(count)) if count > 0 && count == expected_chunk_count as i64 => {
+                                // Validation passed - chunks exist and count matches
+                                let update_query = r#"
+                                    UPDATE crate SET
+                                        status = 'chunked',
+                                        status_updated_at = time::now(),
+                                        chunking_completed_at = time::now()
+                                    WHERE name = $name AND version = $version
+                                "#;
+
+                                match db
+                                    .query(update_query)
+                                    .bind(("name", name.clone()))
+                                    .bind(("version", version.clone()))
+                                    .await
+                                {
+                                    Ok(_) => {
+                                        debug!(
+                                            "Updated crate status to chunked: {}@{} ({} chunks validated)",
+                                            name, version, count
+                                        );
+                                    }
+                                    Err(e) => {
+                                        error!("Failed to update crate chunking status: {}", e);
+                                        broker
+                                            .broadcast(DatabaseError {
+                                                operation: format!(
+                                                    "update chunking status for {}@{}",
+                                                    name, version
+                                                ),
+                                                error: e.to_string(),
+                                            })
+                                            .await;
+                                    }
+                                }
+                            }
+                            Ok(None) | Ok(Some(0)) => {
+                                // No chunks found - validation failed
+                                let warning_msg = format!(
+                                    "No doc_chunks found in database (expected {})",
+                                    expected_chunk_count
+                                );
+                                warn!(
+                                    "Cannot update {}@{} to 'chunked' status: {}",
+                                    name, version, warning_msg
+                                );
+                                broker
+                                    .broadcast(DatabaseWarning {
+                                        operation: format!(
+                                            "validate chunking for {}@{}",
+                                            name, version
+                                        ),
+                                        warning: warning_msg,
+                                    })
+                                    .await;
+                            }
+                            Ok(Some(count)) => {
+                                // Chunks exist but count mismatch
+                                let warning_msg = format!(
+                                    "Chunk count mismatch: expected {}, found {} chunks in database",
+                                    expected_chunk_count, count
+                                );
+                                warn!(
+                                    "Cannot update {}@{} to 'chunked' status: {}",
+                                    name, version, warning_msg
+                                );
+                                broker
+                                    .broadcast(DatabaseWarning {
+                                        operation: format!(
+                                            "validate chunking for {}@{}",
+                                            name, version
+                                        ),
+                                        warning: warning_msg,
+                                    })
+                                    .await;
+                            }
+                            Err(e) => {
+                                error!("Failed to validate chunks for {}@{}: {}", name, version, e);
+                                broker
+                                    .broadcast(DatabaseError {
+                                        operation: format!(
+                                            "validate chunking for {}@{}",
+                                            name, version
+                                        ),
+                                        error: e.to_string(),
+                                    })
+                                    .await;
+                            }
+                        }
                     }
                     Err(e) => {
-                        error!("Failed to update crate chunking status: {}", e);
+                        error!("Failed to query chunk count for {}@{}: {}", name, version, e);
                         broker
                             .broadcast(DatabaseError {
                                 operation: format!(
-                                    "update chunking status for {}@{}",
+                                    "validate chunking for {}@{}",
                                     name, version
                                 ),
                                 error: e.to_string(),
@@ -945,8 +1027,8 @@ impl DatabaseActor {
             })
         });
 
-        // Handle EmbeddingsPersistenceComplete - update status to vectorized after confirmed persistence
-        builder.act_on::<EmbeddingsPersistenceComplete>(|agent, envelope| {
+        // Handle DocumentationVectorized - validate embeddings exist, then update status
+        builder.act_on::<DocumentationVectorized>(|agent, envelope| {
             let msg = envelope.message().clone();
             let db = agent.model.db.clone();
             let broker = agent.broker().clone();
@@ -954,36 +1036,121 @@ impl DatabaseActor {
             AgentReply::from_async(async move {
                 let name = msg.specifier.name().to_string();
                 let version = msg.specifier.version().to_string();
-                let vector_count = msg.vector_count;
+                let expected_vector_count = msg.vector_count;
                 let embedding_model = msg.embedding_model.clone();
 
-                // Update status to 'vectorized' - persistence already confirmed by CrateCoordinatorActor
-                let update_query = r#"
-                    UPDATE crate SET
-                        status = 'vectorized',
-                        status_updated_at = time::now(),
-                        vectorization_completed_at = time::now()
-                    WHERE name = $name AND version = $version
+                // VALIDATION: Verify embeddings actually exist before updating status
+                let validation_query = r#"
+                    SELECT VALUE count() FROM embedding
+                    WHERE crate_id.name = $name AND crate_id.version = $version
                 "#;
 
                 match db
-                    .query(update_query)
+                    .query(validation_query)
                     .bind(("name", name.clone()))
                     .bind(("version", version.clone()))
                     .await
                 {
-                    Ok(_) => {
-                        debug!(
-                            "Updated crate status to vectorized: {}@{} ({} embeddings confirmed, model: {})",
-                            name, version, vector_count, embedding_model
-                        );
+                    Ok(mut response) => {
+                        let actual_count: Result<Option<i64>, _> = response.take(0);
+
+                        match actual_count {
+                            Ok(Some(count)) if count > 0 && count == expected_vector_count as i64 => {
+                                // Validation passed - embeddings exist and count matches
+                                let update_query = r#"
+                                    UPDATE crate SET
+                                        status = 'vectorized',
+                                        status_updated_at = time::now(),
+                                        vectorization_completed_at = time::now()
+                                    WHERE name = $name AND version = $version
+                                "#;
+
+                                match db
+                                    .query(update_query)
+                                    .bind(("name", name.clone()))
+                                    .bind(("version", version.clone()))
+                                    .await
+                                {
+                                    Ok(_) => {
+                                        debug!(
+                                            "Updated crate status to vectorized: {}@{} ({} embeddings validated, model: {})",
+                                            name, version, count, embedding_model
+                                        );
+                                    }
+                                    Err(e) => {
+                                        error!("Failed to update crate vectorization status: {}", e);
+                                        broker
+                                            .broadcast(DatabaseError {
+                                                operation: format!(
+                                                    "update vectorization status for {}@{}",
+                                                    name, version
+                                                ),
+                                                error: e.to_string(),
+                                            })
+                                            .await;
+                                    }
+                                }
+                            }
+                            Ok(None) | Ok(Some(0)) => {
+                                // No embeddings found - validation failed
+                                let warning_msg = format!(
+                                    "No embeddings found in database (expected {})",
+                                    expected_vector_count
+                                );
+                                warn!(
+                                    "Cannot update {}@{} to 'vectorized' status: {}",
+                                    name, version, warning_msg
+                                );
+                                broker
+                                    .broadcast(DatabaseWarning {
+                                        operation: format!(
+                                            "validate vectorization for {}@{}",
+                                            name, version
+                                        ),
+                                        warning: warning_msg,
+                                    })
+                                    .await;
+                            }
+                            Ok(Some(count)) => {
+                                // Embeddings exist but count mismatch
+                                let warning_msg = format!(
+                                    "Embedding count mismatch: expected {}, found {} embeddings in database",
+                                    expected_vector_count, count
+                                );
+                                warn!(
+                                    "Cannot update {}@{} to 'vectorized' status: {}",
+                                    name, version, warning_msg
+                                );
+                                broker
+                                    .broadcast(DatabaseWarning {
+                                        operation: format!(
+                                            "validate vectorization for {}@{}",
+                                            name, version
+                                        ),
+                                        warning: warning_msg,
+                                    })
+                                    .await;
+                            }
+                            Err(e) => {
+                                error!("Failed to validate embeddings for {}@{}: {}", name, version, e);
+                                broker
+                                    .broadcast(DatabaseError {
+                                        operation: format!(
+                                            "validate vectorization for {}@{}",
+                                            name, version
+                                        ),
+                                        error: e.to_string(),
+                                    })
+                                    .await;
+                            }
+                        }
                     }
                     Err(e) => {
-                        error!("Failed to update crate vectorization status: {}", e);
+                        error!("Failed to query embedding count for {}@{}: {}", name, version, e);
                         broker
                             .broadcast(DatabaseError {
                                 operation: format!(
-                                    "update vectorization status for {}@{}",
+                                    "validate vectorization for {}@{}",
                                     name, version
                                 ),
                                 error: e.to_string(),
@@ -993,7 +1160,6 @@ impl DatabaseActor {
                 }
             })
         });
-
 
         // Handle CrateProcessingComplete - validate full pipeline, then update final status
         builder.act_on::<CrateProcessingComplete>(|agent, envelope| {
