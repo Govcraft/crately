@@ -42,6 +42,76 @@ pub struct DatabaseInfo {
     pub database: String,
 }
 
+/// Response structure for queries that return only a crate record ID.
+///
+/// SurrealDB returns record IDs as `Thing` types (table + id enum), which cannot
+/// be directly deserialized into `serde_json::Value`. This struct properly handles
+/// the `Thing` type and provides convenient access to the ID as a string.
+///
+/// # Example
+///
+/// ```rust,ignore
+/// let query = "SELECT id FROM crate WHERE name = $name AND version = $version";
+/// let mut response = db.query(query).bind(params).await?;
+/// let record: Option<CrateIdRecord> = response.take(0)?;
+/// if let Some(rec) = record {
+///     let id = rec.thing(); // Use the Thing directly in queries
+/// }
+/// ```
+#[derive(Debug, Clone, serde::Deserialize)]
+struct CrateIdRecord {
+    /// The SurrealDB record ID (Thing type: table name + record identifier)
+    id: surrealdb::sql::Thing,
+}
+
+impl CrateIdRecord {
+    /// Extract the record ID as a string in SurrealDB format (e.g., "crate:xyz123")
+    #[allow(dead_code)]
+    fn id_string(&self) -> String {
+        self.id.to_string()
+    }
+
+    /// Get a reference to the Thing for use in queries
+    fn thing(&self) -> &surrealdb::sql::Thing {
+        &self.id
+    }
+}
+
+/// Response structure for queries that return only a doc_chunk record ID.
+///
+/// SurrealDB returns record IDs as `Thing` types (table + id enum), which cannot
+/// be directly deserialized into `serde_json::Value`. This struct properly handles
+/// the `Thing` type and provides convenient access to the ID as a string.
+///
+/// # Example
+///
+/// ```rust,ignore
+/// let query = "SELECT id FROM doc_chunk WHERE chunk_id = $chunk_id";
+/// let mut response = db.query(query).bind(params).await?;
+/// let record: Option<DocChunkIdRecord> = response.take(0)?;
+/// if let Some(rec) = record {
+///     let id = rec.thing(); // Use the Thing directly in queries
+/// }
+/// ```
+#[derive(Debug, Clone, serde::Deserialize)]
+struct DocChunkIdRecord {
+    /// The SurrealDB record ID (Thing type: table name + record identifier)
+    id: surrealdb::sql::Thing,
+}
+
+impl DocChunkIdRecord {
+    /// Extract the record ID as a string in SurrealDB format (e.g., "doc_chunk:xyz123")
+    #[allow(dead_code)]
+    fn id_string(&self) -> String {
+        self.id.to_string()
+    }
+
+    /// Get a reference to the Thing for use in queries
+    fn thing(&self) -> &surrealdb::sql::Thing {
+        &self.id
+    }
+}
+
 /// DatabaseActor manages the embedded SurrealDB lifecycle and persistence operations.
 ///
 /// This actor handles:
@@ -1307,12 +1377,12 @@ impl DatabaseActor {
                     .await
                 {
                     Ok(mut response) => {
-                        let crate_id: Result<Option<serde_json::Value>, _> = response.take(0);
+                        let crate_record: Result<Option<CrateIdRecord>, _> = response.take(0);
 
-                        match crate_id {
-                            Ok(Some(crate_record)) => {
-                                if let Some(id) = crate_record.get("id") {
-                                    // Upsert pattern: Try UPDATE first, then INSERT if no rows affected
+                        match crate_record {
+                            Ok(Some(record)) => {
+                                let id = record.thing();
+                                // Upsert pattern: Try UPDATE first, then INSERT if no rows affected
                                     let update_query = r#"
                                         UPDATE doc_chunk SET
                                             content = $content,
@@ -1438,9 +1508,6 @@ impl DatabaseActor {
                                             chunk_index: msg.chunk_index,
                                         })
                                         .await;
-                                } else {
-                                    error!("Crate record missing id field");
-                                }
                             }
                             Ok(None) => {
                                 error!("Crate not found for chunk: {}@{}", name, version);
@@ -1499,32 +1566,8 @@ impl DatabaseActor {
                     .await
                 {
                     Ok(mut chunk_response) => {
-                        match chunk_response.take::<Option<serde_json::Value>>(0) {
-                            Ok(Some(chunk_record)) => {
-                                // Extract the database ID from the chunk record
-                                match chunk_record.get("id") {
-                                    Some(id) => id.clone(),
-                                    None => {
-                                        error!(
-                                            "Chunk record missing 'id' field for chunk_id: {} (crate: {}@{})",
-                                            chunk_id, name, version
-                                        );
-                                        broker
-                                            .broadcast(DatabaseError {
-                                                operation: format!(
-                                                    "persist embedding for chunk {} (crate: {}@{})",
-                                                    chunk_id, name, version
-                                                ),
-                                                error: format!(
-                                                    "Chunk record for '{}' is malformed (missing 'id' field)",
-                                                    chunk_id
-                                                ),
-                                            })
-                                            .await;
-                                        return;
-                                    }
-                                }
-                            }
+                        match chunk_response.take::<Option<DocChunkIdRecord>>(0) {
+                            Ok(Some(record)) => record.thing().clone(),
                             Ok(None) => {
                                 // Chunk not found - this is the key scenario we're improving
                                 let warning_msg = format!(
@@ -1609,31 +1652,8 @@ impl DatabaseActor {
                     .await
                 {
                     Ok(mut crate_response) => {
-                        match crate_response.take::<Option<serde_json::Value>>(0) {
-                            Ok(Some(crate_record)) => {
-                                match crate_record.get("id") {
-                                    Some(id) => id.clone(),
-                                    None => {
-                                        error!(
-                                            "Crate record missing 'id' field for crate: {}@{} (chunk: {})",
-                                            name, version, chunk_id
-                                        );
-                                        broker
-                                            .broadcast(DatabaseError {
-                                                operation: format!(
-                                                    "persist embedding for chunk {} (crate: {}@{})",
-                                                    chunk_id, name, version
-                                                ),
-                                                error: format!(
-                                                    "Crate record for '{}@{}' is malformed (missing 'id' field)",
-                                                    name, version
-                                                ),
-                                            })
-                                            .await;
-                                        return;
-                                    }
-                                }
-                            }
+                        match crate_response.take::<Option<CrateIdRecord>>(0) {
+                            Ok(Some(record)) => record.thing().clone(),
                             Ok(None) => {
                                 let warning_msg = format!(
                                     "Cannot persist embedding: crate {}@{} not found in database (chunk: {})",
@@ -1844,12 +1864,12 @@ impl DatabaseActor {
                     .await
                 {
                     Ok(mut response) => {
-                        let crate_id: Result<Option<serde_json::Value>, _> = response.take(0);
+                        let crate_record: Result<Option<CrateIdRecord>, _> = response.take(0);
 
-                        match crate_id {
-                            Ok(Some(crate_record)) => {
-                                if let Some(id) = crate_record.get("id") {
-                                    let insert_query = r#"
+                        match crate_record {
+                            Ok(Some(record)) => {
+                                let id = record.thing();
+                                let insert_query = r#"
                                         CREATE code_sample CONTENT {
                                             crate_id: $crate_id,
                                             sample_index: $sample_index,
@@ -1897,9 +1917,6 @@ impl DatabaseActor {
                                                 .await;
                                         }
                                     }
-                                } else {
-                                    error!("Crate record missing id field");
-                                }
                             }
                             Ok(None) => {
                                 error!("Crate not found for code sample: {}@{}", name, version);
@@ -2269,6 +2286,11 @@ impl DatabaseActor {
         });
 
         let handle = builder.start().await;
+
+        // Subscribe to persistence messages broadcasted from other actors
+        handle.subscribe::<PersistDocChunk>().await;
+        handle.subscribe::<PersistEmbedding>().await;
+
         let db_info = DatabaseInfo {
             db_path,
             namespace,
