@@ -13,7 +13,7 @@
 //! - **Core Actors** (initialized in `ActorSystem::initialize()`):
 //!   - [`Console`](console::Console) - Output formatting actor
 //!   - [`ConfigManager`](config::ConfigManager) - Configuration management with hot-reload
-//!   - [`CrateDownloader`](crate_downloader::CrateDownloader) - Crate download orchestration
+//!   - [`DownloaderActor`](downloader_actor::DownloaderActor) - Stateless crate download worker
 //!   - [`DatabaseActor`](database::DatabaseActor) - SurrealDB persistence management
 //!
 //! - **Server Actors** (initialized in `ActorSystem::initialize_server_actors()`):
@@ -22,8 +22,8 @@
 
 pub mod config;
 pub mod console;
-pub mod crate_downloader;
 pub mod database;
+pub mod downloader_actor;
 pub mod keyboard_handler;
 pub mod retry_coordinator;
 pub mod server_actor;

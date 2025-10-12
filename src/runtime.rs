@@ -46,8 +46,8 @@ use crate::{
     actors::{
         config::{Config, ConfigManager},
         console::Console,
-        crate_downloader::CrateDownloader,
         database::DatabaseActor,
+        downloader_actor::DownloaderActor,
         server_actor::ServerActor,
     },
     colors::ColorConfig,
@@ -77,7 +77,7 @@ use crate::actors::keyboard_handler::KeyboardHandler;
 /// - `"console"` - Console output formatting actor
 /// - `"config_manager"` - Configuration management actor
 /// - `"database"` - Database persistence actor
-/// - `"crate_downloader"` - Crate download orchestration actor
+/// - `"downloader"` - Stateless crate download worker actor
 /// - `"keyboard_handler"` - Keyboard event handler actor (server mode only)
 /// - `"server"` - HTTP server actor (server mode only)
 pub struct ActorSystem {
@@ -178,12 +178,12 @@ impl ActorSystem {
             )))
             .await;
 
-        // Spawn CrateDownloader actor
-        let crate_downloader = CrateDownloader::spawn(&mut runtime)
+        // Spawn DownloaderActor with configuration
+        let downloader = DownloaderActor::spawn(&mut runtime, config.pipeline.download.clone())
             .await
-            .context("Failed to spawn CrateDownloader actor")?;
+            .context("Failed to spawn DownloaderActor")?;
 
-        actors.insert("crate_downloader".to_string(), crate_downloader.clone());
+        actors.insert("downloader".to_string(), downloader.clone());
 
         Ok(Self {
             runtime,
@@ -586,12 +586,12 @@ impl ActorSystem {
             }
         }
 
-        // Stop CrateDownloader actor
-        if let Some(crate_downloader) = self.get_actor("crate_downloader") {
-            match crate_downloader.stop().await {
+        // Stop DownloaderActor
+        if let Some(downloader) = self.get_actor("downloader") {
+            match downloader.stop().await {
                 Ok(()) => {}
                 Err(e) => {
-                    error!("Failed to stop CrateDownloader actor: {:?}", e);
+                    error!("Failed to stop DownloaderActor: {:?}", e);
                 }
             }
         }
@@ -714,12 +714,12 @@ impl ActorSystem {
             )))
             .await;
 
-        // Spawn CrateDownloader actor
-        let crate_downloader = CrateDownloader::spawn(&mut runtime)
+        // Spawn DownloaderActor with test configuration
+        let downloader = DownloaderActor::spawn(&mut runtime, config.pipeline.download.clone())
             .await
-            .context("Failed to spawn CrateDownloader actor")?;
+            .context("Failed to spawn DownloaderActor")?;
 
-        actors.insert("crate_downloader".to_string(), crate_downloader.clone());
+        actors.insert("downloader".to_string(), downloader.clone());
 
         Ok(Self {
             runtime,
@@ -784,8 +784,8 @@ mod tests {
                 "DatabaseActor should be registered"
             );
             assert!(
-                system.get_actor("crate_downloader").is_some(),
-                "CrateDownloader actor should be registered"
+                system.get_actor("downloader").is_some(),
+                "DownloaderActor should be registered"
             );
 
             system.shutdown().await.expect("Shutdown should succeed");
@@ -974,7 +974,7 @@ mod tests {
                 .expect("Initialization should succeed");
 
             // Manually remove an actor to simulate an edge case
-            system.actors.remove("crate_downloader");
+            system.actors.remove("downloader");
 
             // Shutdown should still succeed even with missing actor
             system.shutdown().await.expect("Shutdown should succeed");
