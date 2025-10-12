@@ -129,6 +129,7 @@ impl FileReaderActor {
                                 features: msg.features,
                                 documentation_bytes,
                                 file_count,
+                                extracted_path: msg.extracted_path,
                             })
                             .await;
                     }

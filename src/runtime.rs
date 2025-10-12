@@ -48,6 +48,8 @@ use crate::{
         console::Console,
         database::DatabaseActor,
         downloader_actor::DownloaderActor,
+        file_reader_actor::FileReaderActor,
+        processor_actor::ProcessorActor,
         server_actor::ServerActor,
     },
     colors::ColorConfig,
@@ -78,6 +80,8 @@ use crate::actors::keyboard_handler::KeyboardHandler;
 /// - `"config_manager"` - Configuration management actor
 /// - `"database"` - Database persistence actor
 /// - `"downloader"` - Stateless crate download worker actor
+/// - `"file_reader"` - Stateless documentation extraction worker actor
+/// - `"processor"` - Stateless documentation chunking worker actor
 /// - `"keyboard_handler"` - Keyboard event handler actor (server mode only)
 /// - `"server"` - HTTP server actor (server mode only)
 pub struct ActorSystem {
@@ -99,8 +103,10 @@ impl ActorSystem {
     /// 2. Spawns the Console actor and triggers initialization
     /// 3. Spawns the ConfigManager actor and loads configuration
     /// 4. Spawns the DatabaseActor for persistence operations
-    /// 5. Spawns the CrateDownloader actor
-    /// 6. Stores all actor handles in the registry
+    /// 5. Spawns the DownloaderActor for crate downloads
+    /// 6. Spawns the FileReaderActor for documentation extraction
+    /// 7. Spawns the ProcessorActor for documentation chunking
+    /// 8. Stores all actor handles in the registry
     ///
     /// # Arguments
     ///
@@ -184,6 +190,20 @@ impl ActorSystem {
             .context("Failed to spawn DownloaderActor")?;
 
         actors.insert("downloader".to_string(), downloader.clone());
+
+        // Spawn FileReaderActor with configuration
+        let file_reader = FileReaderActor::spawn(&mut runtime, config.pipeline.read.clone())
+            .await
+            .context("Failed to spawn FileReaderActor")?;
+
+        actors.insert("file_reader".to_string(), file_reader.clone());
+
+        // Spawn ProcessorActor with configuration
+        let processor = ProcessorActor::spawn(&mut runtime, config.pipeline.process.clone())
+            .await
+            .context("Failed to spawn ProcessorActor")?;
+
+        actors.insert("processor".to_string(), processor.clone());
 
         Ok(Self {
             runtime,
@@ -525,12 +545,14 @@ impl ActorSystem {
     /// This method performs a clean shutdown sequence:
     /// 1. Stops ServerActor (if running) - gracefully stop accepting requests
     /// 2. Stops KeyboardHandler (if running) - stop listening for input
-    /// 3. Stops CrateDownloader actor - finish any pending work
-    /// 4. Stops DatabaseActor - close database connections
-    /// 5. Stops ConfigManager actor - finish any pending work
-    /// 6. Stops Console actor - last so logging works throughout
-    /// 7. Clears actor registry
-    /// 8. Shuts down the acton-reactive runtime
+    /// 3. Stops ProcessorActor - finish any pending work
+    /// 4. Stops FileReaderActor - finish any pending work
+    /// 5. Stops DownloaderActor - finish any pending work
+    /// 6. Stops DatabaseActor - close database connections
+    /// 7. Stops ConfigManager actor - finish any pending work
+    /// 8. Stops Console actor - last so logging works throughout
+    /// 9. Clears actor registry
+    /// 10. Shuts down the acton-reactive runtime
     ///
     /// The shutdown order ensures that the server stops first, followed by
     /// supporting actors, with logging remaining available until all other
@@ -582,6 +604,26 @@ impl ActorSystem {
                     Err(e) => {
                         error!("Failed to stop KeyboardHandler: {:?}", e);
                     }
+                }
+            }
+        }
+
+        // Stop ProcessorActor
+        if let Some(processor) = self.get_actor("processor") {
+            match processor.stop().await {
+                Ok(()) => {}
+                Err(e) => {
+                    error!("Failed to stop ProcessorActor: {:?}", e);
+                }
+            }
+        }
+
+        // Stop FileReaderActor
+        if let Some(file_reader) = self.get_actor("file_reader") {
+            match file_reader.stop().await {
+                Ok(()) => {}
+                Err(e) => {
+                    error!("Failed to stop FileReaderActor: {:?}", e);
                 }
             }
         }
@@ -721,6 +763,20 @@ impl ActorSystem {
 
         actors.insert("downloader".to_string(), downloader.clone());
 
+        // Spawn FileReaderActor with test configuration
+        let file_reader = FileReaderActor::spawn(&mut runtime, config.pipeline.read.clone())
+            .await
+            .context("Failed to spawn FileReaderActor")?;
+
+        actors.insert("file_reader".to_string(), file_reader.clone());
+
+        // Spawn ProcessorActor with test configuration
+        let processor = ProcessorActor::spawn(&mut runtime, config.pipeline.process.clone())
+            .await
+            .context("Failed to spawn ProcessorActor")?;
+
+        actors.insert("processor".to_string(), processor.clone());
+
         Ok(Self {
             runtime,
             actors,
@@ -786,6 +842,14 @@ mod tests {
             assert!(
                 system.get_actor("downloader").is_some(),
                 "DownloaderActor should be registered"
+            );
+            assert!(
+                system.get_actor("file_reader").is_some(),
+                "FileReaderActor should be registered"
+            );
+            assert!(
+                system.get_actor("processor").is_some(),
+                "ProcessorActor should be registered"
             );
 
             system.shutdown().await.expect("Shutdown should succeed");
@@ -920,7 +984,7 @@ mod tests {
                 .expect("Initialization should succeed");
 
             let actors = system.actors();
-            assert_eq!(actors.len(), 4, "Should have exactly 4 actors registered");
+            assert_eq!(actors.len(), 6, "Should have exactly 6 actors registered");
 
             system.shutdown().await.expect("Shutdown should succeed");
 
@@ -945,7 +1009,7 @@ mod tests {
                 .expect("Initialization should succeed");
 
             let actors_before = system.actors();
-            assert_eq!(actors_before.len(), 4, "Should start with 4 actors");
+            assert_eq!(actors_before.len(), 6, "Should start with 6 actors");
 
             // Shutdown should succeed and clean up
             system.shutdown().await.expect("Shutdown should succeed");
@@ -1059,8 +1123,8 @@ mod tests {
             let actors = system.actors();
             assert_eq!(
                 actors.len(),
-                5,
-                "Should have exactly 5 actors (4 core + 1 server, keyboard_handler skipped in tests)"
+                7,
+                "Should have exactly 7 actors (6 core + 1 server, keyboard_handler skipped in tests)"
             );
 
             system.shutdown().await.expect("Shutdown should succeed");

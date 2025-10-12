@@ -165,6 +165,7 @@ async fn test_full_pipeline_status_transitions() {
                 features: vec!["full".to_string()],
                 file_count: 150,
                 documentation_bytes: 524288,
+                extracted_path: PathBuf::from("/tmp/tokio-1.35.0"),
             })
             .await;
 

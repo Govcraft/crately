@@ -15,6 +15,7 @@
 //!   - [`ConfigManager`](config::ConfigManager) - Configuration management with hot-reload
 //!   - [`DownloaderActor`](downloader_actor::DownloaderActor) - Stateless crate download worker
 //!   - [`FileReaderActor`](file_reader_actor::FileReaderActor) - Stateless documentation extraction worker
+//!   - [`ProcessorActor`](processor_actor::ProcessorActor) - Stateless documentation chunking worker
 //!   - [`DatabaseActor`](database::DatabaseActor) - SurrealDB persistence management
 //!
 //! - **Server Actors** (initialized in `ActorSystem::initialize_server_actors()`):
@@ -27,5 +28,6 @@ pub mod database;
 pub mod downloader_actor;
 pub mod file_reader_actor;
 pub mod keyboard_handler;
+pub mod processor_actor;
 pub mod retry_coordinator;
 pub mod server_actor;

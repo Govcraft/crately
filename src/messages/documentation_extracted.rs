@@ -2,6 +2,7 @@
 
 use acton_reactive::prelude::*;
 use crate::crate_specifier::CrateSpecifier;
+use std::path::PathBuf;
 
 /// Event broadcast when documentation is extracted from a downloaded crate.
 ///
@@ -15,6 +16,7 @@ use crate::crate_specifier::CrateSpecifier;
 /// * `features` - Feature flags for this crate
 /// * `documentation_bytes` - Total bytes of documentation extracted
 /// * `file_count` - Number of documentation files processed
+/// * `extracted_path` - Path to the extracted crate directory for re-reading files
 ///
 /// # Message Flow
 ///
@@ -39,6 +41,7 @@ use crate::crate_specifier::CrateSpecifier;
 /// use crately::messages::DocumentationExtracted;
 /// use crately::crate_specifier::CrateSpecifier;
 /// use std::str::FromStr;
+/// use std::path::PathBuf;
 ///
 /// let specifier = CrateSpecifier::from_str("axum@0.7.0").unwrap();
 /// let event = DocumentationExtracted {
@@ -46,6 +49,7 @@ use crate::crate_specifier::CrateSpecifier;
 ///     features: vec!["macros".to_string()],
 ///     documentation_bytes: 46080,  // 45KB
 ///     file_count: 15,
+///     extracted_path: PathBuf::from("/tmp/crately/axum-0.7.0"),
 /// };
 /// // broker.broadcast(event).await;
 /// ```
@@ -59,6 +63,8 @@ pub struct DocumentationExtracted {
     pub documentation_bytes: u64,
     /// Number of files processed
     pub file_count: u32,
+    /// Path to the extracted crate directory for re-reading files
+    pub extracted_path: PathBuf,
 }
 
 #[cfg(test)]
@@ -69,30 +75,36 @@ mod tests {
     #[test]
     fn test_message_creation() {
         let specifier = CrateSpecifier::from_str("serde@1.0.0").unwrap();
+        let extracted_path = PathBuf::from("/tmp/serde-1.0.0");
         let message = DocumentationExtracted {
             specifier: specifier.clone(),
             features: vec!["derive".to_string()],
             documentation_bytes: 50000,
             file_count: 10,
+            extracted_path: extracted_path.clone(),
         };
         assert_eq!(message.specifier, specifier);
         assert_eq!(message.documentation_bytes, 50000);
         assert_eq!(message.file_count, 10);
+        assert_eq!(message.extracted_path, extracted_path);
     }
 
     #[test]
     fn test_message_clone() {
         let specifier = CrateSpecifier::from_str("tokio@1.0.0").unwrap();
+        let extracted_path = PathBuf::from("/tmp/tokio-1.0.0");
         let message = DocumentationExtracted {
             specifier,
             features: vec![],
             documentation_bytes: 100000,
             file_count: 20,
+            extracted_path,
         };
         let cloned = message.clone();
         assert_eq!(message.specifier, cloned.specifier);
         assert_eq!(message.documentation_bytes, cloned.documentation_bytes);
         assert_eq!(message.file_count, cloned.file_count);
+        assert_eq!(message.extracted_path, cloned.extracted_path);
     }
 
     #[test]
@@ -103,6 +115,7 @@ mod tests {
             features: vec![],
             documentation_bytes: 46080,
             file_count: 15,
+            extracted_path: PathBuf::from("/tmp/axum-0.7.0"),
         };
         let debug_str = format!("{:?}", message);
         assert!(debug_str.contains("DocumentationExtracted"));
@@ -124,6 +137,7 @@ mod tests {
             features: vec![],
             documentation_bytes: 123456,
             file_count: 25,
+            extracted_path: PathBuf::from("/tmp/tracing-0.1.0"),
         };
         assert_eq!(message.documentation_bytes, 123456);
         assert!(message.documentation_bytes > 0);
@@ -137,6 +151,7 @@ mod tests {
             features: vec![],
             documentation_bytes: 0,
             file_count: 0, // Edge case: no files found
+            extracted_path: PathBuf::from("/tmp/anyhow-1.0.0"),
         };
         assert_eq!(message.file_count, 0);
         assert_eq!(message.documentation_bytes, 0);
@@ -150,6 +165,7 @@ mod tests {
             features: vec![],
             documentation_bytes: u64::MAX, // Very large documentation
             file_count: 1000,
+            extracted_path: PathBuf::from("/tmp/huge-crate-1.0.0"),
         };
         assert_eq!(message.documentation_bytes, u64::MAX);
         assert_eq!(message.file_count, 1000);
