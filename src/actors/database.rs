@@ -224,12 +224,48 @@ impl DatabaseActor {
             let broker = agent.broker().clone();
 
             Box::pin(async move {
-                // Create the record data
+                let name = msg.specifier.name().to_string();
+                let version = msg.specifier.version().to_string();
+
+                // Step 1: Clean up any existing chunks/embeddings for idempotency
+                // This ensures reprocessing doesn't create duplicates
+                let cleanup_query = r#"
+                    -- First, delete embeddings that reference chunks for this crate
+                    DELETE embedding WHERE crate_id.name = $name AND crate_id.version = $version;
+                    -- Then delete the doc chunks themselves
+                    DELETE doc_chunk WHERE crate_id.name = $name AND crate_id.version = $version;
+                    -- Also delete any code samples
+                    DELETE code_sample WHERE crate_id.name = $name AND crate_id.version = $version;
+                "#;
+
+                match db
+                    .query(cleanup_query)
+                    .bind(("name", name.clone()))
+                    .bind(("version", version.clone()))
+                    .await
+                {
+                    Ok(_) => {
+                        debug!(
+                            "Cleaned up existing chunks/embeddings for {}@{} before reprocessing",
+                            name, version
+                        );
+                    }
+                    Err(e) => {
+                        // Log warning but continue - cleanup failure shouldn't block new processing
+                        warn!(
+                            "Failed to cleanup existing data for {}@{}: {}",
+                            name, version, e
+                        );
+                    }
+                }
+
+                // Step 2: Create or update the crate record
                 let record_data = serde_json::json!({
-                    "name": msg.specifier.name(),
-                    "version": msg.specifier.version().to_string(),
+                    "name": name,
+                    "version": version,
                     "features": msg.features,
                     "status": "pending",
+                    "requested_at": "time::now()",
                 });
 
                 // Execute the create statement
@@ -241,8 +277,8 @@ impl DatabaseActor {
                     Ok(_) => {
                         debug!(
                             "Persisted crate: {}@{}",
-                            msg.specifier.name(),
-                            msg.specifier.version()
+                            name,
+                            version
                         );
                     }
                     Err(e) => {
@@ -251,8 +287,8 @@ impl DatabaseActor {
                             .broadcast(DatabaseError {
                                 operation: format!(
                                     "persist crate {}@{}",
-                                    msg.specifier.name(),
-                                    msg.specifier.version()
+                                    name,
+                                    version
                                 ),
                                 error: e.to_string(),
                             })
@@ -1250,7 +1286,7 @@ impl DatabaseActor {
             })
         });
 
-        // Handle PersistDocChunk - insert documentation chunk
+        // Handle PersistDocChunk - upsert documentation chunk (idempotent)
         builder.mutate_on::<PersistDocChunk>(|agent, envelope| {
             let msg = envelope.message().clone();
             let db = agent.model.db.clone();
@@ -1276,28 +1312,27 @@ impl DatabaseActor {
                         match crate_id {
                             Ok(Some(crate_record)) => {
                                 if let Some(id) = crate_record.get("id") {
-                                    let insert_query = r#"
-                                        CREATE doc_chunk CONTENT {
-                                            crate_id: $crate_id,
-                                            chunk_index: $chunk_index,
-                                            chunk_id: $chunk_id,
-                                            content: $content,
-                                            source_file: $source_file,
-                                            content_type: $content_type,
-                                            token_count: $token_count,
-                                            char_count: $char_count,
-                                            start_line: $start_line,
-                                            end_line: $end_line,
-                                            parent_module: $parent_module,
-                                            item_type: $item_type,
-                                            item_name: $item_name
-                                        }
+                                    // Upsert pattern: Try UPDATE first, then INSERT if no rows affected
+                                    let update_query = r#"
+                                        UPDATE doc_chunk SET
+                                            content = $content,
+                                            source_file = $source_file,
+                                            content_type = $content_type,
+                                            token_count = $token_count,
+                                            char_count = $char_count,
+                                            start_line = $start_line,
+                                            end_line = $end_line,
+                                            parent_module = $parent_module,
+                                            item_type = $item_type,
+                                            item_name = $item_name,
+                                            vectorized = false,
+                                            vectorized_at = NONE
+                                        WHERE chunk_id = $chunk_id
+                                        RETURN BEFORE
                                     "#;
 
-                                    match db
-                                        .query(insert_query)
-                                        .bind(("crate_id", id.clone()))
-                                        .bind(("chunk_index", msg.chunk_index as i64))
+                                    let update_result = db
+                                        .query(update_query)
                                         .bind(("chunk_id", msg.chunk_id.clone()))
                                         .bind(("content", msg.content.clone()))
                                         .bind(("source_file", msg.source_file.clone()))
@@ -1312,36 +1347,97 @@ impl DatabaseActor {
                                         .bind(("parent_module", msg.metadata.parent_module.clone()))
                                         .bind(("item_type", msg.metadata.item_type.clone()))
                                         .bind(("item_name", msg.metadata.item_name.clone()))
-                                        .await
-                                    {
-                                        Ok(_) => {
-                                            debug!(
-                                                "Persisted doc chunk {} for {}@{}",
-                                                msg.chunk_id, name, version
-                                            );
+                                        .await;
 
-                                            // Broadcast acknowledgment for completion tracking
-                                            broker
-                                                .broadcast(DocChunkPersisted {
-                                                    chunk_id: msg.chunk_id.clone(),
-                                                    specifier: msg.specifier.clone(),
-                                                    chunk_index: msg.chunk_index,
-                                                })
-                                                .await;
+                                    // Check if update affected any rows
+                                    let needs_insert = match update_result {
+                                        Ok(mut response) => {
+                                            // Check if any rows were returned (indicating update succeeded)
+                                            let rows: Result<Vec<serde_json::Value>, _> = response.take(0);
+                                            match rows {
+                                                Ok(rows) if !rows.is_empty() => {
+                                                    debug!(
+                                                        "Updated existing doc chunk {} for {}@{}",
+                                                        msg.chunk_id, name, version
+                                                    );
+                                                    false
+                                                }
+                                                _ => true, // No rows returned, need to insert
+                                            }
                                         }
-                                        Err(e) => {
-                                            error!("Failed to persist doc chunk: {}", e);
-                                            broker
-                                                .broadcast(DatabaseError {
-                                                    operation: format!(
-                                                        "persist doc chunk {}",
-                                                        msg.chunk_id
-                                                    ),
-                                                    error: e.to_string(),
-                                                })
-                                                .await;
+                                        Err(_) => true, // Update failed, try insert
+                                    };
+
+                                    if needs_insert {
+                                        // No existing record, insert new one
+                                        let insert_query = r#"
+                                            CREATE doc_chunk CONTENT {
+                                                crate_id: $crate_id,
+                                                chunk_index: $chunk_index,
+                                                chunk_id: $chunk_id,
+                                                content: $content,
+                                                source_file: $source_file,
+                                                content_type: $content_type,
+                                                token_count: $token_count,
+                                                char_count: $char_count,
+                                                start_line: $start_line,
+                                                end_line: $end_line,
+                                                parent_module: $parent_module,
+                                                item_type: $item_type,
+                                                item_name: $item_name
+                                            }
+                                        "#;
+
+                                        match db
+                                            .query(insert_query)
+                                            .bind(("crate_id", id.clone()))
+                                            .bind(("chunk_index", msg.chunk_index as i64))
+                                            .bind(("chunk_id", msg.chunk_id.clone()))
+                                            .bind(("content", msg.content.clone()))
+                                            .bind(("source_file", msg.source_file.clone()))
+                                            .bind(("content_type", msg.metadata.content_type.clone()))
+                                            .bind(("token_count", msg.metadata.token_count as i64))
+                                            .bind(("char_count", msg.metadata.char_count as i64))
+                                            .bind((
+                                                "start_line",
+                                                msg.metadata.start_line.map(|n| n as i64),
+                                            ))
+                                            .bind(("end_line", msg.metadata.end_line.map(|n| n as i64)))
+                                            .bind(("parent_module", msg.metadata.parent_module.clone()))
+                                            .bind(("item_type", msg.metadata.item_type.clone()))
+                                            .bind(("item_name", msg.metadata.item_name.clone()))
+                                            .await
+                                        {
+                                            Ok(_) => {
+                                                debug!(
+                                                    "Inserted new doc chunk {} for {}@{}",
+                                                    msg.chunk_id, name, version
+                                                );
+                                            }
+                                            Err(e) => {
+                                                error!("Failed to insert doc chunk: {}", e);
+                                                broker
+                                                    .broadcast(DatabaseError {
+                                                        operation: format!(
+                                                            "persist doc chunk {}",
+                                                            msg.chunk_id
+                                                        ),
+                                                        error: e.to_string(),
+                                                    })
+                                                    .await;
+                                                return;
+                                            }
                                         }
                                     }
+
+                                    // Broadcast acknowledgment for completion tracking
+                                    broker
+                                        .broadcast(DocChunkPersisted {
+                                            chunk_id: msg.chunk_id.clone(),
+                                            specifier: msg.specifier.clone(),
+                                            chunk_index: msg.chunk_index,
+                                        })
+                                        .await;
                                 } else {
                                     error!("Crate record missing id field");
                                 }
@@ -1608,77 +1704,122 @@ impl DatabaseActor {
                     }
                 };
 
-                // Step 3: Both prerequisites satisfied - persist the embedding
+                // Step 3: Both prerequisites satisfied - upsert the embedding (idempotent)
                 let vector_dim = msg.vector.len();
 
-                let insert_query = r#"
-                    CREATE embedding CONTENT {
-                        chunk_id: $chunk_id,
-                        crate_id: $crate_id,
-                        vector: $vector,
-                        vector_dimension: $vector_dimension,
-                        model_name: $model_name,
-                        model_version: $model_version,
-                        content_hash: crypto::md5(string::concat($chunk_id, $model_name))
-                    }
+                // Upsert pattern: Try UPDATE first, then INSERT if no rows affected
+                let update_query = r#"
+                    UPDATE embedding SET
+                        vector = $vector,
+                        vector_dimension = $vector_dimension,
+                        content_hash = crypto::md5(string::concat($chunk_id_str, $model_name)),
+                        created_at = time::now()
+                    WHERE chunk_id = $chunk_id AND model_name = $model_name AND model_version = $model_version
+                    RETURN BEFORE
                 "#;
 
-                match db
-                    .query(insert_query)
-                    .bind(("chunk_id", chunk_db_id))
-                    .bind(("crate_id", crate_db_id))
+                let update_result = db
+                    .query(update_query)
+                    .bind(("chunk_id", chunk_db_id.clone()))
+                    .bind(("chunk_id_str", chunk_id.clone()))
                     .bind(("vector", msg.vector.clone()))
                     .bind(("vector_dimension", vector_dim as i64))
                     .bind(("model_name", msg.model_name.clone()))
                     .bind(("model_version", msg.model_version.clone()))
-                    .await
-                {
-                    Ok(_) => {
-                        debug!(
-                            "Persisted embedding for chunk {} (crate: {}@{}, dim: {}, model: {})",
-                            chunk_id, name, version, vector_dim, msg.model_name
-                        );
+                    .await;
 
-                        // Update chunk's vectorized flag and timestamp
-                        if let Err(e) = db
-                            .query("UPDATE doc_chunk SET vectorized = true, vectorized_at = time::now() WHERE chunk_id = $chunk_id")
-                            .bind(("chunk_id", chunk_id.clone()))
-                            .await
-                        {
-                            error!(
-                                "Failed to update vectorized flag for chunk {} (crate: {}@{}): {}",
-                                chunk_id, name, version, e
+                // Check if update affected any rows
+                let needs_insert = match update_result {
+                    Ok(mut response) => {
+                        // Check if any rows were returned (indicating update succeeded)
+                        let rows: Result<Vec<serde_json::Value>, _> = response.take(0);
+                        match rows {
+                            Ok(rows) if !rows.is_empty() => {
+                                debug!(
+                                    "Updated existing embedding for chunk {} (crate: {}@{}, dim: {}, model: {})",
+                                    chunk_id, name, version, vector_dim, msg.model_name
+                                );
+                                false
+                            }
+                            _ => true, // No rows returned, need to insert
+                        }
+                    }
+                    Err(_) => true, // Update failed, try insert
+                };
+
+                if needs_insert {
+                    // No existing embedding, insert new one
+                    let insert_query = r#"
+                        CREATE embedding CONTENT {
+                            chunk_id: $chunk_id,
+                            crate_id: $crate_id,
+                            vector: $vector,
+                            vector_dimension: $vector_dimension,
+                            model_name: $model_name,
+                            model_version: $model_version,
+                            content_hash: crypto::md5(string::concat($chunk_id_str, $model_name))
+                        }
+                    "#;
+
+                    match db
+                        .query(insert_query)
+                        .bind(("chunk_id", chunk_db_id))
+                        .bind(("crate_id", crate_db_id))
+                        .bind(("chunk_id_str", chunk_id.clone()))
+                        .bind(("vector", msg.vector.clone()))
+                        .bind(("vector_dimension", vector_dim as i64))
+                        .bind(("model_name", msg.model_name.clone()))
+                        .bind(("model_version", msg.model_version.clone()))
+                        .await
+                    {
+                        Ok(_) => {
+                            debug!(
+                                "Inserted new embedding for chunk {} (crate: {}@{}, dim: {}, model: {})",
+                                chunk_id, name, version, vector_dim, msg.model_name
                             );
                         }
-
-                        // Broadcast acknowledgment for completion tracking
-                        broker
-                            .broadcast(EmbeddingPersisted {
-                                chunk_id: msg.chunk_id.clone(),
-                                specifier: msg.specifier.clone(),
-                                model_name: msg.model_name.clone(),
-                            })
-                            .await;
-                    }
-                    Err(e) => {
-                        error!(
-                            "Failed to persist embedding for chunk {} (crate: {}@{}): {}",
-                            chunk_id, name, version, e
-                        );
-                        broker
-                            .broadcast(DatabaseError {
-                                operation: format!(
-                                    "persist embedding for chunk {} (crate: {}@{})",
-                                    chunk_id, name, version
-                                ),
-                                error: format!(
-                                    "Failed to create embedding record for chunk '{}': {}",
-                                    chunk_id, e
-                                ),
-                            })
-                            .await;
+                        Err(e) => {
+                            error!(
+                                "Failed to insert embedding for chunk {} (crate: {}@{}): {}",
+                                chunk_id, name, version, e
+                            );
+                            broker
+                                .broadcast(DatabaseError {
+                                    operation: format!(
+                                        "persist embedding for chunk {} (crate: {}@{})",
+                                        chunk_id, name, version
+                                    ),
+                                    error: format!(
+                                        "Failed to create embedding record for chunk '{}': {}",
+                                        chunk_id, e
+                                    ),
+                                })
+                                .await;
+                            return;
+                        }
                     }
                 }
+
+                // Update chunk's vectorized flag and timestamp
+                if let Err(e) = db
+                    .query("UPDATE doc_chunk SET vectorized = true, vectorized_at = time::now() WHERE chunk_id = $chunk_id")
+                    .bind(("chunk_id", chunk_id.clone()))
+                    .await
+                {
+                    error!(
+                        "Failed to update vectorized flag for chunk {} (crate: {}@{}): {}",
+                        chunk_id, name, version, e
+                    );
+                }
+
+                // Broadcast acknowledgment for completion tracking
+                broker
+                    .broadcast(EmbeddingPersisted {
+                        chunk_id: msg.chunk_id.clone(),
+                        specifier: msg.specifier.clone(),
+                        model_name: msg.model_name.clone(),
+                    })
+                    .await;
             })
         });
 
@@ -2038,6 +2179,7 @@ impl DatabaseActor {
                     DEFINE INDEX idx_chunk_index ON TABLE doc_chunk COLUMNS chunk_index;
                     DEFINE INDEX idx_vectorized ON TABLE doc_chunk COLUMNS vectorized;
                     DEFINE INDEX idx_crate_chunk ON TABLE doc_chunk COLUMNS crate_id, chunk_index UNIQUE;
+                    DEFINE INDEX idx_chunk_id_unique ON TABLE doc_chunk COLUMNS chunk_id UNIQUE;
 
                     -- Vector embeddings table
                     DEFINE TABLE embedding SCHEMAFULL;
@@ -2057,6 +2199,7 @@ impl DatabaseActor {
                     DEFINE INDEX idx_crate_id_emb ON TABLE embedding COLUMNS crate_id;
                     DEFINE INDEX idx_model ON TABLE embedding COLUMNS model_name, model_version;
                     DEFINE INDEX idx_content_hash ON TABLE embedding COLUMNS content_hash;
+                    DEFINE INDEX idx_embedding_unique ON TABLE embedding COLUMNS chunk_id, model_name, model_version UNIQUE;
 
                     -- Code samples table
                     DEFINE TABLE code_sample SCHEMAFULL;
@@ -3915,6 +4058,129 @@ mod tests {
 
             // Status should NOT be 'complete' because validation failed
 
+            runtime.shutdown_all().await.unwrap();
+
+            cleanup_test_db(&test_db_path).await;
+        })
+        .await
+        .expect("Test should complete within timeout");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_idempotent_chunk_and_embedding_persistence() {
+        // Test that processing the same crate twice doesn't create duplicates
+        tokio::time::timeout(Duration::from_secs(30), async {
+            let mut runtime = ActonApp::launch();
+            let test_db_path = create_test_db_path("idempotent");
+
+            let (db_handle, _) = DatabaseActor::spawn(&mut runtime, test_db_path.clone())
+                .await
+                .unwrap();
+
+            // Wait for schema initialization
+            tokio::time::sleep(Duration::from_millis(500)).await;
+
+            let specifier = CrateSpecifier::from_str("serde@1.0.0").unwrap();
+
+            // First processing: persist crate, chunk, and embedding
+            db_handle
+                .send(PersistCrate {
+                    specifier: specifier.clone(),
+                    features: vec!["derive".to_string()],
+                })
+                .await;
+            tokio::time::sleep(Duration::from_millis(200)).await;
+
+            // Persist a doc chunk
+            db_handle
+                .send(PersistDocChunk {
+                    specifier: specifier.clone(),
+                    chunk_index: 0,
+                    chunk_id: "test_chunk_1".to_string(),
+                    content: "Test documentation content".to_string(),
+                    source_file: "src/lib.rs".to_string(),
+                    metadata: ChunkMetadata {
+                        content_type: "markdown".to_string(),
+                        token_count: 10,
+                        char_count: 100,
+                        start_line: Some(1),
+                        end_line: Some(10),
+                        parent_module: Some("root".to_string()),
+                        item_type: Some("struct".to_string()),
+                        item_name: Some("TestStruct".to_string()),
+                    },
+                })
+                .await;
+            tokio::time::sleep(Duration::from_millis(200)).await;
+
+            // Persist an embedding for the chunk
+            db_handle
+                .send(PersistEmbedding {
+                    specifier: specifier.clone(),
+                    chunk_id: "test_chunk_1".to_string(),
+                    vector: vec![0.1, 0.2, 0.3, 0.4],
+                    model_name: "test-model".to_string(),
+                    model_version: "v1".to_string(),
+                })
+                .await;
+            tokio::time::sleep(Duration::from_millis(200)).await;
+
+            // Second processing: Reprocess the same crate (idempotency test)
+            // This should clean up old data and insert fresh
+            db_handle
+                .send(PersistCrate {
+                    specifier: specifier.clone(),
+                    features: vec!["derive".to_string()],
+                })
+                .await;
+            tokio::time::sleep(Duration::from_millis(200)).await;
+
+            // Persist the same chunk again (should upsert)
+            db_handle
+                .send(PersistDocChunk {
+                    specifier: specifier.clone(),
+                    chunk_index: 0,
+                    chunk_id: "test_chunk_1".to_string(),
+                    content: "Updated documentation content".to_string(),
+                    source_file: "src/lib.rs".to_string(),
+                    metadata: ChunkMetadata {
+                        content_type: "markdown".to_string(),
+                        token_count: 15,
+                        char_count: 150,
+                        start_line: Some(1),
+                        end_line: Some(15),
+                        parent_module: Some("root".to_string()),
+                        item_type: Some("struct".to_string()),
+                        item_name: Some("TestStruct".to_string()),
+                    },
+                })
+                .await;
+            tokio::time::sleep(Duration::from_millis(200)).await;
+
+            // Persist the same embedding again (should upsert)
+            db_handle
+                .send(PersistEmbedding {
+                    specifier: specifier.clone(),
+                    chunk_id: "test_chunk_1".to_string(),
+                    vector: vec![0.5, 0.6, 0.7, 0.8],
+                    model_name: "test-model".to_string(),
+                    model_version: "v1".to_string(),
+                })
+                .await;
+            tokio::time::sleep(Duration::from_millis(200)).await;
+
+            // Verify: Query the crate and count chunks/embeddings
+            // There should be exactly 1 crate, 1 chunk, and 1 embedding (no duplicates)
+            db_handle
+                .send(QueryCrate {
+                    name: "serde".to_string(),
+                    version: Some("1.0.0".to_string()),
+                })
+                .await;
+            tokio::time::sleep(Duration::from_millis(100)).await;
+
+            // Clean shutdown
+            db_handle.stop().await.unwrap();
             runtime.shutdown_all().await.unwrap();
 
             cleanup_test_db(&test_db_path).await;
