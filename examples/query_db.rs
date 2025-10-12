@@ -60,6 +60,42 @@ async fn main() -> anyhow::Result<()> {
     // Display total
     println!("Total crates: {}", crates.len());
 
+    println!("\n=== Querying doc_chunks ===\n");
+
+    // Query all doc_chunks
+    #[derive(Debug, serde::Deserialize)]
+    struct DocChunkRecord {
+        id: Thing,
+        chunk_id: String,
+        crate_id: Thing,
+        vectorized: bool,
+        vectorized_at: Option<String>,
+    }
+
+    let mut result = db
+        .query("SELECT id, chunk_id, crate_id, vectorized, vectorized_at FROM doc_chunk LIMIT 10")
+        .await?;
+    let chunks: Vec<DocChunkRecord> = result.take(0)?;
+
+    if chunks.is_empty() {
+        println!("❌ No doc_chunks found!");
+        println!("   This explains why no embeddings exist.");
+        println!("   The documentation chunking pipeline needs to run first.\n");
+    } else {
+        println!("Found {} doc_chunk(s):\n", chunks.len());
+
+        for chunk in &chunks {
+            println!("  Chunk: {}", chunk.chunk_id);
+            println!("    ID: {}", chunk.id);
+            println!("    Crate: {}", chunk.crate_id);
+            println!("    Vectorized: {}", chunk.vectorized);
+            if let Some(vectorized_at) = &chunk.vectorized_at {
+                println!("    Vectorized at: {}", vectorized_at);
+            }
+            println!();
+        }
+    }
+
     println!("\n=== Querying embeddings ===\n");
 
     // Query all embeddings - use a specific struct
