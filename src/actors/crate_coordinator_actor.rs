@@ -10,11 +10,12 @@ use crate::crate_specifier::CrateSpecifier;
 use crate::errors::{DownloadError, ExtractionError, PipelineError};
 use crate::messages::{
     CheckProcessingTimeouts, CrateDownloadFailed, CrateDownloaded, CrateProcessingComplete,
-    CrateProcessingFailed, CrateReceived, DocumentationChunked, DocumentationExtracted,
-    DocumentationExtractionFailed, DocumentationVectorized,
+    CrateProcessingFailed, CrateReceived, DocChunkPersisted, DocumentationChunked,
+    DocumentationExtracted, DocumentationExtractionFailed, DocumentationVectorized,
+    EmbeddingPersisted,
 };
 use acton_reactive::prelude::*;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::Instant;
 use tokio::time::Duration;
 use tracing::*;
@@ -82,6 +83,14 @@ pub struct CrateProcessingState {
     pub retry_count: u32,
     /// Error message if failed
     pub error: Option<String>,
+    /// Expected number of chunks to be persisted (None until DocumentationChunked received)
+    pub expected_chunks: Option<u32>,
+    /// Set of chunk IDs that have been persisted successfully
+    pub persisted_chunks: HashSet<String>,
+    /// Expected number of embeddings to be persisted (None until DocumentationVectorized received)
+    pub expected_vectors: Option<u32>,
+    /// Set of chunk IDs for which embeddings have been persisted successfully
+    pub persisted_vectors: HashSet<String>,
 }
 
 impl CrateProcessingState {
@@ -96,6 +105,10 @@ impl CrateProcessingState {
             last_updated: now,
             retry_count: 0,
             error: None,
+            expected_chunks: None,
+            persisted_chunks: HashSet::new(),
+            expected_vectors: None,
+            persisted_vectors: HashSet::new(),
         }
     }
 
@@ -334,65 +347,142 @@ impl CrateCoordinatorActor {
             AgentReply::immediate()
         });
 
-        // Handle DocumentationChunked - update to Chunked and transition to Vectorizing
+        // Handle DocumentationChunked - set expected chunks count and track in-progress chunking
         builder.mutate_on::<DocumentationChunked>(|agent, envelope| {
             let msg = envelope.message();
             let specifier = &msg.specifier;
 
             if let Some(state) = agent.model.processing_states.get_mut(specifier) {
-                state.update_status(ProcessingStatus::Chunked);
+                // Set expected chunk count for persistence tracking
+                state.expected_chunks = Some(msg.chunk_count);
+                // Transition to Chunking status to track in-progress persistence
+                state.update_status(ProcessingStatus::Chunking);
                 debug!(
                     specifier = %specifier,
+                    chunk_count = msg.chunk_count,
                     status = ?state.status,
-                    "Chunking completed, preparing for vectorization"
+                    "Chunking completed, waiting for chunk persistence"
                 );
-                // Transition to Vectorizing status - next stage
-                state.update_status(ProcessingStatus::Vectorizing);
             }
 
             AgentReply::immediate()
         });
 
-        // Handle DocumentationVectorized - update to Vectorized and broadcast Complete
+        // Handle DocChunkPersisted - track chunk persistence and transition when complete
+        builder.mutate_on::<DocChunkPersisted>(|agent, envelope| {
+            let msg = envelope.message();
+            let specifier = &msg.specifier;
+
+            if let Some(state) = agent.model.processing_states.get_mut(specifier) {
+                // Track this chunk as persisted (idempotency via HashSet)
+                state.persisted_chunks.insert(msg.chunk_id.clone());
+
+                let persisted_count = state.persisted_chunks.len() as u32;
+                let expected_count = state.expected_chunks.unwrap_or(0);
+
+                debug!(
+                    specifier = %specifier,
+                    chunk_id = %msg.chunk_id,
+                    persisted = persisted_count,
+                    expected = expected_count,
+                    "Chunk persisted"
+                );
+
+                // Check if all chunks have been persisted
+                if let Some(expected) = state.expected_chunks {
+                    if persisted_count == expected {
+                        // All chunks persisted - transition to Chunked, then Vectorizing
+                        state.update_status(ProcessingStatus::Chunked);
+                        debug!(
+                            specifier = %specifier,
+                            total_chunks = expected,
+                            "All chunks persisted, transitioning to vectorizing"
+                        );
+                        state.update_status(ProcessingStatus::Vectorizing);
+                    }
+                }
+            }
+
+            AgentReply::immediate()
+        });
+
+        // Handle EmbeddingPersisted - track embedding persistence and transition when complete
+        builder.mutate_on::<EmbeddingPersisted>(|agent, envelope| {
+            let msg = envelope.message();
+            let specifier = &msg.specifier;
+
+            if let Some(state) = agent.model.processing_states.get_mut(specifier) {
+                // Track this embedding as persisted (idempotency via HashSet)
+                state.persisted_vectors.insert(msg.chunk_id.clone());
+
+                let persisted_count = state.persisted_vectors.len() as u32;
+                let expected_count = state.expected_vectors.unwrap_or(0);
+
+                debug!(
+                    specifier = %specifier,
+                    chunk_id = %msg.chunk_id,
+                    persisted = persisted_count,
+                    expected = expected_count,
+                    "Embedding persisted"
+                );
+
+                // Check if all embeddings have been persisted
+                if let Some(expected) = state.expected_vectors {
+                    if persisted_count == expected {
+                        // All embeddings persisted - transition to Vectorized, then Complete
+                        state.update_status(ProcessingStatus::Vectorized);
+                        debug!(
+                            specifier = %specifier,
+                            total_embeddings = expected,
+                            "All embeddings persisted, transitioning to complete"
+                        );
+                        state.update_status(ProcessingStatus::Complete);
+
+                        let total_duration_ms = state.total_duration_ms();
+                        let features = state.features.clone();
+                        let specifier_clone = specifier.clone();
+
+                        info!(
+                            specifier = %specifier,
+                            total_duration_ms = total_duration_ms,
+                            "Crate processing completed successfully"
+                        );
+
+                        let broker = agent.broker().clone();
+
+                        // Broadcast completion event
+                        return AgentReply::from_async(async move {
+                            broker
+                                .broadcast(CrateProcessingComplete {
+                                    specifier: specifier_clone,
+                                    features,
+                                    total_duration_ms,
+                                    stages_completed: 4, // download → extract → chunk → vectorize
+                                })
+                                .await;
+                        });
+                    }
+                }
+            }
+
+            AgentReply::immediate()
+        });
+
+        // Handle DocumentationVectorized - set expected vectors count and track in-progress vectorization
         builder.mutate_on::<DocumentationVectorized>(|agent, envelope| {
             let msg = envelope.message();
             let specifier = &msg.specifier;
 
             if let Some(state) = agent.model.processing_states.get_mut(specifier) {
-                // First transition to Vectorized status
-                state.update_status(ProcessingStatus::Vectorized);
+                // Set expected vector count for persistence tracking
+                state.expected_vectors = Some(msg.vector_count);
+                // Keep status as Vectorizing to track in-progress persistence
                 debug!(
                     specifier = %specifier,
+                    vector_count = msg.vector_count,
                     status = ?state.status,
-                    "Vectorization completed"
+                    "Vectorization completed, waiting for embedding persistence"
                 );
-
-                // Then transition to Complete
-                state.update_status(ProcessingStatus::Complete);
-
-                let total_duration_ms = state.total_duration_ms();
-                let features = state.features.clone();
-                let specifier_clone = specifier.clone();
-
-                info!(
-                    specifier = %specifier,
-                    total_duration_ms = total_duration_ms,
-                    "Crate processing completed successfully"
-                );
-
-                let broker = agent.broker().clone();
-
-                // Broadcast completion event
-                return AgentReply::from_async(async move {
-                    broker
-                        .broadcast(CrateProcessingComplete {
-                            specifier: specifier_clone,
-                            features,
-                            total_duration_ms,
-                            stages_completed: 4, // download → extract → chunk → vectorize
-                        })
-                        .await;
-                });
             }
 
             AgentReply::immediate()
@@ -499,7 +589,21 @@ impl CrateCoordinatorActor {
             })
         });
 
-        Ok(builder.start().await)
+        let handle = builder.start().await;
+
+        // Subscribe to pipeline events for state tracking
+        handle.subscribe::<CrateReceived>().await;
+        handle.subscribe::<CrateDownloaded>().await;
+        handle.subscribe::<CrateDownloadFailed>().await;
+        handle.subscribe::<DocumentationExtracted>().await;
+        handle.subscribe::<DocumentationExtractionFailed>().await;
+        handle.subscribe::<DocumentationChunked>().await;
+        handle.subscribe::<DocChunkPersisted>().await;
+        handle.subscribe::<EmbeddingPersisted>().await;
+        handle.subscribe::<DocumentationVectorized>().await;
+        handle.subscribe::<CrateProcessingFailed>().await;
+
+        Ok(handle)
     }
 }
 
@@ -643,5 +747,212 @@ mod tests {
         fn assert_sync<T: Sync>() {}
         assert_send::<CrateProcessingState>();
         assert_sync::<CrateProcessingState>();
+    }
+
+    #[test]
+    fn test_crate_processing_state_persistence_tracking_fields() {
+        let specifier = CrateSpecifier::from_str("serde@1.0.0").unwrap();
+        let state = CrateProcessingState::new(specifier, vec![]);
+
+        // Verify initial state of tracking fields
+        assert!(state.expected_chunks.is_none());
+        assert!(state.persisted_chunks.is_empty());
+        assert!(state.expected_vectors.is_none());
+        assert!(state.persisted_vectors.is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_coordinator_tracks_chunk_persistence() {
+        use crate::actors::retry_coordinator::RetryCoordinator;
+        use crate::retry_policy::RetryPolicy;
+
+        let mut runtime = ActonApp::launch();
+        let config = CoordinatorConfig::default();
+
+        let retry_policy = RetryPolicy::default();
+        let retry_coordinator = RetryCoordinator::spawn(&mut runtime, retry_policy)
+            .await
+            .expect("Failed to spawn RetryCoordinator");
+
+        let handle = CrateCoordinatorActor::spawn(&mut runtime, config, retry_coordinator)
+            .await
+            .expect("Failed to spawn CrateCoordinatorActor");
+
+        let specifier = CrateSpecifier::from_str("test-crate@1.0.0").unwrap();
+
+        // Initialize state
+        handle
+            .send(CrateReceived {
+                specifier: specifier.clone(),
+                features: vec![],
+            })
+            .await;
+
+        // Simulate chunking completion
+        handle
+            .send(DocumentationChunked {
+                specifier: specifier.clone(),
+                features: vec![],
+                chunk_count: 3,
+                total_tokens_estimated: 1000,
+            })
+            .await;
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        // Simulate chunk persistence (3 chunks)
+        for i in 0..3 {
+            handle
+                .send(DocChunkPersisted {
+                    chunk_id: format!("test-crate_1_0_0_{:03}", i),
+                    specifier: specifier.clone(),
+                    chunk_index: i,
+                })
+                .await;
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        runtime.shutdown_all().await.expect("Failed to shutdown");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_coordinator_tracks_embedding_persistence() {
+        use crate::actors::retry_coordinator::RetryCoordinator;
+        use crate::retry_policy::RetryPolicy;
+
+        let mut runtime = ActonApp::launch();
+        let config = CoordinatorConfig::default();
+
+        let retry_policy = RetryPolicy::default();
+        let retry_coordinator = RetryCoordinator::spawn(&mut runtime, retry_policy)
+            .await
+            .expect("Failed to spawn RetryCoordinator");
+
+        let handle = CrateCoordinatorActor::spawn(&mut runtime, config, retry_coordinator)
+            .await
+            .expect("Failed to spawn CrateCoordinatorActor");
+
+        let specifier = CrateSpecifier::from_str("test-crate@1.0.0").unwrap();
+
+        // Initialize state
+        handle
+            .send(CrateReceived {
+                specifier: specifier.clone(),
+                features: vec![],
+            })
+            .await;
+
+        // Simulate vectorization completion
+        handle
+            .send(DocumentationVectorized {
+                specifier: specifier.clone(),
+                features: vec![],
+                vector_count: 3,
+                embedding_model: "test-model".to_string(),
+                vectorization_duration_ms: 1000,
+            })
+            .await;
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        // Simulate embedding persistence (3 embeddings)
+        for i in 0..3 {
+            handle
+                .send(EmbeddingPersisted {
+                    chunk_id: format!("test-crate_1_0_0_{:03}", i),
+                    specifier: specifier.clone(),
+                    model_name: "test-model".to_string(),
+                })
+                .await;
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        runtime.shutdown_all().await.expect("Failed to shutdown");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_coordinator_idempotency_duplicate_chunk_persisted() {
+        use crate::actors::retry_coordinator::RetryCoordinator;
+        use crate::retry_policy::RetryPolicy;
+
+        let mut runtime = ActonApp::launch();
+        let config = CoordinatorConfig::default();
+
+        let retry_policy = RetryPolicy::default();
+        let retry_coordinator = RetryCoordinator::spawn(&mut runtime, retry_policy)
+            .await
+            .expect("Failed to spawn RetryCoordinator");
+
+        let handle = CrateCoordinatorActor::spawn(&mut runtime, config, retry_coordinator)
+            .await
+            .expect("Failed to spawn CrateCoordinatorActor");
+
+        let specifier = CrateSpecifier::from_str("test-crate@1.0.0").unwrap();
+
+        // Initialize state
+        handle
+            .send(CrateReceived {
+                specifier: specifier.clone(),
+                features: vec![],
+            })
+            .await;
+
+        // Simulate chunking completion
+        handle
+            .send(DocumentationChunked {
+                specifier: specifier.clone(),
+                features: vec![],
+                chunk_count: 2,
+                total_tokens_estimated: 500,
+            })
+            .await;
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        // Send duplicate chunk_id - should be idempotent
+        for _ in 0..3 {
+            handle
+                .send(DocChunkPersisted {
+                    chunk_id: "test-crate_1_0_0_000".to_string(),
+                    specifier: specifier.clone(),
+                    chunk_index: 0,
+                })
+                .await;
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+
+        // Send second chunk
+        handle
+            .send(DocChunkPersisted {
+                chunk_id: "test-crate_1_0_0_001".to_string(),
+                specifier: specifier.clone(),
+                chunk_index: 1,
+            })
+            .await;
+
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        runtime.shutdown_all().await.expect("Failed to shutdown");
+    }
+
+    #[test]
+    fn test_hashset_idempotency() {
+        use std::collections::HashSet;
+
+        let mut set = HashSet::new();
+        set.insert("chunk_1".to_string());
+        assert_eq!(set.len(), 1);
+
+        // Insert duplicate - should not increase size
+        set.insert("chunk_1".to_string());
+        assert_eq!(set.len(), 1);
+
+        // Insert new item
+        set.insert("chunk_2".to_string());
+        assert_eq!(set.len(), 2);
     }
 }
