@@ -21,10 +21,10 @@ use crate::crate_specifier::CrateSpecifier;
 use crate::messages::{
     CrateDownloadFailed, CrateDownloaded, CrateListResponse, CrateProcessingComplete,
     CrateProcessingFailed, CrateQueryResponse, CrateReceived, CrateSummary, DatabaseError,
-    DatabaseReady, DatabaseWarning, DocumentationChunked, DocumentationExtracted,
-    DocumentationExtractionFailed, DocumentationVectorized, ListCrates, PersistCodeSample,
-    PersistCrate, PersistDocChunk, PersistEmbedding, PrintWarning, QueryCrate, QuerySimilarDocs,
-    SimilarDocsResponse,
+    DatabaseReady, DatabaseWarning, DocChunkPersisted, DocumentationChunked, DocumentationExtracted,
+    DocumentationExtractionFailed, DocumentationVectorized, EmbeddingPersisted, ListCrates,
+    PersistCodeSample, PersistCrate, PersistDocChunk, PersistEmbedding, PrintWarning, QueryCrate,
+    QuerySimilarDocs, SimilarDocsResponse,
 };
 use crate::types::SearchResult;
 
@@ -1319,6 +1319,15 @@ impl DatabaseActor {
                                                 "Persisted doc chunk {} for {}@{}",
                                                 msg.chunk_id, name, version
                                             );
+
+                                            // Broadcast acknowledgment for completion tracking
+                                            broker
+                                                .broadcast(DocChunkPersisted {
+                                                    chunk_id: msg.chunk_id.clone(),
+                                                    specifier: msg.specifier.clone(),
+                                                    chunk_index: msg.chunk_index,
+                                                })
+                                                .await;
                                         }
                                         Err(e) => {
                                             error!("Failed to persist doc chunk: {}", e);
@@ -1641,6 +1650,15 @@ impl DatabaseActor {
                                 chunk_id, name, version, e
                             );
                         }
+
+                        // Broadcast acknowledgment for completion tracking
+                        broker
+                            .broadcast(EmbeddingPersisted {
+                                chunk_id: msg.chunk_id.clone(),
+                                specifier: msg.specifier.clone(),
+                                model_name: msg.model_name.clone(),
+                            })
+                            .await;
                     }
                     Err(e) => {
                         error!(
