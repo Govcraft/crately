@@ -98,6 +98,8 @@ pub struct ActorSystem {
     actors: Arc<DashMap<String, AgentHandle>>,
     /// The initial configuration loaded at startup
     config: Config,
+    /// Database connection metadata
+    database_info: crate::actors::database::DatabaseInfo,
     /// Whether server-specific actors have been initialized
     server_mode: bool,
 }
@@ -248,6 +250,7 @@ impl ActorSystem {
             runtime,
             actors,
             config,
+            database_info: db_info,
             server_mode: false,
         })
     }
@@ -441,6 +444,7 @@ impl ActorSystem {
             &mut self.runtime,
             self.config.clone(),
             Arc::clone(&self.actors),
+            self.database_info.clone(),
         )
         .await
         {
@@ -883,6 +887,7 @@ impl ActorSystem {
             runtime,
             actors,
             config,
+            database_info: db_info,
             server_mode: false,
         })
     }

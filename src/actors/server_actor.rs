@@ -21,7 +21,10 @@ use tokio::sync::broadcast;
 use tracing::{debug, error, info, warn};
 
 use crate::{
-    actors::config::{Config, ConfigResponse, ReloadConfig},
+    actors::{
+        config::{Config, ConfigResponse, ReloadConfig},
+        database::DatabaseInfo,
+    },
     messages::{
         CrateReceived, KeyPressed, PrintError, PrintProgress, PrintSuccess, ServerReloaded,
         ServerStarted, StartServer, StopServer,
@@ -30,13 +33,15 @@ use crate::{
     response::CrateResponse,
 };
 
-/// Shared application state containing actor handles and broker
+/// Shared application state containing actor handles, broker, and database info
 #[derive(Clone)]
 struct AppState {
     /// Thread-safe map of actor handles accessible by name
     actors: Arc<DashMap<String, AgentHandle>>,
     /// Broker handle for event broadcasting
     broker: AgentHandle,
+    /// Database connection metadata for introspection
+    database_info: DatabaseInfo,
 }
 
 /// Handle HTTP POST requests to the /crate endpoint
@@ -91,6 +96,11 @@ async fn status_handler(State(state): State<AppState>) -> impl IntoResponse {
         "status": "healthy",
         "actor_count": actor_count,
         "actors": actors_list,
+        "database": {
+            "path": state.database_info.db_path.display().to_string(),
+            "namespace": &state.database_info.namespace,
+            "database": &state.database_info.database,
+        },
         "timestamp": chrono::Utc::now().to_rfc3339()
     }))
 }
@@ -165,7 +175,7 @@ async fn get_actor_handler(
 ///     let config = Config::default();
 ///     let actors = std::sync::Arc::new(dashmap::DashMap::new());
 ///
-///     let server = ServerActor::spawn(&mut runtime, config, actors).await?;
+///     let server = ServerActor::spawn(&mut runtime, config, actors, test_database_info()).await?;
 ///     server.send(StartServer).await;
 ///
 ///     runtime.shutdown_all().await?;
@@ -201,6 +211,7 @@ impl ServerActor {
     /// * `runtime` - Mutable reference to the acton-reactive runtime
     /// * `config` - Initial server configuration
     /// * `actors` - Registry of actor handles for HTTP handlers
+    /// * `database_info` - Database connection metadata for status introspection
     ///
     /// # Returns
     ///
@@ -228,7 +239,7 @@ impl ServerActor {
     ///     let config = Config::default();
     ///     let actors = std::sync::Arc::new(dashmap::DashMap::new());
     ///
-    ///     let server = ServerActor::spawn(&mut runtime, config, actors).await?;
+    ///     let server = ServerActor::spawn(&mut runtime, config, actors, test_database_info()).await?;
     ///     runtime.shutdown_all().await?;
     ///     Ok(())
     /// }
@@ -237,10 +248,14 @@ impl ServerActor {
         runtime: &mut AgentRuntime,
         config: Config,
         actors: Arc<DashMap<String, AgentHandle>>,
+        database_info: DatabaseInfo,
     ) -> Result<AgentHandle> {
         let mut builder = runtime
             .new_agent_with_name::<ServerActor>("server".to_string())
             .await;
+
+        // Clone database_info before closure captures it
+        let db_info_for_closure = database_info.clone();
 
         // Initialize the actor state
         builder.model = ServerActor {
@@ -251,7 +266,7 @@ impl ServerActor {
         };
 
         // Handle StartServer messages
-        builder.mutate_on::<StartServer>(|agent, _envelope| {
+        builder.mutate_on::<StartServer>(move |agent, _envelope| {
             if agent.model.is_running {
                 warn!("Server is already running, ignoring StartServer message");
                 return AgentReply::immediate();
@@ -263,11 +278,13 @@ impl ServerActor {
             let actors = Arc::clone(&agent.model.actors);
             let console = actors.get("console").map(|h| h.clone());
             let broker = agent.handle().clone();
+            let database_info = db_info_for_closure.clone();
 
             // Create shared application state
             let app_state = AppState {
                 actors,
                 broker: broker.clone(),
+                database_info,
             };
 
             // Build the router with introspection endpoints
@@ -486,14 +503,25 @@ impl ServerActor {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
+
+    /// Helper to create test DatabaseInfo
+    fn test_database_info() -> DatabaseInfo {
+        DatabaseInfo {
+            db_path: PathBuf::from("/tmp/test_db"),
+            namespace: "crately".to_string(),
+            database: "production".to_string(),
+        }
+    }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn test_server_actor_spawn_succeeds() {
         let mut runtime = ActonApp::launch();
         let config = Config::default();
         let actors = Arc::new(DashMap::new());
+        let db_info = test_database_info();
 
-        let result = ServerActor::spawn(&mut runtime, config, actors).await;
+        let result = ServerActor::spawn(&mut runtime, config, actors, db_info).await;
         assert!(result.is_ok(), "ServerActor should spawn successfully");
 
         let handle = result.unwrap();
@@ -512,8 +540,9 @@ mod tests {
             pipeline: crate::actors::config::PipelineConfig::default(),
         }; // Use port 0 for random available port
         let actors = Arc::new(DashMap::new());
+        let db_info = test_database_info();
 
-        let handle = ServerActor::spawn(&mut runtime, config, actors)
+        let handle = ServerActor::spawn(&mut runtime, config, actors, db_info)
             .await
             .expect("Should spawn");
 
@@ -545,7 +574,7 @@ mod tests {
         };
         let actors = Arc::new(DashMap::new());
 
-        let handle = ServerActor::spawn(&mut runtime, config, actors)
+        let handle = ServerActor::spawn(&mut runtime, config, actors, test_database_info())
             .await
             .expect("Should spawn");
 
@@ -579,7 +608,7 @@ mod tests {
         };
         let actors = Arc::new(DashMap::new());
 
-        let handle = ServerActor::spawn(&mut runtime, config, actors.clone())
+        let handle = ServerActor::spawn(&mut runtime, config, actors.clone(), test_database_info())
             .await
             .expect("Should spawn");
 
@@ -638,7 +667,7 @@ mod tests {
         };
         let actors = Arc::new(DashMap::new());
 
-        let handle = ServerActor::spawn(&mut runtime, config, actors.clone())
+        let handle = ServerActor::spawn(&mut runtime, config, actors.clone(), test_database_info())
             .await
             .expect("Should spawn");
 
@@ -684,7 +713,7 @@ mod tests {
         };
         let actors = Arc::new(DashMap::new());
 
-        let handle = ServerActor::spawn(&mut runtime, config, actors.clone())
+        let handle = ServerActor::spawn(&mut runtime, config, actors.clone(), test_database_info())
             .await
             .expect("Should spawn server");
 
@@ -773,7 +802,7 @@ mod tests {
         };
         let actors = Arc::new(DashMap::new());
 
-        let handle = ServerActor::spawn(&mut runtime, config, actors.clone())
+        let handle = ServerActor::spawn(&mut runtime, config, actors.clone(), test_database_info())
             .await
             .expect("Should spawn server");
 
@@ -882,7 +911,7 @@ mod tests {
         actors.insert("console".to_string(), runtime.new_agent::<TestSubscriber>().await.start().await);
         actors.insert("database".to_string(), runtime.new_agent::<TestSubscriber>().await.start().await);
 
-        let handle = ServerActor::spawn(&mut runtime, config, actors.clone())
+        let handle = ServerActor::spawn(&mut runtime, config, actors.clone(), test_database_info())
             .await
             .expect("Should spawn server");
 
@@ -941,7 +970,7 @@ mod tests {
         actors.insert("actor2".to_string(), runtime.new_agent::<TestSubscriber>().await.start().await);
         actors.insert("actor3".to_string(), runtime.new_agent::<TestSubscriber>().await.start().await);
 
-        let handle = ServerActor::spawn(&mut runtime, config, actors.clone())
+        let handle = ServerActor::spawn(&mut runtime, config, actors.clone(), test_database_info())
             .await
             .expect("Should spawn server");
 
@@ -995,7 +1024,7 @@ mod tests {
 
         actors.insert("database".to_string(), runtime.new_agent::<TestSubscriber>().await.start().await);
 
-        let handle = ServerActor::spawn(&mut runtime, config, actors.clone())
+        let handle = ServerActor::spawn(&mut runtime, config, actors.clone(), test_database_info())
             .await
             .expect("Should spawn server");
 
@@ -1037,7 +1066,7 @@ mod tests {
         };
         let actors = Arc::new(DashMap::new());
 
-        let handle = ServerActor::spawn(&mut runtime, config, actors.clone())
+        let handle = ServerActor::spawn(&mut runtime, config, actors.clone(), test_database_info())
             .await
             .expect("Should spawn server");
 
@@ -1053,6 +1082,70 @@ mod tests {
             .expect("HTTP request should succeed");
 
         assert_eq!(response.status(), reqwest::StatusCode::NOT_FOUND);
+
+        // Cleanup
+        handle.send(StopServer).await;
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+        handle.stop().await.expect("Should stop server");
+        runtime
+            .shutdown_all()
+            .await
+            .expect("Runtime should shutdown");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_status_endpoint_includes_database_info() {
+        let mut runtime = ActonApp::launch();
+        let test_port = 38299;
+        let config = Config {
+            port: test_port,
+            pipeline: crate::actors::config::PipelineConfig::default(),
+        };
+        let actors = Arc::new(DashMap::new());
+
+        // Create database info with specific test values
+        let db_info = DatabaseInfo {
+            db_path: PathBuf::from("/tmp/test_crately_db"),
+            namespace: "test_namespace".to_string(),
+            database: "test_database".to_string(),
+        };
+
+        let handle = ServerActor::spawn(&mut runtime, config, actors.clone(), db_info.clone())
+            .await
+            .expect("Should spawn server");
+
+        handle.send(StartServer).await;
+        tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+
+        // Query status endpoint
+        let client = reqwest::Client::new();
+        let response = client
+            .get(format!("http://127.0.0.1:{}/status", test_port))
+            .send()
+            .await
+            .expect("HTTP request should succeed");
+
+        assert!(response.status().is_success(), "Should return 200 OK");
+
+        let body: serde_json::Value = response.json().await.expect("Should parse JSON response");
+
+        // Verify database info is present and correct
+        assert!(body["database"].is_object(), "database field should be present");
+        assert_eq!(
+            body["database"]["path"].as_str().unwrap(),
+            "/tmp/test_crately_db",
+            "Database path should match"
+        );
+        assert_eq!(
+            body["database"]["namespace"].as_str().unwrap(),
+            "test_namespace",
+            "Database namespace should match"
+        );
+        assert_eq!(
+            body["database"]["database"].as_str().unwrap(),
+            "test_database",
+            "Database name should match"
+        );
 
         // Cleanup
         handle.send(StopServer).await;
