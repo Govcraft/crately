@@ -8,8 +8,10 @@ use acton_reactive::prelude::*;
 use anyhow::Result;
 use axum::{
     Router,
-    extract::{Json, State},
-    routing::post,
+    extract::{Json, Path, State},
+    http::StatusCode,
+    response::IntoResponse,
+    routing::{get, post},
 };
 use crossterm::event::{KeyCode, KeyModifiers};
 use dashmap::DashMap;
@@ -78,6 +80,45 @@ async fn handle_crate_request(
     };
 
     Json(response)
+}
+
+/// Handle GET /status - Overall system health and status
+async fn status_handler(State(state): State<AppState>) -> impl IntoResponse {
+    let actor_count = state.actors.len();
+    let actors_list: Vec<String> = state.actors.iter().map(|entry| entry.key().clone()).collect();
+
+    Json(serde_json::json!({
+        "status": "healthy",
+        "actor_count": actor_count,
+        "actors": actors_list,
+        "timestamp": chrono::Utc::now().to_rfc3339()
+    }))
+}
+
+/// Handle GET /actors - List all running actors
+async fn list_actors_handler(State(state): State<AppState>) -> impl IntoResponse {
+    let actors: Vec<String> = state.actors.iter().map(|entry| entry.key().clone()).collect();
+
+    Json(serde_json::json!({
+        "actors": actors,
+        "count": actors.len()
+    }))
+}
+
+/// Handle GET /actors/{name} - Get specific actor information
+async fn get_actor_handler(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+) -> Result<impl IntoResponse, StatusCode> {
+    if state.actors.contains_key(&name) {
+        Ok(Json(serde_json::json!({
+            "name": name,
+            "status": "running",
+            "exists": true
+        })))
+    } else {
+        Err(StatusCode::NOT_FOUND)
+    }
 }
 
 /// Actor that manages the HTTP server lifecycle.
@@ -229,9 +270,12 @@ impl ServerActor {
                 broker: broker.clone(),
             };
 
-            // Build the router
+            // Build the router with introspection endpoints
             let app = Router::new()
                 .route("/crate", post(handle_crate_request))
+                .route("/status", get(status_handler))
+                .route("/actors", get(list_actors_handler))
+                .route("/actors/{name}", get(get_actor_handler))
                 .with_state(app_state);
 
             let addr = SocketAddr::from(([127, 0, 0, 1], config.port));
@@ -822,5 +866,201 @@ mod tests {
     #[acton_actor]
     struct TestSubscriber {
         event_tx: Option<tokio::sync::mpsc::UnboundedSender<CrateReceived>>,
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_status_endpoint_returns_actor_list() {
+        let mut runtime = ActonApp::launch();
+        let test_port = 38295;
+        let config = Config {
+            port: test_port,
+            pipeline: crate::actors::config::PipelineConfig::default(),
+        };
+        let actors = Arc::new(DashMap::new());
+
+        // Add some test actors to the registry
+        actors.insert("console".to_string(), runtime.new_agent::<TestSubscriber>().await.start().await);
+        actors.insert("database".to_string(), runtime.new_agent::<TestSubscriber>().await.start().await);
+
+        let handle = ServerActor::spawn(&mut runtime, config, actors.clone())
+            .await
+            .expect("Should spawn server");
+
+        // Start server
+        handle.send(StartServer).await;
+        tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+
+        // Query status endpoint
+        let client = reqwest::Client::new();
+        let response = client
+            .get(format!("http://127.0.0.1:{}/status", test_port))
+            .send()
+            .await
+            .expect("HTTP request should succeed");
+
+        assert!(response.status().is_success(), "Should return 200 OK");
+
+        let body: serde_json::Value = response.json().await.expect("Should parse JSON response");
+        assert_eq!(body["status"], "healthy");
+        assert_eq!(body["actor_count"], 2);
+        assert!(body["actors"].is_array());
+        assert!(body["timestamp"].is_string());
+
+        let actor_names: Vec<String> = body["actors"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap().to_string())
+            .collect();
+
+        assert!(actor_names.contains(&"console".to_string()));
+        assert!(actor_names.contains(&"database".to_string()));
+
+        // Cleanup
+        handle.send(StopServer).await;
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+        handle.stop().await.expect("Should stop server");
+        runtime
+            .shutdown_all()
+            .await
+            .expect("Runtime should shutdown");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_actors_endpoint_lists_all_actors() {
+        let mut runtime = ActonApp::launch();
+        let test_port = 38296;
+        let config = Config {
+            port: test_port,
+            pipeline: crate::actors::config::PipelineConfig::default(),
+        };
+        let actors = Arc::new(DashMap::new());
+
+        // Add test actors
+        actors.insert("actor1".to_string(), runtime.new_agent::<TestSubscriber>().await.start().await);
+        actors.insert("actor2".to_string(), runtime.new_agent::<TestSubscriber>().await.start().await);
+        actors.insert("actor3".to_string(), runtime.new_agent::<TestSubscriber>().await.start().await);
+
+        let handle = ServerActor::spawn(&mut runtime, config, actors.clone())
+            .await
+            .expect("Should spawn server");
+
+        handle.send(StartServer).await;
+        tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+
+        // Query actors endpoint
+        let client = reqwest::Client::new();
+        let response = client
+            .get(format!("http://127.0.0.1:{}/actors", test_port))
+            .send()
+            .await
+            .expect("HTTP request should succeed");
+
+        assert!(response.status().is_success());
+
+        let body: serde_json::Value = response.json().await.expect("Should parse JSON response");
+        assert_eq!(body["count"], 3);
+        assert!(body["actors"].is_array());
+
+        let actor_names: Vec<String> = body["actors"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap().to_string())
+            .collect();
+
+        assert!(actor_names.contains(&"actor1".to_string()));
+        assert!(actor_names.contains(&"actor2".to_string()));
+        assert!(actor_names.contains(&"actor3".to_string()));
+
+        // Cleanup
+        handle.send(StopServer).await;
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+        handle.stop().await.expect("Should stop server");
+        runtime
+            .shutdown_all()
+            .await
+            .expect("Runtime should shutdown");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_get_actor_endpoint_returns_existing_actor() {
+        let mut runtime = ActonApp::launch();
+        let test_port = 38297;
+        let config = Config {
+            port: test_port,
+            pipeline: crate::actors::config::PipelineConfig::default(),
+        };
+        let actors = Arc::new(DashMap::new());
+
+        actors.insert("database".to_string(), runtime.new_agent::<TestSubscriber>().await.start().await);
+
+        let handle = ServerActor::spawn(&mut runtime, config, actors.clone())
+            .await
+            .expect("Should spawn server");
+
+        handle.send(StartServer).await;
+        tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+
+        // Query specific actor
+        let client = reqwest::Client::new();
+        let response = client
+            .get(format!("http://127.0.0.1:{}/actors/database", test_port))
+            .send()
+            .await
+            .expect("HTTP request should succeed");
+
+        assert!(response.status().is_success());
+
+        let body: serde_json::Value = response.json().await.expect("Should parse JSON response");
+        assert_eq!(body["name"], "database");
+        assert_eq!(body["status"], "running");
+        assert_eq!(body["exists"], true);
+
+        // Cleanup
+        handle.send(StopServer).await;
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+        handle.stop().await.expect("Should stop server");
+        runtime
+            .shutdown_all()
+            .await
+            .expect("Runtime should shutdown");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_get_actor_endpoint_returns_404_for_nonexistent_actor() {
+        let mut runtime = ActonApp::launch();
+        let test_port = 38298;
+        let config = Config {
+            port: test_port,
+            pipeline: crate::actors::config::PipelineConfig::default(),
+        };
+        let actors = Arc::new(DashMap::new());
+
+        let handle = ServerActor::spawn(&mut runtime, config, actors.clone())
+            .await
+            .expect("Should spawn server");
+
+        handle.send(StartServer).await;
+        tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+
+        // Query non-existent actor
+        let client = reqwest::Client::new();
+        let response = client
+            .get(format!("http://127.0.0.1:{}/actors/nonexistent", test_port))
+            .send()
+            .await
+            .expect("HTTP request should succeed");
+
+        assert_eq!(response.status(), reqwest::StatusCode::NOT_FOUND);
+
+        // Cleanup
+        handle.send(StopServer).await;
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+        handle.stop().await.expect("Should stop server");
+        runtime
+            .shutdown_all()
+            .await
+            .expect("Runtime should shutdown");
     }
 }
