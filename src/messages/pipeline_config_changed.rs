@@ -54,7 +54,20 @@ use crate::actors::config::PipelineConfig;
 #[acton_message(raw)]
 #[derive(Clone)]
 pub struct PipelineConfigChanged {
-    /// The updated pipeline configuration
+    /// The updated pipeline configuration.
+    ///
+    /// NOTE: Currently unused but reserved for future hot-reload functionality.
+    /// When hot-reload is implemented, pipeline actors will subscribe to this
+    /// message and update their runtime behavior based on the new configuration.
+    ///
+    /// Planned subscribers:
+    /// - CrateDownloader: Update download settings
+    /// - FileReaderActor: Update extraction settings
+    /// - ProcessorActor: Update chunking settings
+    /// - VectorizerActor: Update embedding settings
+    ///
+    /// See issue #55 for planned hot-reload implementation.
+    #[allow(dead_code)]
     pub pipeline: PipelineConfig,
 }
 

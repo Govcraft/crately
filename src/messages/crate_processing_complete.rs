@@ -53,11 +53,27 @@ use crate::crate_specifier::CrateSpecifier;
 pub struct CrateProcessingComplete {
     /// The crate that was processed
     pub specifier: CrateSpecifier,
-    /// Feature flags for this crate
+    /// Feature flags for this crate.
+    ///
+    /// NOTE: Currently unused but reserved for completion event logging.
+    /// When Console subscribes to this event, features will be displayed in
+    /// the final success message to confirm which configuration was processed.
+    ///
+    /// See issue #55 for planned completion reporting.
+    #[allow(dead_code)]
     pub features: Vec<String>,
     /// Total pipeline duration in milliseconds
     pub total_duration_ms: u64,
-    /// Number of pipeline stages completed
+    /// Number of pipeline stages completed.
+    ///
+    /// NOTE: Currently unused but reserved for progress tracking and metrics.
+    /// Planned uses:
+    /// - Console: Display "Completed 4/4 stages" in success message
+    /// - MetricsActor: Track which stages completed for pipeline analytics
+    /// - Alerting: Detect partial completion scenarios
+    ///
+    /// See issue #55 for planned progress reporting.
+    #[allow(dead_code)]
     pub stages_completed: u32,
 }
 

@@ -58,7 +58,16 @@ pub struct DocumentationChunked {
     pub features: Vec<String>,
     /// Number of text chunks created
     pub chunk_count: u32,
-    /// Estimated total tokens across all chunks
+    /// Estimated total tokens across all chunks.
+    ///
+    /// NOTE: Currently unused but reserved for token tracking and cost estimation.
+    /// Planned uses:
+    /// - Console: Display token estimate in progress message ("42 chunks, ~8500 tokens")
+    /// - MetricsActor: Track token usage for embedding API cost estimation
+    /// - CostTracker: Calculate estimated API costs before vectorization
+    ///
+    /// See issue #55 for planned token tracking implementation.
+    #[allow(dead_code)]
     pub total_tokens_estimated: u32,
 }
 

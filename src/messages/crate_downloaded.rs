@@ -61,7 +61,16 @@ pub struct CrateDownloaded {
     pub features: Vec<String>,
     /// Path where crate was extracted
     pub extracted_path: PathBuf,
-    /// Download and extraction time in milliseconds
+    /// Download and extraction time in milliseconds.
+    ///
+    /// NOTE: Currently unused but reserved for future performance metrics collection.
+    /// Planned use cases:
+    /// - Console: Display timing in success messages ("Downloaded in 1.2s")
+    /// - MetricsActor: Track download performance over time
+    /// - DatabaseActor: Store timing data for analytics
+    ///
+    /// See issue #55 for planned metrics implementation.
+    #[allow(dead_code)]
     pub download_duration_ms: u64,
 }
 

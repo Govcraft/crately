@@ -39,13 +39,34 @@ use crate::crate_specifier::CrateSpecifier;
 /// ```
 #[acton_message]
 pub struct RetryCrateProcessing {
-    /// The crate to retry processing
+    /// The crate to retry processing.
+    ///
+    /// NOTE: Currently unused but broadcast by RetryCoordinator after backoff delay.
+    /// No actors currently subscribe to this message, so retries are not actually executed.
+    ///
+    /// Planned subscriber: CrateDownloader should subscribe and re-initiate processing.
+    ///
+    /// See issue #55 for retry implementation tracking.
+    #[allow(dead_code)]
     pub specifier: CrateSpecifier,
 
-    /// The features requested for this crate
+    /// The features requested for this crate.
+    ///
+    /// NOTE: Currently unused - part of unsubscribed retry message.
+    /// Will be used when CrateDownloader subscribes to retry events.
+    ///
+    /// See issue #55 for retry implementation tracking.
+    #[allow(dead_code)]
     pub features: Vec<String>,
 
-    /// The retry attempt number (1-indexed, first retry is 1)
+    /// The retry attempt number (1-indexed, first retry is 1).
+    ///
+    /// NOTE: Currently unused - part of unsubscribed retry message.
+    /// Will be used for retry tracking and backoff calculations when retry
+    /// handling is implemented.
+    ///
+    /// See issue #55 for retry implementation tracking.
+    #[allow(dead_code)]
     pub retry_attempt: u32,
 }
 

@@ -57,13 +57,29 @@ use crate::crate_specifier::CrateSpecifier;
 pub struct DocumentationVectorized {
     /// The crate that was processed
     pub specifier: CrateSpecifier,
-    /// Feature flags for this crate
+    /// Feature flags for this crate.
+    ///
+    /// NOTE: Currently unused but reserved for vectorization event logging.
+    /// When Console subscribes to this event, features will be displayed
+    /// to provide context about which crate configuration was vectorized.
+    ///
+    /// See issue #55 for planned event reporting.
+    #[allow(dead_code)]
     pub features: Vec<String>,
     /// Number of vectors created
     pub vector_count: u32,
     /// Embedding model used
     pub embedding_model: String,
-    /// Time taken for vectorization in milliseconds
+    /// Time taken for vectorization in milliseconds.
+    ///
+    /// NOTE: Currently unused but reserved for performance metrics and API usage tracking.
+    /// Planned uses:
+    /// - Console: Display timing in progress message ("Vectorized 42 chunks in 2.3s")
+    /// - MetricsActor: Track embedding API performance and latency
+    /// - CostTracker: Calculate actual API time and usage statistics
+    ///
+    /// See issue #55 for planned metrics implementation.
+    #[allow(dead_code)]
     pub vectorization_duration_ms: u64,
 }
 

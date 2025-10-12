@@ -55,7 +55,14 @@ use crate::crate_specifier::CrateSpecifier;
 pub struct CrateDownloadFailed {
     /// The crate that failed to download
     pub specifier: CrateSpecifier,
-    /// Feature flags that were requested
+    /// Feature flags that were requested.
+    ///
+    /// NOTE: Currently unused but reserved for better error context in logs and diagnostics.
+    /// When Console subscribes to this event, features will be included in error messages
+    /// to help users understand which feature configuration failed.
+    ///
+    /// See issue #55 for planned error reporting improvements.
+    #[allow(dead_code)]
     pub features: Vec<String>,
     /// Human-readable error description
     pub error_message: String,

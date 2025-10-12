@@ -47,7 +47,19 @@ use acton_reactive::prelude::*;
 /// ```
 #[acton_message]
 pub struct SimilarDocsResponse {
-    /// Ranked search results, sorted by similarity score (highest first)
+    /// Ranked search results, sorted by similarity score (highest first).
+    ///
+    /// NOTE: Currently unused but reserved for semantic search result handling.
+    /// This field will be used when search functionality is implemented, likely
+    /// by a dedicated SearchActor or API handler that formats results for users.
+    ///
+    /// Planned consumers:
+    /// - SearchActor: Format and display search results to users
+    /// - APIHandler: Serialize results to JSON for HTTP responses
+    /// - Console: Display top N results in terminal output
+    ///
+    /// See issue #55 for planned search functionality.
+    #[allow(dead_code)]
     pub results: Vec<SearchResult>,
 }
 
