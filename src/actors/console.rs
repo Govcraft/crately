@@ -8,13 +8,15 @@
 #![allow(dead_code)]
 
 use acton_reactive::prelude::*;
+use crossterm::tty::IsTty;
+use std::io::stdout;
 
 use crate::actors::config::ConfigLoaded;
 use crate::colors::{format_error, format_progress, format_success, format_warning, ColorConfig};
 use crate::messages::{
     ConfigReloadFailed, CrateListResponse, CratePersisted, CrateQueryResponse, DatabaseError,
-    Init, PrintError, PrintProgress, PrintSeparator, PrintSuccess, PrintWarning, ServerReloaded,
-    ServerStarted, SetRawMode,
+    DatabaseWarning, Init, PrintError, PrintProgress, PrintSeparator, PrintSuccess, PrintWarning,
+    ServerReloaded, ServerStarted, SetRawMode,
 };
 use tracing::info;
 
@@ -253,6 +255,15 @@ impl Console {
                 );
                 AgentReply::immediate()
             })
+            .act_on::<DatabaseWarning>(|actor, envelope| {
+                let msg = envelope.message();
+                print_warning(
+                    &format!("Database warning during {}: {}", msg.operation, msg.warning),
+                    actor.model.raw_mode_active,
+                    actor.model.color_config,
+                );
+                AgentReply::immediate()
+            })
             .act_on::<CrateQueryResponse>(|actor, envelope| {
                 let msg = envelope.message();
                 let raw_mode = actor.model.raw_mode_active;
@@ -340,12 +351,27 @@ impl Console {
         builder.handle().subscribe::<ServerStarted>().await;
         builder.handle().subscribe::<CratePersisted>().await;
         builder.handle().subscribe::<DatabaseError>().await;
+        builder.handle().subscribe::<DatabaseWarning>().await;
         builder.handle().subscribe::<CrateQueryResponse>().await;
         builder.handle().subscribe::<CrateListResponse>().await;
 
         Ok(builder.start().await)
     }
 }
+/// Checks if stdout is connected to a TTY (terminal).
+///
+/// This is used to determine whether console output should be displayed.
+/// When not connected to a TTY (e.g., CI/CD, background jobs, log files),
+/// console output is suppressed to avoid filling mailboxes with broadcast messages.
+///
+/// # Returns
+///
+/// Returns `true` if stdout is connected to a TTY, `false` otherwise
+#[inline]
+fn is_tty() -> bool {
+    stdout().is_tty()
+}
+
 /// Returns the appropriate line ending based on raw mode state.
 ///
 /// # Arguments
@@ -366,20 +392,32 @@ fn line_ending(raw_mode: bool) -> &'static str {
 
 /// Prints a line with the appropriate line ending for the current mode.
 ///
+/// This function checks if stdout is connected to a TTY before printing.
+/// If not in a TTY (e.g., CI/CD, background jobs), output is suppressed.
+///
 /// # Arguments
 ///
 /// * `text` - The text to print
 /// * `raw_mode` - Whether terminal raw mode is active
 fn print_line(text: &str, raw_mode: bool) {
+    if !is_tty() {
+        return;
+    }
     eprint!("{}{}", text, line_ending(raw_mode));
 }
 
 /// Prints a newline with the appropriate line ending for the current mode.
 ///
+/// This function checks if stdout is connected to a TTY before printing.
+/// If not in a TTY (e.g., CI/CD, background jobs), output is suppressed.
+///
 /// # Arguments
 ///
 /// * `raw_mode` - Whether terminal raw mode is active
 fn print_newline(raw_mode: bool) {
+    if !is_tty() {
+        return;
+    }
     eprint!("{}", line_ending(raw_mode));
 }
 
@@ -388,6 +426,9 @@ fn print_newline(raw_mode: bool) {
 /// This function uses [`BANNER_TEMPLATE`] to generate a consistent startup banner
 /// with the provided version string. The version is left-aligned within a 7-character
 /// field to maintain proper box alignment.
+///
+/// The banner is only displayed when stdout is connected to a TTY. When not in a TTY
+/// (e.g., CI/CD, background jobs), the banner is suppressed but still logged via tracing.
 ///
 /// # Arguments
 ///
@@ -528,6 +569,13 @@ mod tests {
     #[test]
     fn test_line_ending_raw_mode() {
         assert_eq!(line_ending(true), "\r\n");
+    }
+
+    #[test]
+    fn test_is_tty_does_not_panic() {
+        // This test verifies the is_tty function executes without panic
+        // The actual return value depends on test environment
+        let _ = is_tty();
     }
 
     #[test]

@@ -16,9 +16,10 @@ use crate::crate_specifier::CrateSpecifier;
 use crate::messages::{
     CrateDownloadFailed, CrateDownloaded, CrateListResponse, CrateProcessingComplete,
     CrateProcessingFailed, CrateQueryResponse, CrateReceived, CrateSummary, DatabaseError,
-    DatabaseReady, DocumentationChunked, DocumentationExtracted, DocumentationExtractionFailed,
-    DocumentationVectorized, ListCrates, PersistCodeSample, PersistCrate, PersistDocChunk,
-    PersistEmbedding, PrintWarning, QueryCrate, QuerySimilarDocs, SimilarDocsResponse,
+    DatabaseReady, DatabaseWarning, DocumentationChunked, DocumentationExtracted,
+    DocumentationExtractionFailed, DocumentationVectorized, ListCrates, PersistCodeSample,
+    PersistCrate, PersistDocChunk, PersistEmbedding, PrintWarning, QueryCrate, QuerySimilarDocs,
+    SimilarDocsResponse,
 };
 use crate::types::SearchResult;
 
@@ -820,41 +821,41 @@ impl DatabaseActor {
                             }
                             Ok(None) | Ok(Some(0)) => {
                                 // No chunks found - validation failed
-                                let error_msg = format!(
+                                let warning_msg = format!(
                                     "No doc_chunks found in database (expected {})",
                                     expected_chunk_count
                                 );
                                 warn!(
                                     "Cannot update {}@{} to 'chunked' status: {}",
-                                    name, version, error_msg
+                                    name, version, warning_msg
                                 );
                                 broker
-                                    .broadcast(DatabaseError {
+                                    .broadcast(DatabaseWarning {
                                         operation: format!(
                                             "validate chunking for {}@{}",
                                             name, version
                                         ),
-                                        error: error_msg,
+                                        warning: warning_msg,
                                     })
                                     .await;
                             }
                             Ok(Some(count)) => {
                                 // Chunks exist but count mismatch
-                                let error_msg = format!(
+                                let warning_msg = format!(
                                     "Chunk count mismatch: expected {}, found {} chunks in database",
                                     expected_chunk_count, count
                                 );
                                 warn!(
                                     "Cannot update {}@{} to 'chunked' status: {}",
-                                    name, version, error_msg
+                                    name, version, warning_msg
                                 );
                                 broker
-                                    .broadcast(DatabaseError {
+                                    .broadcast(DatabaseWarning {
                                         operation: format!(
                                             "validate chunking for {}@{}",
                                             name, version
                                         ),
-                                        error: error_msg,
+                                        warning: warning_msg,
                                     })
                                     .await;
                             }
@@ -953,42 +954,42 @@ impl DatabaseActor {
                                 }
                             }
                             Ok(None) | Ok(Some(0)) => {
-                                // No embeddings found - validation failed (THIS IS THE BUG FIX)
-                                let error_msg = format!(
+                                // No embeddings found - validation failed
+                                let warning_msg = format!(
                                     "No embeddings found in database (expected {})",
                                     expected_vector_count
                                 );
                                 warn!(
                                     "Cannot update {}@{} to 'vectorized' status: {}",
-                                    name, version, error_msg
+                                    name, version, warning_msg
                                 );
                                 broker
-                                    .broadcast(DatabaseError {
+                                    .broadcast(DatabaseWarning {
                                         operation: format!(
                                             "validate vectorization for {}@{}",
                                             name, version
                                         ),
-                                        error: error_msg,
+                                        warning: warning_msg,
                                     })
                                     .await;
                             }
                             Ok(Some(count)) => {
                                 // Embeddings exist but count mismatch
-                                let error_msg = format!(
+                                let warning_msg = format!(
                                     "Embedding count mismatch: expected {}, found {} embeddings in database",
                                     expected_vector_count, count
                                 );
                                 warn!(
                                     "Cannot update {}@{} to 'vectorized' status: {}",
-                                    name, version, error_msg
+                                    name, version, warning_msg
                                 );
                                 broker
-                                    .broadcast(DatabaseError {
+                                    .broadcast(DatabaseWarning {
                                         operation: format!(
                                             "validate vectorization for {}@{}",
                                             name, version
                                         ),
-                                        error: error_msg,
+                                        warning: warning_msg,
                                     })
                                     .await;
                             }
