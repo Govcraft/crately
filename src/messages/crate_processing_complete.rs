@@ -51,7 +51,11 @@ use crate::crate_specifier::CrateSpecifier;
 /// ```
 #[acton_message]
 pub struct CrateProcessingComplete {
-    /// The crate that was processed
+    /// The crate that was processed.
+    ///
+    /// NOTE: Currently unused by handlers but broadcast for observability.
+    /// Reserved for completion event subscribers (Console, MetricsActor).
+    #[allow(dead_code)]
     pub specifier: CrateSpecifier,
     /// Feature flags for this crate.
     ///
@@ -62,7 +66,11 @@ pub struct CrateProcessingComplete {
     /// See issue #55 for planned completion reporting.
     #[allow(dead_code)]
     pub features: Vec<String>,
-    /// Total pipeline duration in milliseconds
+    /// Total pipeline duration in milliseconds.
+    ///
+    /// NOTE: Currently unused by handlers but broadcast for observability.
+    /// Reserved for timing display and performance metrics tracking.
+    #[allow(dead_code)]
     pub total_duration_ms: u64,
     /// Number of pipeline stages completed.
     ///

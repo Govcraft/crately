@@ -20,11 +20,11 @@ use std::str::FromStr;
 use crate::crate_specifier::CrateSpecifier;
 use crate::messages::{
     ChunksPersistenceComplete, CrateDownloadFailed, CrateDownloaded, CrateListResponse,
-    CrateProcessingComplete, CrateProcessingFailed, CrateQueryResponse, CrateReceived,
-    CrateSummary, DatabaseError, DatabaseReady, DocChunkPersisted, DocumentationExtracted,
-    DocumentationExtractionFailed, EmbeddingPersisted, EmbeddingsPersistenceComplete, ListCrates,
-    PersistCodeSample, PersistCrate, PersistDocChunk, PersistEmbedding, PrintWarning, QueryCrate,
-    QuerySimilarDocs, SimilarDocsResponse,
+    CrateProcessingFailed, CrateQueryResponse, CrateReceived, CrateSummary, DatabaseError,
+    DatabaseReady, DocChunkPersisted, DocumentationExtracted, DocumentationExtractionFailed,
+    EmbeddingPersisted, EmbeddingsPersistenceComplete, ListCrates, PersistCodeSample, PersistCrate,
+    PersistDocChunk, PersistEmbedding, PrintWarning, QueryCrate, QuerySimilarDocs,
+    SimilarDocsResponse,
 };
 
 #[cfg(test)]
@@ -636,10 +636,6 @@ impl DatabaseActor {
             .handle()
             .subscribe::<EmbeddingsPersistenceComplete>()
             .await;
-        builder
-            .handle()
-            .subscribe::<CrateProcessingComplete>()
-            .await;
         builder.handle().subscribe::<CrateProcessingFailed>().await;
 
         // Handle CrateReceived - create initial crate record with pending status
@@ -945,7 +941,7 @@ impl DatabaseActor {
             })
         });
 
-        // Handle EmbeddingsPersistenceComplete - update status to vectorized after confirmed persistence
+        // Handle EmbeddingsPersistenceComplete - update status to complete after confirmed persistence
         builder.act_on::<EmbeddingsPersistenceComplete>(|agent, envelope| {
             let msg = envelope.message().clone();
             let db = agent.model.db.clone();
@@ -957,12 +953,14 @@ impl DatabaseActor {
                 let vector_count = msg.vector_count;
                 let embedding_model = msg.embedding_model.clone();
 
-                // Update status to 'vectorized' - persistence already confirmed by CrateCoordinatorActor
+                // Update status directly to 'complete' - persistence already confirmed by CrateCoordinatorActor
+                // This is the final status, so we set both vectorization_completed_at and completed_at
                 let update_query = r#"
                     UPDATE crate SET
-                        status = 'vectorized',
+                        status = 'complete',
                         status_updated_at = time::now(),
-                        vectorization_completed_at = time::now()
+                        vectorization_completed_at = time::now(),
+                        completed_at = time::now()
                     WHERE name = $name AND version = $version
                 "#;
 
@@ -974,165 +972,16 @@ impl DatabaseActor {
                 {
                     Ok(_) => {
                         debug!(
-                            "Updated crate status to vectorized: {}@{} ({} embeddings confirmed, model: {})",
+                            "Updated crate status to complete: {}@{} ({} embeddings confirmed, model: {})",
                             name, version, vector_count, embedding_model
                         );
                     }
                     Err(e) => {
-                        error!("Failed to update crate vectorization status: {}", e);
+                        error!("Failed to update crate completion status: {}", e);
                         broker
                             .broadcast(DatabaseError {
                                 operation: format!(
-                                    "update vectorization status for {}@{}",
-                                    name, version
-                                ),
-                                error: e.to_string(),
-                            })
-                            .await;
-                    }
-                }
-            })
-        });
-
-
-        // Handle CrateProcessingComplete - validate full pipeline, then update final status
-        builder.act_on::<CrateProcessingComplete>(|agent, envelope| {
-            let msg = envelope.message().clone();
-            let db = agent.model.db.clone();
-            let broker = agent.broker().clone();
-
-            AgentReply::from_async(async move {
-                let name = msg.specifier.name().to_string();
-                let version = msg.specifier.version().to_string();
-                let total_duration_ms = msg.total_duration_ms;
-
-                // VALIDATION: Verify all pipeline stages completed before marking as 'complete'
-                // Check that chunks exist, embeddings exist, and current status is 'vectorized'
-                let validation_query = r#"
-                    LET $crate = (SELECT status FROM crate WHERE name = $name AND version = $version LIMIT 1)[0];
-                    LET $chunk_count = count((SELECT id FROM doc_chunk WHERE crate_id.name = $name AND crate_id.version = $version));
-                    LET $embedding_count = count((SELECT id FROM embedding WHERE crate_id.name = $name AND crate_id.version = $version));
-                    RETURN {
-                        status: $crate.status,
-                        chunk_count: $chunk_count,
-                        embedding_count: $embedding_count
-                    };
-                "#;
-
-                match db
-                    .query(validation_query)
-                    .bind(("name", name.clone()))
-                    .bind(("version", version.clone()))
-                    .await
-                {
-                    Ok(mut response) => {
-                        let validation_result: Result<Option<serde_json::Value>, _> = response.take(0);
-
-                        match validation_result {
-                            Ok(Some(result)) => {
-                                let status = result.get("status")
-                                    .and_then(|v| v.as_str())
-                                    .unwrap_or("unknown");
-                                let chunk_count = result.get("chunk_count")
-                                    .and_then(|v| v.as_i64())
-                                    .unwrap_or(0);
-                                let embedding_count = result.get("embedding_count")
-                                    .and_then(|v| v.as_i64())
-                                    .unwrap_or(0);
-
-                                // Validation: must have vectorized status, chunks, and embeddings
-                                if status == "vectorized" && chunk_count > 0 && embedding_count > 0 {
-                                    // Validation passed - all prerequisites met
-                                    let update_query = r#"
-                                        UPDATE crate SET
-                                            status = 'complete',
-                                            status_updated_at = time::now(),
-                                            completed_at = time::now()
-                                        WHERE name = $name AND version = $version
-                                    "#;
-
-                                    match db
-                                        .query(update_query)
-                                        .bind(("name", name.clone()))
-                                        .bind(("version", version.clone()))
-                                        .await
-                                    {
-                                        Ok(_) => {
-                                            debug!(
-                                                "Updated crate status to complete: {}@{} (total duration: {}ms, {} chunks, {} embeddings)",
-                                                name, version, total_duration_ms, chunk_count, embedding_count
-                                            );
-                                        }
-                                        Err(e) => {
-                                            error!("Failed to update crate completion status: {}", e);
-                                            broker
-                                                .broadcast(DatabaseError {
-                                                    operation: format!(
-                                                        "update completion status for {}@{}",
-                                                        name, version
-                                                    ),
-                                                    error: e.to_string(),
-                                                })
-                                                .await;
-                                        }
-                                    }
-                                } else {
-                                    // Validation failed - prerequisites not met
-                                    let error_msg = format!(
-                                        "Cannot mark as 'complete': status={}, chunks={}, embeddings={} (expected status='vectorized' with chunks>0 and embeddings>0)",
-                                        status, chunk_count, embedding_count
-                                    );
-                                    warn!(
-                                        "Cannot update {}@{} to 'complete' status: {}",
-                                        name, version, error_msg
-                                    );
-                                    broker
-                                        .broadcast(DatabaseError {
-                                            operation: format!(
-                                                "validate completion for {}@{}",
-                                                name, version
-                                            ),
-                                            error: error_msg,
-                                        })
-                                        .await;
-                                }
-                            }
-                            Ok(None) => {
-                                let error_msg = "Crate record not found in database".to_string();
-                                warn!(
-                                    "Cannot update {}@{} to 'complete' status: {}",
-                                    name, version, error_msg
-                                );
-                                broker
-                                    .broadcast(DatabaseError {
-                                        operation: format!(
-                                            "validate completion for {}@{}",
-                                            name, version
-                                        ),
-                                        error: error_msg,
-                                    })
-                                    .await;
-                            }
-                            Err(e) => {
-                                error!("Failed to validate completion prerequisites for {}@{}: {}", name, version, e);
-                                broker
-                                    .broadcast(DatabaseError {
-                                        operation: format!(
-                                            "validate completion for {}@{}",
-                                            name, version
-                                        ),
-                                        error: e.to_string(),
-                                    })
-                                    .await;
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        error!("Failed to query completion prerequisites for {}@{}: {}", name, version, e);
-                        broker
-                            .broadcast(DatabaseError {
-                                operation: format!(
-                                    "validate completion for {}@{}",
+                                    "update completion status for {}@{}",
                                     name, version
                                 ),
                                 error: e.to_string(),
@@ -3189,19 +3038,7 @@ mod tests {
                 .await;
             tokio::time::sleep(Duration::from_millis(100)).await;
 
-            // Step 6: CrateProcessingComplete
-            runtime
-                .broker()
-                .broadcast(CrateProcessingComplete {
-                    specifier: specifier.clone(),
-                    features: vec!["test".to_string()],
-                    total_duration_ms: 625,
-                    stages_completed: 4,
-                })
-                .await;
-            tokio::time::sleep(Duration::from_millis(200)).await;
-
-            // Query final status
+            // Query final status after vectorization
             let mut subscriber_builder = runtime.new_agent::<TestSubscriber>().await;
 
             subscriber_builder.mutate_on::<CrateQueryResponse>(|agent, envelope| {
@@ -3744,186 +3581,6 @@ mod tests {
         .expect("Test should complete within timeout");
     }
 
-    /// Test that CrateProcessingComplete validates full pipeline before marking as complete
-    #[tokio::test(flavor = "multi_thread")]
-    async fn test_complete_status_validation_passes_with_full_pipeline() {
-        tokio::time::timeout(Duration::from_secs(15), async {
-            let mut runtime = ActonApp::launch();
-            let test_db_path = create_test_db_path("complete_validation_pass");
-
-            let (handle, _db_info) = DatabaseActor::spawn(&mut runtime, test_db_path.clone())
-                .await
-                .expect("Failed to spawn DatabaseActor");
-
-            tokio::time::sleep(Duration::from_millis(100)).await;
-
-            let specifier = CrateSpecifier::from_str("complete_test@1.0.0").unwrap();
-
-            // Full pipeline: Received → Downloaded → Extracted → Chunked → Vectorized → Complete
-            runtime
-                .broker()
-                .broadcast(CrateReceived {
-                    specifier: specifier.clone(),
-                    features: vec![],
-                })
-                .await;
-            tokio::time::sleep(Duration::from_millis(100)).await;
-
-            runtime
-                .broker()
-                .broadcast(CrateDownloaded {
-                    specifier: specifier.clone(),
-                    features: vec![],
-                    extracted_path: PathBuf::from("/tmp/test"),
-                    download_duration_ms: 100,
-                })
-                .await;
-            tokio::time::sleep(Duration::from_millis(100)).await;
-
-            runtime
-                .broker()
-                .broadcast(DocumentationExtracted {
-                    specifier: specifier.clone(),
-                    features: vec![],
-                    documentation_bytes: 1024,
-                    file_count: 5,
-                    extracted_path: PathBuf::from("/tmp/test"),
-                })
-                .await;
-            tokio::time::sleep(Duration::from_millis(100)).await;
-
-            // Persist chunks
-            for i in 0..2 {
-                let chunk_metadata = ChunkMetadata {
-                    content_type: "markdown".to_string(),
-                    start_line: None,
-                    end_line: None,
-                    token_count: 50,
-                    char_count: 200,
-                    parent_module: None,
-                    item_type: None,
-                    item_name: None,
-                };
-
-                handle
-                    .send(PersistDocChunk {
-                        specifier: specifier.clone(),
-                        chunk_index: i,
-                        chunk_id: format!("complete_test_1.0.0_chunk_{:03}", i),
-                        content: format!("Chunk {}", i),
-                        source_file: "complete.rs".to_string(),
-                        metadata: chunk_metadata,
-                    })
-                    .await;
-                tokio::time::sleep(Duration::from_millis(50)).await;
-            }
-
-            runtime
-                .broker()
-                .broadcast(DocumentationChunked {
-                    specifier: specifier.clone(),
-                    features: vec![],
-                    chunk_count: 2,
-                    total_tokens_estimated: 100,
-                })
-                .await;
-            tokio::time::sleep(Duration::from_millis(100)).await;
-
-            // Persist embeddings
-            for i in 0..2 {
-                handle
-                    .send(PersistEmbedding {
-                        specifier: specifier.clone(),
-                        chunk_id: format!("complete_test_1.0.0_chunk_{:03}", i),
-                        vector: vec![0.1, 0.2, 0.3],
-                        model_name: "test-model".to_string(),
-                        model_version: "v1".to_string(),
-                    })
-                    .await;
-                tokio::time::sleep(Duration::from_millis(50)).await;
-            }
-
-            runtime
-                .broker()
-                .broadcast(DocumentationVectorized {
-                    specifier: specifier.clone(),
-                    features: vec![],
-                    vector_count: 2,
-                    embedding_model: "test-model".to_string(),
-                    vectorization_duration_ms: 100,
-                })
-                .await;
-            tokio::time::sleep(Duration::from_millis(100)).await;
-
-            // Now send CrateProcessingComplete - should succeed
-            runtime
-                .broker()
-                .broadcast(CrateProcessingComplete {
-                    specifier: specifier.clone(),
-                    features: vec![],
-                    total_duration_ms: 500,
-                    stages_completed: 4,
-                })
-                .await;
-            tokio::time::sleep(Duration::from_millis(200)).await;
-
-            // Status should be 'complete' since validation passed
-
-            handle.stop().await.unwrap();
-            runtime.shutdown_all().await.unwrap();
-
-            cleanup_test_db(&test_db_path).await;
-        })
-        .await
-        .expect("Test should complete within timeout");
-    }
-
-    /// Test that CrateProcessingComplete rejects status update when prerequisites missing
-    #[tokio::test(flavor = "multi_thread")]
-    async fn test_complete_status_validation_fails_without_embeddings() {
-        tokio::time::timeout(Duration::from_secs(10), async {
-            let mut runtime = ActonApp::launch();
-            let test_db_path = create_test_db_path("complete_validation_fail");
-
-            let (_handle, _db_info) = DatabaseActor::spawn(&mut runtime, test_db_path.clone())
-                .await
-                .expect("Failed to spawn DatabaseActor");
-
-            tokio::time::sleep(Duration::from_millis(100)).await;
-
-            let specifier = CrateSpecifier::from_str("incomplete@1.0.0").unwrap();
-
-            // Create crate record but skip chunks and embeddings
-            runtime
-                .broker()
-                .broadcast(CrateReceived {
-                    specifier: specifier.clone(),
-                    features: vec![],
-                })
-                .await;
-            tokio::time::sleep(Duration::from_millis(100)).await;
-
-            // Try to mark as complete without prerequisites
-            runtime
-                .broker()
-                .broadcast(CrateProcessingComplete {
-                    specifier: specifier.clone(),
-                    features: vec![],
-                    total_duration_ms: 100,
-                    stages_completed: 4,
-                })
-                .await;
-            tokio::time::sleep(Duration::from_millis(200)).await;
-
-            // Status should NOT be 'complete' because validation failed
-
-            runtime.shutdown_all().await.unwrap();
-
-            cleanup_test_db(&test_db_path).await;
-        })
-        .await
-        .expect("Test should complete within timeout");
-    }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn test_idempotent_chunk_and_embedding_persistence() {
