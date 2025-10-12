@@ -10,7 +10,7 @@ use std::time::Instant;
 
 use crate::actors::config::VectorizeConfig;
 use crate::crate_specifier::CrateSpecifier;
-use crate::messages::{DocumentationChunked, DocumentationVectorized};
+use crate::messages::{DocumentationChunked, DocumentationVectorized, PersistEmbedding};
 
 /// Stateless actor for generating vector embeddings
 ///
@@ -117,7 +117,7 @@ impl VectorizerActor {
             AgentReply::from_async(async move {
                 let start_time = Instant::now();
 
-                match vectorize_chunks(&config, &msg.specifier, msg.chunk_count).await {
+                match vectorize_chunks(&config, &broker, &msg.specifier, msg.chunk_count).await {
                     Ok(vector_count) => {
                         let duration_ms = start_time.elapsed().as_millis() as u64;
 
@@ -154,13 +154,14 @@ impl VectorizerActor {
 
 /// Generates embeddings for documentation chunks
 ///
-/// This function generates mock embeddings for each chunk. In a real implementation,
-/// this would call an embedding API (e.g., OpenAI's embeddings endpoint) to generate
-/// actual vector embeddings.
+/// This function generates mock embeddings for each chunk and broadcasts `PersistEmbedding`
+/// messages to the DatabaseActor for persistence. In a real implementation, this would call
+/// an embedding API (e.g., OpenAI's embeddings endpoint) to generate actual vector embeddings.
 ///
 /// # Arguments
 ///
 /// * `config` - Vectorization configuration with model settings
+/// * `broker` - Message broker handle for broadcasting persistence messages
 /// * `specifier` - Crate name and version for context
 /// * `chunk_count` - Number of chunks to vectorize
 ///
@@ -176,6 +177,7 @@ impl VectorizerActor {
 /// - Vector persistence fails
 async fn vectorize_chunks(
     config: &VectorizeConfig,
+    broker: &AgentHandle,
     specifier: &CrateSpecifier,
     chunk_count: u32,
 ) -> Result<u32> {
@@ -185,7 +187,7 @@ async fn vectorize_chunks(
     // 2. Batch chunks for API calls
     // 3. Call embedding API for each batch
     // 4. Handle rate limiting and retries
-    // 5. Persist embeddings to database
+    // 5. Persist embeddings to database via PersistEmbedding messages
 
     // Simulate processing each chunk
     for index in 0..chunk_count {
@@ -199,13 +201,16 @@ async fn vectorize_chunks(
         // Generate mock embedding vector with configured dimensions
         let mock_vector = generate_mock_embedding(config.vector_dimension);
 
-        // Note: In the actual implementation, we would broadcast PersistEmbedding here
-        // For now, we're just logging that we would do this
-        tracing::debug!(
-            "Would persist embedding for chunk {} with {} dimensions",
-            chunk_id,
-            mock_vector.len()
-        );
+        // Broadcast PersistEmbedding message to DatabaseActor
+        broker
+            .broadcast(PersistEmbedding {
+                chunk_id: chunk_id.clone(),
+                specifier: specifier.clone(),
+                vector: mock_vector,
+                model_name: config.model_name.clone(),
+                model_version: config.model_version.clone(),
+            })
+            .await;
     }
 
     Ok(chunk_count)
@@ -258,28 +263,52 @@ mod tests {
         assert_eq!(actor.config.model_name, config.model_name);
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread")]
     async fn test_vectorize_chunks_success() {
+        let mut runtime = ActonApp::launch();
         let specifier = CrateSpecifier::from_str("test_crate@1.0.0").unwrap();
         let config = VectorizeConfig::default();
 
-        let result = vectorize_chunks(&config, &specifier, 5).await;
+        // Create a simple agent to get access to the broker
+        let mut builder = runtime.new_agent::<VectorizerActor>().await;
+        builder.model = VectorizerActor::new(config.clone());
+        let handle = builder.start().await;
+
+        // Get broker from the agent handle
+        let broker = handle.get_broker().expect("Broker should be available");
+
+        let result = vectorize_chunks(&config, &broker, &specifier, 5).await;
         assert!(result.is_ok(), "Vectorization should succeed");
 
         let vector_count = result.unwrap();
         assert_eq!(vector_count, 5, "Should have created 5 vectors");
+
+        handle.stop().await.unwrap();
+        runtime.shutdown_all().await.unwrap();
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread")]
     async fn test_vectorize_chunks_zero_chunks() {
+        let mut runtime = ActonApp::launch();
         let specifier = CrateSpecifier::from_str("empty@1.0.0").unwrap();
         let config = VectorizeConfig::default();
 
-        let result = vectorize_chunks(&config, &specifier, 0).await;
+        // Create a simple agent to get access to the broker
+        let mut builder = runtime.new_agent::<VectorizerActor>().await;
+        builder.model = VectorizerActor::new(config.clone());
+        let handle = builder.start().await;
+
+        // Get broker from the agent handle
+        let broker = handle.get_broker().expect("Broker should be available");
+
+        let result = vectorize_chunks(&config, &broker, &specifier, 0).await;
         assert!(result.is_ok(), "Vectorization of zero chunks should succeed");
 
         let vector_count = result.unwrap();
         assert_eq!(vector_count, 0, "Should have created 0 vectors");
+
+        handle.stop().await.unwrap();
+        runtime.shutdown_all().await.unwrap();
     }
 
     #[test]

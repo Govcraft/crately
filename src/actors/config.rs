@@ -368,6 +368,10 @@ pub struct VectorizeConfig {
     #[serde(default = "default_model_name")]
     pub model_name: String,
 
+    /// Embedding model version (default: "1.0")
+    #[serde(default = "default_model_version")]
+    pub model_version: String,
+
     /// Batch size for vectorization (default: 32)
     #[serde(default = "default_batch_size")]
     pub batch_size: usize,
@@ -389,6 +393,7 @@ impl Default for VectorizeConfig {
     fn default() -> Self {
         Self {
             model_name: default_model_name(),
+            model_version: default_model_version(),
             batch_size: default_batch_size(),
             vector_dimension: default_vector_dimension(),
             max_concurrent: default_max_concurrent_vectorize(),
@@ -430,6 +435,10 @@ impl VectorizeConfig {
 
 fn default_model_name() -> String {
     "all-MiniLM-L6-v2".to_string()
+}
+
+fn default_model_version() -> String {
+    "1.0".to_string()
 }
 
 fn default_batch_size() -> usize {
@@ -1123,6 +1132,7 @@ mod tests {
 
         // Vectorize config defaults
         assert_eq!(pipeline.vectorize.model_name, "all-MiniLM-L6-v2");
+        assert_eq!(pipeline.vectorize.model_version, "1.0");
         assert_eq!(pipeline.vectorize.batch_size, 32);
         assert_eq!(pipeline.vectorize.vector_dimension, 384);
         assert_eq!(pipeline.vectorize.max_concurrent, 2);
@@ -1372,6 +1382,7 @@ mod tests {
 
             [pipeline.vectorize]
             model_name = "custom-model"
+            model_version = "2.0"
             batch_size = 64
             vector_dimension = 768
             max_concurrent = 4
@@ -1386,6 +1397,7 @@ mod tests {
         assert_eq!(config.pipeline.process.chunk_size, 2000);
         assert!(!config.pipeline.process.extract_source_code);
         assert_eq!(config.pipeline.vectorize.model_name, "custom-model");
+        assert_eq!(config.pipeline.vectorize.model_version, "2.0");
         assert_eq!(config.pipeline.vectorize.batch_size, 64);
     }
 }
