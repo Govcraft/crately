@@ -7,10 +7,10 @@ use acton_reactive::prelude::*;
 use crately::actors::database::DatabaseActor;
 use crately::crate_specifier::CrateSpecifier;
 use crately::messages::{
-    CrateDownloaded, CrateListResponse, CrateProcessingComplete, CrateProcessingFailed,
-    CrateQueryResponse, DatabaseError, DocumentationChunked, DocumentationExtracted,
-    DocumentationVectorized, PersistCrate, PersistDocChunk, PersistEmbedding, QueryCrate,
-    QuerySimilarDocs, SimilarDocsResponse,
+    CrateDownloaded, CrateProcessingComplete, CrateProcessingFailed, CrateQueryResponse,
+    DatabaseError, DocumentationChunked, DocumentationExtracted, DocumentationVectorized,
+    PersistCrate, PersistDocChunk, PersistEmbedding, QueryCrate, QuerySimilarDocs,
+    SimilarDocsResponse,
 };
 use crately::types::ChunkMetadata;
 use std::path::PathBuf;
@@ -55,7 +55,6 @@ async fn cleanup_test_db(path: &std::path::Path) {
 #[derive(Default, Clone)]
 struct TestSubscriber {
     query_responses: Vec<CrateQueryResponse>,
-    list_responses: Vec<CrateListResponse>,
     error_responses: Vec<DatabaseError>,
     similar_docs_responses: Vec<SimilarDocsResponse>,
 }
@@ -541,7 +540,7 @@ async fn test_vector_search_accuracy_and_ranking() {
         tokio::time::sleep(Duration::from_millis(400)).await;
 
         // Setup: Persist crates and chunks with embeddings
-        let specifiers = vec![
+        let specifiers = [
             CrateSpecifier::from_str("tokio@1.35.0").unwrap(),
             CrateSpecifier::from_str("async-std@1.12.0").unwrap(),
             CrateSpecifier::from_str("actix-web@4.4.0").unwrap(),

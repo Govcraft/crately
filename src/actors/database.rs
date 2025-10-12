@@ -54,9 +54,6 @@ pub struct DatabaseInfo {
 #[derive(Clone, Debug)]
 pub struct DatabaseActor {
     db: Surreal<Db>,
-    namespace: String,
-    database: String,
-    db_path: PathBuf,
 }
 
 impl Default for DatabaseActor {
@@ -75,9 +72,6 @@ impl Default for DatabaseActor {
         // This will be immediately replaced by spawn() before the actor starts
         Self {
             db: Surreal::init(),
-            namespace: String::new(),
-            database: String::new(),
-            db_path: PathBuf::new(),
         }
     }
 }
@@ -192,12 +186,7 @@ impl DatabaseActor {
                 .context("Failed to create DatabaseActor agent configuration")?;
 
         // Create the DatabaseActor model with the established connection
-        let database_actor = DatabaseActor {
-            db,
-            namespace: namespace.clone(),
-            database: database.clone(),
-            db_path: db_path.clone(),
-        };
+        let database_actor = DatabaseActor { db };
 
         // Create agent builder
         let mut builder = runtime
@@ -1743,7 +1732,6 @@ mod tests {
     struct TestSubscriber {
         query_responses: Vec<CrateQueryResponse>,
         list_responses: Vec<CrateListResponse>,
-        error_responses: Vec<DatabaseError>,
     }
 
     #[tokio::test(flavor = "multi_thread")]

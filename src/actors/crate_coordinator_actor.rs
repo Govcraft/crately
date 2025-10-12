@@ -449,7 +449,7 @@ impl CrateCoordinatorActor {
             let mut timed_out_crates = Vec::new();
 
             // Check all non-terminal states for timeouts
-            for (specifier, state) in agent.model.processing_states.iter() {
+            for state in agent.model.processing_states.values() {
                 // Skip terminal states using is_terminal() utility method
                 if state.status.is_terminal() {
                     continue;
@@ -459,7 +459,7 @@ impl CrateCoordinatorActor {
                 let time_since_update = state.time_since_update();
                 if time_since_update > timeout_secs {
                     warn!(
-                        specifier = %specifier,
+                        specifier = %state.specifier,
                         status = ?state.status,
                         time_since_update = time_since_update,
                         timeout_threshold = timeout_secs,
@@ -467,7 +467,7 @@ impl CrateCoordinatorActor {
                     );
 
                     timed_out_crates.push((
-                        specifier.clone(),
+                        state.specifier.clone(),
                         state.status,
                     ));
                 }
