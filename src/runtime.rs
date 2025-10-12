@@ -51,6 +51,7 @@ use crate::{
         file_reader_actor::FileReaderActor,
         processor_actor::ProcessorActor,
         server_actor::ServerActor,
+        vectorizer_actor::VectorizerActor,
     },
     colors::ColorConfig,
     messages::{Init, PrintProgress, PrintSuccess, StopKeyboardHandler, StopServer},
@@ -82,6 +83,7 @@ use crate::actors::keyboard_handler::KeyboardHandler;
 /// - `"downloader"` - Stateless crate download worker actor
 /// - `"file_reader"` - Stateless documentation extraction worker actor
 /// - `"processor"` - Stateless documentation chunking worker actor
+/// - `"vectorizer"` - Stateless embedding generation worker actor
 /// - `"keyboard_handler"` - Keyboard event handler actor (server mode only)
 /// - `"server"` - HTTP server actor (server mode only)
 pub struct ActorSystem {
@@ -106,7 +108,8 @@ impl ActorSystem {
     /// 5. Spawns the DownloaderActor for crate downloads
     /// 6. Spawns the FileReaderActor for documentation extraction
     /// 7. Spawns the ProcessorActor for documentation chunking
-    /// 8. Stores all actor handles in the registry
+    /// 8. Spawns the VectorizerActor for embedding generation
+    /// 9. Stores all actor handles in the registry
     ///
     /// # Arguments
     ///
@@ -204,6 +207,13 @@ impl ActorSystem {
             .context("Failed to spawn ProcessorActor")?;
 
         actors.insert("processor".to_string(), processor.clone());
+
+        // Spawn VectorizerActor with configuration
+        let vectorizer = VectorizerActor::spawn(&mut runtime, config.pipeline.vectorize.clone())
+            .await
+            .context("Failed to spawn VectorizerActor")?;
+
+        actors.insert("vectorizer".to_string(), vectorizer.clone());
 
         Ok(Self {
             runtime,
@@ -545,14 +555,15 @@ impl ActorSystem {
     /// This method performs a clean shutdown sequence:
     /// 1. Stops ServerActor (if running) - gracefully stop accepting requests
     /// 2. Stops KeyboardHandler (if running) - stop listening for input
-    /// 3. Stops ProcessorActor - finish any pending work
-    /// 4. Stops FileReaderActor - finish any pending work
-    /// 5. Stops DownloaderActor - finish any pending work
-    /// 6. Stops DatabaseActor - close database connections
-    /// 7. Stops ConfigManager actor - finish any pending work
-    /// 8. Stops Console actor - last so logging works throughout
-    /// 9. Clears actor registry
-    /// 10. Shuts down the acton-reactive runtime
+    /// 3. Stops VectorizerActor - finish any pending work
+    /// 4. Stops ProcessorActor - finish any pending work
+    /// 5. Stops FileReaderActor - finish any pending work
+    /// 6. Stops DownloaderActor - finish any pending work
+    /// 7. Stops DatabaseActor - close database connections
+    /// 8. Stops ConfigManager actor - finish any pending work
+    /// 9. Stops Console actor - last so logging works throughout
+    /// 10. Clears actor registry
+    /// 11. Shuts down the acton-reactive runtime
     ///
     /// The shutdown order ensures that the server stops first, followed by
     /// supporting actors, with logging remaining available until all other
@@ -604,6 +615,16 @@ impl ActorSystem {
                     Err(e) => {
                         error!("Failed to stop KeyboardHandler: {:?}", e);
                     }
+                }
+            }
+        }
+
+        // Stop VectorizerActor
+        if let Some(vectorizer) = self.get_actor("vectorizer") {
+            match vectorizer.stop().await {
+                Ok(()) => {}
+                Err(e) => {
+                    error!("Failed to stop VectorizerActor: {:?}", e);
                 }
             }
         }
@@ -777,6 +798,13 @@ impl ActorSystem {
 
         actors.insert("processor".to_string(), processor.clone());
 
+        // Spawn VectorizerActor with test configuration
+        let vectorizer = VectorizerActor::spawn(&mut runtime, config.pipeline.vectorize.clone())
+            .await
+            .context("Failed to spawn VectorizerActor")?;
+
+        actors.insert("vectorizer".to_string(), vectorizer.clone());
+
         Ok(Self {
             runtime,
             actors,
@@ -850,6 +878,10 @@ mod tests {
             assert!(
                 system.get_actor("processor").is_some(),
                 "ProcessorActor should be registered"
+            );
+            assert!(
+                system.get_actor("vectorizer").is_some(),
+                "VectorizerActor should be registered"
             );
 
             system.shutdown().await.expect("Shutdown should succeed");
@@ -984,7 +1016,7 @@ mod tests {
                 .expect("Initialization should succeed");
 
             let actors = system.actors();
-            assert_eq!(actors.len(), 6, "Should have exactly 6 actors registered");
+            assert_eq!(actors.len(), 7, "Should have exactly 7 actors registered");
 
             system.shutdown().await.expect("Shutdown should succeed");
 
@@ -1009,7 +1041,7 @@ mod tests {
                 .expect("Initialization should succeed");
 
             let actors_before = system.actors();
-            assert_eq!(actors_before.len(), 6, "Should start with 6 actors");
+            assert_eq!(actors_before.len(), 7, "Should start with 7 actors");
 
             // Shutdown should succeed and clean up
             system.shutdown().await.expect("Shutdown should succeed");
@@ -1123,8 +1155,8 @@ mod tests {
             let actors = system.actors();
             assert_eq!(
                 actors.len(),
-                7,
-                "Should have exactly 7 actors (6 core + 1 server, keyboard_handler skipped in tests)"
+                8,
+                "Should have exactly 8 actors (7 core + 1 server, keyboard_handler skipped in tests)"
             );
 
             system.shutdown().await.expect("Shutdown should succeed");

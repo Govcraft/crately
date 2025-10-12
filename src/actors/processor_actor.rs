@@ -11,7 +11,8 @@ use std::path::Path;
 
 use crate::actors::config::ProcessConfig;
 use crate::crate_specifier::CrateSpecifier;
-use crate::messages::{DocumentationChunked, DocumentationExtracted};
+use crate::messages::{DocumentationChunked, DocumentationExtracted, PersistDocChunk};
+use crate::types::ChunkMetadata;
 
 /// Stateless actor for chunking documentation text
 ///
@@ -117,7 +118,42 @@ impl ProcessorActor {
 
             AgentReply::from_async(async move {
                 match chunk_documentation(&config, &msg.specifier, &msg.extracted_path).await {
-                    Ok((chunk_count, total_tokens_estimated)) => {
+                    Ok((chunks, total_tokens_estimated)) => {
+                        let chunk_count = chunks.len() as u32;
+
+                        // Persist all chunks to database before broadcasting event
+                        for (index, (content, source_file)) in chunks.into_iter().enumerate() {
+                            let chunk_id = format!(
+                                "{}_{}_{:03}",
+                                msg.specifier.name().replace('-', "_"),
+                                msg.specifier.version().to_string().replace('.', "_"),
+                                index
+                            );
+
+                            let metadata = ChunkMetadata {
+                                content_type: "markdown".to_string(),
+                                start_line: None,
+                                end_line: None,
+                                token_count: estimate_tokens(content.len()) as usize,
+                                char_count: content.len(),
+                                parent_module: None,
+                                item_type: None,
+                                item_name: None,
+                            };
+
+                            broker
+                                .broadcast(PersistDocChunk {
+                                    specifier: msg.specifier.clone(),
+                                    chunk_index: index,
+                                    chunk_id,
+                                    content,
+                                    source_file,
+                                    metadata,
+                                })
+                                .await;
+                        }
+
+                        // Broadcast DocumentationChunked event with statistics
                         broker
                             .broadcast(DocumentationChunked {
                                 specifier: msg.specifier,
@@ -162,7 +198,8 @@ impl ProcessorActor {
 ///
 /// # Returns
 ///
-/// Returns a tuple of (chunk_count, total_tokens_estimated) on success
+/// Returns a tuple of (chunks, total_tokens_estimated) on success where chunks
+/// is a vector of (content, source_file) tuples
 ///
 /// # Errors
 ///
@@ -174,7 +211,7 @@ async fn chunk_documentation(
     config: &ProcessConfig,
     specifier: &CrateSpecifier,
     extracted_path: &Path,
-) -> Result<(u32, u32)> {
+) -> Result<(Vec<(String, String)>, u32)> {
     // The extracted path is: download_dir/crate-version/
     // The tarball extracts to: download_dir/crate-version/crate-version/
     let crate_dir = extracted_path.join(format!(
@@ -193,6 +230,7 @@ async fn chunk_documentation(
 
     // Read and concatenate all documentation files
     let mut full_documentation = String::new();
+    let mut primary_source_file = String::from("combined");
 
     // Read README.md if it exists
     let readme_path = crate_dir.join("README.md");
@@ -202,6 +240,7 @@ async fn chunk_documentation(
         full_documentation.push_str("=== README.md ===\n\n");
         full_documentation.push_str(&readme_content);
         full_documentation.push_str("\n\n");
+        primary_source_file = String::from("README.md");
     }
 
     // Read Cargo.toml
@@ -239,14 +278,19 @@ async fn chunk_documentation(
     }
 
     // Chunk the documentation
-    let chunks = create_semantic_chunks(&full_documentation, config.chunk_size, config.chunk_overlap);
+    let text_chunks = create_semantic_chunks(&full_documentation, config.chunk_size, config.chunk_overlap);
 
-    // Count chunks and estimate tokens
-    let chunk_count = chunks.len() as u32;
-    let total_chars: usize = chunks.iter().map(|s| s.len()).sum();
+    // Pair each chunk with its source file
+    let chunks: Vec<(String, String)> = text_chunks
+        .into_iter()
+        .map(|content| (content, primary_source_file.clone()))
+        .collect();
+
+    // Estimate total tokens
+    let total_chars: usize = chunks.iter().map(|(content, _)| content.len()).sum();
     let total_tokens_estimated = estimate_tokens(total_chars);
 
-    Ok((chunk_count, total_tokens_estimated))
+    Ok((chunks, total_tokens_estimated))
 }
 
 /// Creates semantic chunks from documentation text
@@ -428,9 +472,14 @@ pub fn another() {
         let result = chunk_documentation(&config, &specifier, &extracted_path).await;
         assert!(result.is_ok(), "Documentation chunking should succeed");
 
-        let (chunk_count, total_tokens) = result.unwrap();
-        assert!(chunk_count > 0, "Should have created at least one chunk");
+        let (chunks, total_tokens) = result.unwrap();
+        assert!(!chunks.is_empty(), "Should have created at least one chunk");
         assert!(total_tokens > 0, "Should have estimated some tokens");
+        // Verify chunks have both content and source file
+        for (content, source_file) in &chunks {
+            assert!(!content.is_empty(), "Chunk content should not be empty");
+            assert!(!source_file.is_empty(), "Source file should not be empty");
+        }
 
         // Cleanup
         let _ = fs::remove_dir_all(&temp_dir);
