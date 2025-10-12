@@ -7,8 +7,8 @@
 use crate::actors::config::CoordinatorConfig;
 use crate::crate_specifier::CrateSpecifier;
 use crate::messages::{
-    CrateDownloadFailed, CrateDownloaded, CrateProcessingComplete, CrateProcessingFailed,
-    CrateReceived, DocumentationChunked, DocumentationExtracted,
+    CheckProcessingTimeouts, CrateDownloadFailed, CrateDownloaded, CrateProcessingComplete,
+    CrateProcessingFailed, CrateReceived, DocumentationChunked, DocumentationExtracted,
     DocumentationExtractionFailed, DocumentationVectorized, RetryCrateProcessing,
 };
 use acton_reactive::prelude::*;
@@ -178,7 +178,7 @@ impl CrateCoordinatorActor {
             processing_states: HashMap::new(),
         };
 
-        // Handle CrateReceived - initialize tracking
+        // Handle CrateReceived - initialize tracking and transition to Downloading
         builder.mutate_on::<CrateReceived>(|agent, envelope| {
             let msg = envelope.message().clone();
             let specifier = msg.specifier.clone();
@@ -190,13 +190,15 @@ impl CrateCoordinatorActor {
             );
 
             // Initialize state tracking
-            let state = CrateProcessingState::new(specifier.clone(), msg.features);
+            let mut state = CrateProcessingState::new(specifier.clone(), msg.features);
+            // Transition to Downloading status immediately
+            state.update_status(ProcessingStatus::Downloading);
             agent.model.processing_states.insert(specifier, state);
 
             AgentReply::immediate()
         });
 
-        // Handle CrateDownloaded - update to Downloaded
+        // Handle CrateDownloaded - update to Downloaded and transition to Extracting
         builder.mutate_on::<CrateDownloaded>(|agent, envelope| {
             let msg = envelope.message();
             let specifier = &msg.specifier;
@@ -206,8 +208,10 @@ impl CrateCoordinatorActor {
                 debug!(
                     specifier = %specifier,
                     status = ?state.status,
-                    "Updated processing status"
+                    "Download completed, preparing for extraction"
                 );
+                // Transition to Extracting status - next stage
+                state.update_status(ProcessingStatus::Extracting);
             }
 
             AgentReply::immediate()
@@ -221,6 +225,10 @@ impl CrateCoordinatorActor {
 
             if let Some(state) = agent.model.processing_states.get_mut(&specifier) {
                 state.update_with_error(ProcessingStatus::DownloadFailed, error.clone());
+
+                // Verify we're in a failure state using is_failure() utility
+                debug_assert!(state.status.is_failure(), "DownloadFailed should be a failure state");
+
                 state.increment_retry();
 
                 let retry_count = state.retry_count;
@@ -280,7 +288,7 @@ impl CrateCoordinatorActor {
             AgentReply::immediate()
         });
 
-        // Handle DocumentationExtracted - update to Extracted
+        // Handle DocumentationExtracted - update to Extracted and transition to Chunking
         builder.mutate_on::<DocumentationExtracted>(|agent, envelope| {
             let msg = envelope.message();
             let specifier = &msg.specifier;
@@ -290,8 +298,10 @@ impl CrateCoordinatorActor {
                 debug!(
                     specifier = %specifier,
                     status = ?state.status,
-                    "Updated processing status"
+                    "Extraction completed, preparing for chunking"
                 );
+                // Transition to Chunking status - next stage
+                state.update_status(ProcessingStatus::Chunking);
             }
 
             AgentReply::immediate()
@@ -305,6 +315,10 @@ impl CrateCoordinatorActor {
 
             if let Some(state) = agent.model.processing_states.get_mut(&specifier) {
                 state.update_with_error(ProcessingStatus::ExtractionFailed, error.clone());
+
+                // Verify we're in a failure state using is_failure() utility
+                debug_assert!(state.status.is_failure(), "ExtractionFailed should be a failure state");
+
                 state.increment_retry();
 
                 let retry_count = state.retry_count;
@@ -364,7 +378,7 @@ impl CrateCoordinatorActor {
             AgentReply::immediate()
         });
 
-        // Handle DocumentationChunked - update to Chunked
+        // Handle DocumentationChunked - update to Chunked and transition to Vectorizing
         builder.mutate_on::<DocumentationChunked>(|agent, envelope| {
             let msg = envelope.message();
             let specifier = &msg.specifier;
@@ -374,8 +388,10 @@ impl CrateCoordinatorActor {
                 debug!(
                     specifier = %specifier,
                     status = ?state.status,
-                    "Updated processing status"
+                    "Chunking completed, preparing for vectorization"
                 );
+                // Transition to Vectorizing status - next stage
+                state.update_status(ProcessingStatus::Vectorizing);
             }
 
             AgentReply::immediate()
@@ -387,6 +403,15 @@ impl CrateCoordinatorActor {
             let specifier = &msg.specifier;
 
             if let Some(state) = agent.model.processing_states.get_mut(specifier) {
+                // First transition to Vectorized status
+                state.update_status(ProcessingStatus::Vectorized);
+                debug!(
+                    specifier = %specifier,
+                    status = ?state.status,
+                    "Vectorization completed"
+                );
+
+                // Then transition to Complete
                 state.update_status(ProcessingStatus::Complete);
 
                 let total_duration_ms = state.total_duration_ms();
@@ -417,11 +442,60 @@ impl CrateCoordinatorActor {
             AgentReply::immediate()
         });
 
+        // Add timeout monitoring message handler
+        builder.mutate_on::<CheckProcessingTimeouts>(|agent, _envelope| {
+            let timeout_secs = agent.model.config.timeout_secs;
+            let broker = agent.broker().clone();
+            let mut timed_out_crates = Vec::new();
+
+            // Check all non-terminal states for timeouts
+            for (specifier, state) in agent.model.processing_states.iter() {
+                // Skip terminal states using is_terminal() utility method
+                if state.status.is_terminal() {
+                    continue;
+                }
+
+                // Use time_since_update() utility method
+                let time_since_update = state.time_since_update();
+                if time_since_update > timeout_secs {
+                    warn!(
+                        specifier = %specifier,
+                        status = ?state.status,
+                        time_since_update = time_since_update,
+                        timeout_threshold = timeout_secs,
+                        "Processing timeout detected"
+                    );
+
+                    timed_out_crates.push((
+                        specifier.clone(),
+                        state.status,
+                    ));
+                }
+            }
+
+            // Handle timeouts asynchronously
+            if !timed_out_crates.is_empty() {
+                return AgentReply::from_async(async move {
+                    for (specifier, status) in timed_out_crates {
+                        broker
+                            .broadcast(CrateProcessingFailed {
+                                specifier,
+                                stage: format!("{:?}", status).to_lowercase(),
+                                error: format!("Processing timeout after {}s", timeout_secs),
+                            })
+                            .await;
+                    }
+                });
+            }
+
+            AgentReply::immediate()
+        });
+
         // Start timeout detection background task
         builder.after_start(|agent| {
             let check_interval = agent.model.config.check_interval_secs;
             let timeout_secs = agent.model.config.timeout_secs;
-            let _broker = agent.broker().clone();
+            let handle = agent.handle().clone();
 
             info!(
                 check_interval_secs = check_interval,
@@ -436,11 +510,8 @@ impl CrateCoordinatorActor {
                     loop {
                         interval.tick().await;
 
-                        // Check for timeouts
-                        // Note: This is a simplified implementation
-                        // In production, we would need access to agent state
-                        // which requires a different pattern (message-based checks)
-                        debug!("Timeout detection check (placeholder)");
+                        // Send message to check timeouts
+                        handle.send(CheckProcessingTimeouts).await;
                     }
                 });
             })

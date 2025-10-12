@@ -87,6 +87,7 @@
 //! pub use download::Download;
 //! ```
 
+mod check_processing_timeouts;
 mod config_reload_failed;
 mod crate_downloaded;
 mod pipeline_config_changed;
@@ -127,6 +128,7 @@ mod start_server;
 mod stop_keyboard_handler;
 mod stop_server;
 
+pub use check_processing_timeouts::CheckProcessingTimeouts;
 pub use config_reload_failed::ConfigReloadFailed;
 pub use crate_downloaded::CrateDownloaded;
 pub use pipeline_config_changed::PipelineConfigChanged;
