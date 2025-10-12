@@ -56,7 +56,7 @@ use crate::{
         vectorizer_actor::VectorizerActor,
     },
     colors::ColorConfig,
-    messages::{Init, PrintProgress, PrintSuccess, StopKeyboardHandler, StopServer},
+    messages::{Init, PrintError, PrintProgress, PrintSuccess, StopKeyboardHandler, StopServer},
     retry_policy::RetryPolicy,
 };
 
@@ -181,20 +181,38 @@ impl ActorSystem {
         let db_path = Self::get_database_path()
             .context("Failed to determine database path")?;
 
-        let (database, db_info) = DatabaseActor::spawn(&mut runtime, db_path)
-            .await
-            .context("Failed to spawn DatabaseActor")?;
+        let db_info = match DatabaseActor::spawn(&mut runtime, db_path).await {
+            Ok((database, db_info)) => {
+                actors.insert("database".to_string(), database.clone());
 
-        actors.insert("database".to_string(), database.clone());
+                // Display database initialization via Console
+                console
+                    .send(PrintSuccess(format!(
+                        "Database initialized {} {}",
+                        crate::actors::console::LOCATION,
+                        db_info.db_path.display()
+                    )))
+                    .await;
 
-        // Display database initialization via Console
-        console
-            .send(PrintSuccess(format!(
-                "Database initialized {} {}",
-                crate::actors::console::LOCATION,
-                db_info.db_path.display()
-            )))
-            .await;
+                db_info
+            }
+            Err(e) => {
+                // Log the error using tracing for file logging
+                error!("Failed to spawn DatabaseActor: {}", e);
+
+                // Display error through Console actor for user visibility
+                console
+                    .send(PrintError(format!(
+                        "Failed to initialize database: {}", e
+                    )))
+                    .await;
+
+                // Give Console time to process the error message
+                tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+
+                return Err(e.context("Failed to spawn DatabaseActor"));
+            }
+        };
 
         // Spawn RetryCoordinator with retry policy configuration
         let retry_policy = RetryPolicy::default();
@@ -818,20 +836,38 @@ impl ActorSystem {
         actors.insert("config_manager".to_string(), config_manager.clone());
 
         // Spawn DatabaseActor with custom path (test isolation)
-        let (database, db_info) = DatabaseActor::spawn(&mut runtime, db_path)
-            .await
-            .context("Failed to spawn DatabaseActor")?;
+        let db_info = match DatabaseActor::spawn(&mut runtime, db_path).await {
+            Ok((database, db_info)) => {
+                actors.insert("database".to_string(), database.clone());
 
-        actors.insert("database".to_string(), database.clone());
+                // Display database initialization via Console
+                console
+                    .send(PrintSuccess(format!(
+                        "Database initialized {} {}",
+                        crate::actors::console::LOCATION,
+                        db_info.db_path.display()
+                    )))
+                    .await;
 
-        // Display database initialization via Console
-        console
-            .send(PrintSuccess(format!(
-                "Database initialized {} {}",
-                crate::actors::console::LOCATION,
-                db_info.db_path.display()
-            )))
-            .await;
+                db_info
+            }
+            Err(e) => {
+                // Log the error using tracing for file logging
+                error!("Failed to spawn DatabaseActor: {}", e);
+
+                // Display error through Console actor for user visibility
+                console
+                    .send(PrintError(format!(
+                        "Failed to initialize database: {}", e
+                    )))
+                    .await;
+
+                // Give Console time to process the error message
+                tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+
+                return Err(e.context("Failed to spawn DatabaseActor"));
+            }
+        };
 
         // Spawn RetryCoordinator with retry policy configuration
         let retry_policy = RetryPolicy::default();
