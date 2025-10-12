@@ -15,8 +15,9 @@ use crate::actors::config::ConfigLoaded;
 use crate::colors::{format_error, format_progress, format_success, format_warning, ColorConfig};
 use crate::messages::{
     ConfigReloadFailed, CrateListResponse, CratePersisted, CrateQueryResponse, DatabaseError,
-    DatabaseWarning, Init, PrintError, PrintProgress, PrintSeparator, PrintSuccess, PrintWarning,
-    ServerReloaded, ServerStarted, SetRawMode,
+    DatabaseWarning, DocChunkPersisted, EmbeddingPersisted, Init, PrintError, PrintProgress,
+    PrintSeparator, PrintSpinner, PrintSuccess, PrintWarning, ServerReloaded, ServerStarted,
+    SetRawMode, StopSpinner, UpdateSpinner,
 };
 use tracing::info;
 
@@ -55,6 +56,13 @@ pub const BANNER_TEMPLATE: &str = "\
 ║                     Version {version:<7}                       ║
 ╚═══════════════════════════════════════════════════════════╝";
 
+/// Commands for controlling the spinner task
+enum SpinnerCommand {
+    Start(String),
+    Update(String),
+    Stop,
+}
+
 #[acton_actor]
 pub struct Console {
     /// Whether terminal raw mode is currently active.
@@ -64,6 +72,8 @@ pub struct Console {
     raw_mode_active: bool,
     /// Color configuration for terminal output
     color_config: ColorConfig,
+    /// Channel sender for spinner commands
+    spinner_tx: Option<tokio::sync::mpsc::UnboundedSender<SpinnerCommand>>,
 }
 
 impl Console {
@@ -129,6 +139,7 @@ impl Console {
         builder.model = Console {
             raw_mode_active: false,
             color_config,
+            spinner_tx: None,
         };
 
         builder
@@ -342,6 +353,131 @@ impl Console {
                 }
 
                 AgentReply::immediate()
+            })
+            .mutate_on::<PrintSpinner>(|agent, envelope| {
+                let message = envelope.message();
+                let raw_mode = agent.model.raw_mode_active;
+                let color_config = agent.model.color_config;
+
+                // Create a new spinner task if one doesn't exist
+                if agent.model.spinner_tx.is_none() {
+                    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<SpinnerCommand>();
+                    agent.model.spinner_tx = Some(tx);
+
+                    tokio::spawn(async move {
+                        let frames = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+                        let mut frame_index = 0;
+                        let mut current_message = String::new();
+                        let mut running = false;
+
+                        loop {
+                            tokio::select! {
+                                Some(cmd) = rx.recv() => {
+                                    match cmd {
+                                        SpinnerCommand::Start(msg) => {
+                                            current_message = msg;
+                                            running = true;
+                                        }
+                                        SpinnerCommand::Update(msg) => {
+                                            current_message = msg;
+                                        }
+                                        SpinnerCommand::Stop => {
+                                            running = false;
+                                            // Clear the spinner line
+                                            eprint!("\r{}", " ".repeat(80));
+                                            eprint!("\r");
+                                            if raw_mode {
+                                                eprint!("\r\n");
+                                            }
+                                        }
+                                    }
+                                }
+                                _ = tokio::time::sleep(tokio::time::Duration::from_millis(80)), if running => {
+                                    // Print spinner frame with message
+                                    let formatted = format_progress(&current_message, color_config);
+                                    eprint!("\r{} {}", frames[frame_index], formatted);
+                                    frame_index = (frame_index + 1) % frames.len();
+                                }
+                            }
+                        }
+                    });
+                }
+
+                // Send start command
+                if let Some(tx) = &agent.model.spinner_tx {
+                    let _ = tx.send(SpinnerCommand::Start(message.message.clone()));
+                }
+
+                AgentReply::immediate()
+            })
+            .mutate_on::<UpdateSpinner>(|agent, envelope| {
+                let message = envelope.message();
+
+                // Send update command to spinner task
+                if let Some(tx) = &agent.model.spinner_tx {
+                    let _ = tx.send(SpinnerCommand::Update(message.message.clone()));
+                }
+
+                AgentReply::immediate()
+            })
+            .mutate_on::<StopSpinner>(|agent, envelope| {
+                let message = envelope.message();
+                let raw_mode = agent.model.raw_mode_active;
+                let color_config = agent.model.color_config;
+
+                // Send stop command to spinner task
+                if let Some(tx) = &agent.model.spinner_tx {
+                    let _ = tx.send(SpinnerCommand::Stop);
+                }
+
+                // Display final message if provided
+                if let Some(final_msg) = &message.final_message {
+                    if message.success {
+                        print_success(final_msg, raw_mode, color_config);
+                    } else {
+                        print_error(final_msg, raw_mode, color_config);
+                    }
+                }
+
+                AgentReply::immediate()
+            })
+            .act_on::<DocChunkPersisted>(|agent, envelope| {
+                let msg = envelope.message();
+
+                // Use chunk_index to show progress
+                let progress_msg = format!(
+                    "Persisting chunk {}/? for {}@{}",
+                    msg.chunk_index + 1, // Display as 1-indexed
+                    msg.specifier.name(),
+                    msg.specifier.version()
+                );
+
+                print_progress(
+                    &progress_msg,
+                    agent.model.raw_mode_active,
+                    agent.model.color_config,
+                );
+
+                AgentReply::immediate()
+            })
+            .act_on::<EmbeddingPersisted>(|agent, envelope| {
+                let msg = envelope.message();
+
+                // Use model_name to show which embedding model is being used
+                let progress_msg = format!(
+                    "Vectorized chunk for {}@{} with {}",
+                    msg.specifier.name(),
+                    msg.specifier.version(),
+                    msg.model_name
+                );
+
+                print_progress(
+                    &progress_msg,
+                    agent.model.raw_mode_active,
+                    agent.model.color_config,
+                );
+
+                AgentReply::immediate()
             });
 
         // Subscribe to broadcast messages before starting
@@ -354,6 +490,8 @@ impl Console {
         builder.handle().subscribe::<DatabaseWarning>().await;
         builder.handle().subscribe::<CrateQueryResponse>().await;
         builder.handle().subscribe::<CrateListResponse>().await;
+        builder.handle().subscribe::<DocChunkPersisted>().await;
+        builder.handle().subscribe::<EmbeddingPersisted>().await;
 
         Ok(builder.start().await)
     }
@@ -805,6 +943,331 @@ mod tests {
         console.send(SetRawMode(false)).await;
         tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
         console.send(PrintSuccess("Normal mode 2".to_string())).await;
+
+        console.stop().await.unwrap();
+        runtime.shutdown_all().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_console_actor_handles_print_spinner_message() {
+        use crate::cli::ColorChoice;
+        let mut runtime = ActonApp::launch();
+        let color_config = ColorConfig::new(ColorChoice::Never);
+        let console = Console::spawn(&mut runtime, color_config).await.unwrap();
+
+        // Send spinner start message
+        console
+            .send(PrintSpinner {
+                message: "Test spinner".to_string(),
+            })
+            .await;
+
+        // Let spinner run briefly
+        tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+
+        // Stop spinner
+        console
+            .send(StopSpinner {
+                success: true,
+                final_message: Some("Spinner completed".to_string()),
+            })
+            .await;
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+
+        console.stop().await.unwrap();
+        runtime.shutdown_all().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_console_actor_handles_update_spinner_message() {
+        use crate::cli::ColorChoice;
+        let mut runtime = ActonApp::launch();
+        let color_config = ColorConfig::new(ColorChoice::Never);
+        let console = Console::spawn(&mut runtime, color_config).await.unwrap();
+
+        // Start spinner
+        console
+            .send(PrintSpinner {
+                message: "Initial message".to_string(),
+            })
+            .await;
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+        // Update spinner message
+        console
+            .send(UpdateSpinner {
+                message: "Updated message".to_string(),
+            })
+            .await;
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+        // Stop spinner
+        console
+            .send(StopSpinner {
+                success: true,
+                final_message: None,
+            })
+            .await;
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+
+        console.stop().await.unwrap();
+        runtime.shutdown_all().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_console_actor_handles_stop_spinner_with_success() {
+        use crate::cli::ColorChoice;
+        let mut runtime = ActonApp::launch();
+        let color_config = ColorConfig::new(ColorChoice::Never);
+        let console = Console::spawn(&mut runtime, color_config).await.unwrap();
+
+        // Start spinner
+        console
+            .send(PrintSpinner {
+                message: "Working...".to_string(),
+            })
+            .await;
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+        // Stop with success
+        console
+            .send(StopSpinner {
+                success: true,
+                final_message: Some("Operation succeeded".to_string()),
+            })
+            .await;
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+
+        console.stop().await.unwrap();
+        runtime.shutdown_all().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_console_actor_handles_stop_spinner_with_failure() {
+        use crate::cli::ColorChoice;
+        let mut runtime = ActonApp::launch();
+        let color_config = ColorConfig::new(ColorChoice::Never);
+        let console = Console::spawn(&mut runtime, color_config).await.unwrap();
+
+        // Start spinner
+        console
+            .send(PrintSpinner {
+                message: "Working...".to_string(),
+            })
+            .await;
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+        // Stop with failure
+        console
+            .send(StopSpinner {
+                success: false,
+                final_message: Some("Operation failed".to_string()),
+            })
+            .await;
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+
+        console.stop().await.unwrap();
+        runtime.shutdown_all().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_console_actor_handles_stop_spinner_without_message() {
+        use crate::cli::ColorChoice;
+        let mut runtime = ActonApp::launch();
+        let color_config = ColorConfig::new(ColorChoice::Never);
+        let console = Console::spawn(&mut runtime, color_config).await.unwrap();
+
+        // Start spinner
+        console
+            .send(PrintSpinner {
+                message: "Working...".to_string(),
+            })
+            .await;
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+        // Stop without message
+        console
+            .send(StopSpinner {
+                success: true,
+                final_message: None,
+            })
+            .await;
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+
+        console.stop().await.unwrap();
+        runtime.shutdown_all().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_console_actor_handles_multiple_spinners_sequentially() {
+        use crate::cli::ColorChoice;
+        let mut runtime = ActonApp::launch();
+        let color_config = ColorConfig::new(ColorChoice::Never);
+        let console = Console::spawn(&mut runtime, color_config).await.unwrap();
+
+        // First spinner
+        console
+            .send(PrintSpinner {
+                message: "First operation".to_string(),
+            })
+            .await;
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+        console
+            .send(StopSpinner {
+                success: true,
+                final_message: Some("First done".to_string()),
+            })
+            .await;
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+
+        // Second spinner
+        console
+            .send(PrintSpinner {
+                message: "Second operation".to_string(),
+            })
+            .await;
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+        console
+            .send(StopSpinner {
+                success: true,
+                final_message: Some("Second done".to_string()),
+            })
+            .await;
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+
+        console.stop().await.unwrap();
+        runtime.shutdown_all().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_console_actor_handles_doc_chunk_persisted() {
+        use crate::cli::ColorChoice;
+        use crate::crate_specifier::CrateSpecifier;
+        use std::str::FromStr;
+
+        let mut runtime = ActonApp::launch();
+        let color_config = ColorConfig::new(ColorChoice::Never);
+        let console = Console::spawn(&mut runtime, color_config).await.unwrap();
+
+        // Broadcast DocChunkPersisted event
+        runtime
+            .broker()
+            .broadcast(DocChunkPersisted {
+                chunk_id: "test_chunk_001".to_string(),
+                specifier: CrateSpecifier::from_str("serde@1.0.0").unwrap(),
+                chunk_index: 5,
+            })
+            .await;
+
+        // Allow time for processing
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+
+        console.stop().await.unwrap();
+        runtime.shutdown_all().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_console_actor_handles_embedding_persisted() {
+        use crate::cli::ColorChoice;
+        use crate::crate_specifier::CrateSpecifier;
+        use std::str::FromStr;
+
+        let mut runtime = ActonApp::launch();
+        let color_config = ColorConfig::new(ColorChoice::Never);
+        let console = Console::spawn(&mut runtime, color_config).await.unwrap();
+
+        // Broadcast EmbeddingPersisted event
+        runtime
+            .broker()
+            .broadcast(EmbeddingPersisted {
+                chunk_id: "test_chunk_001".to_string(),
+                specifier: CrateSpecifier::from_str("tokio@1.35.0").unwrap(),
+                model_name: "text-embedding-3-small".to_string(),
+            })
+            .await;
+
+        // Allow time for processing
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+
+        console.stop().await.unwrap();
+        runtime.shutdown_all().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_console_actor_handles_multiple_chunk_progress() {
+        use crate::cli::ColorChoice;
+        use crate::crate_specifier::CrateSpecifier;
+        use std::str::FromStr;
+
+        let mut runtime = ActonApp::launch();
+        let color_config = ColorConfig::new(ColorChoice::Never);
+        let console = Console::spawn(&mut runtime, color_config).await.unwrap();
+
+        let specifier = CrateSpecifier::from_str("axum@0.7.0").unwrap();
+
+        // Simulate persisting multiple chunks
+        for chunk_idx in 0..5 {
+            runtime
+                .broker()
+                .broadcast(DocChunkPersisted {
+                    chunk_id: format!("axum_chunk_{:03}", chunk_idx),
+                    specifier: specifier.clone(),
+                    chunk_index: chunk_idx,
+                })
+                .await;
+
+            tokio::time::sleep(tokio::time::Duration::from_millis(20)).await;
+        }
+
+        console.stop().await.unwrap();
+        runtime.shutdown_all().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_console_actor_spinner_in_raw_mode() {
+        use crate::cli::ColorChoice;
+        let mut runtime = ActonApp::launch();
+        let color_config = ColorConfig::new(ColorChoice::Never);
+        let console = Console::spawn(&mut runtime, color_config).await.unwrap();
+
+        // Enable raw mode
+        console.send(SetRawMode(true)).await;
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+
+        // Start spinner in raw mode
+        console
+            .send(PrintSpinner {
+                message: "Raw mode spinner".to_string(),
+            })
+            .await;
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(150)).await;
+
+        // Stop spinner
+        console
+            .send(StopSpinner {
+                success: true,
+                final_message: Some("Raw mode complete".to_string()),
+            })
+            .await;
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
 
         console.stop().await.unwrap();
         runtime.shutdown_all().await.unwrap();
