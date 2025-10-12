@@ -2678,7 +2678,7 @@ mod tests {
                     specifier: specifier.clone(),
                     features: vec!["test".to_string()],
                     total_duration_ms: 625,
-                    record_id: "crate:test_crate_1_0_0".to_string(),
+                    stages_completed: 4,
                 })
                 .await;
             tokio::time::sleep(Duration::from_millis(200)).await;

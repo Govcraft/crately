@@ -25,6 +25,7 @@
 
 pub mod config;
 pub mod console;
+pub mod crate_coordinator_actor;
 pub mod database;
 pub mod downloader_actor;
 pub mod file_reader_actor;

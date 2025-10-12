@@ -62,6 +62,10 @@ pub struct PipelineConfig {
     /// Vectorization stage configuration
     #[serde(default)]
     pub vectorize: VectorizeConfig,
+
+    /// Coordinator configuration
+    #[serde(default)]
+    pub coordinator: CoordinatorConfig,
 }
 
 impl PipelineConfig {
@@ -75,6 +79,7 @@ impl PipelineConfig {
         self.read.validate()?;
         self.process.validate()?;
         self.vectorize.validate()?;
+        self.coordinator.validate()?;
         Ok(())
     }
 }
@@ -441,6 +446,84 @@ fn default_max_concurrent_vectorize() -> usize {
 
 fn default_vectorize_timeout() -> u64 {
     60
+}
+
+/// Configuration for the crate processing coordinator
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CoordinatorConfig {
+    /// Maximum retry attempts (default: 3)
+    #[serde(default = "default_max_retries_coordinator")]
+    pub max_retries: u32,
+
+    /// Retry backoff delay in seconds (default: 2)
+    #[serde(default = "default_retry_backoff")]
+    pub retry_backoff_secs: u64,
+
+    /// Processing timeout in seconds (default: 300 = 5 minutes)
+    #[serde(default = "default_processing_timeout")]
+    pub timeout_secs: u64,
+
+    /// Check interval for timeout detection in seconds (default: 30)
+    #[serde(default = "default_check_interval")]
+    pub check_interval_secs: u64,
+}
+
+impl Default for CoordinatorConfig {
+    fn default() -> Self {
+        Self {
+            max_retries: default_max_retries_coordinator(),
+            retry_backoff_secs: default_retry_backoff(),
+            timeout_secs: default_processing_timeout(),
+            check_interval_secs: default_check_interval(),
+        }
+    }
+}
+
+impl CoordinatorConfig {
+    /// Validates coordinator configuration
+    ///
+    /// # Errors
+    ///
+    /// Returns `ConfigError::InvalidValue` if any value is invalid
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        if self.max_retries == 0 {
+            return Err(ConfigError::InvalidValue(
+                "coordinator.max_retries must be > 0".to_string(),
+            ));
+        }
+        if self.retry_backoff_secs == 0 {
+            return Err(ConfigError::InvalidValue(
+                "coordinator.retry_backoff_secs must be > 0".to_string(),
+            ));
+        }
+        if self.timeout_secs == 0 {
+            return Err(ConfigError::InvalidValue(
+                "coordinator.timeout_secs must be > 0".to_string(),
+            ));
+        }
+        if self.check_interval_secs == 0 {
+            return Err(ConfigError::InvalidValue(
+                "coordinator.check_interval_secs must be > 0".to_string(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+fn default_max_retries_coordinator() -> u32 {
+    3
+}
+
+fn default_retry_backoff() -> u64 {
+    2
+}
+
+fn default_processing_timeout() -> u64 {
+    300
+}
+
+fn default_check_interval() -> u64 {
+    30
 }
 
 /// Message types for ConfigManager actor communication

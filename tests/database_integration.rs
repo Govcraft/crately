@@ -235,7 +235,7 @@ async fn test_full_pipeline_status_transitions() {
                 specifier: specifier.clone(),
                 features: vec!["full".to_string()],
                 total_duration_ms: 45000,
-                record_id: "tokio:1.35.0".to_string(),
+                stages_completed: 4,
             })
             .await;
 

@@ -46,6 +46,7 @@ use crate::{
     actors::{
         config::{Config, ConfigManager},
         console::Console,
+        crate_coordinator_actor::CrateCoordinatorActor,
         database::DatabaseActor,
         downloader_actor::DownloaderActor,
         file_reader_actor::FileReaderActor,
@@ -80,6 +81,7 @@ use crate::actors::keyboard_handler::KeyboardHandler;
 /// - `"console"` - Console output formatting actor
 /// - `"config_manager"` - Configuration management actor
 /// - `"database"` - Database persistence actor
+/// - `"coordinator"` - Crate processing pipeline coordinator actor
 /// - `"downloader"` - Stateless crate download worker actor
 /// - `"file_reader"` - Stateless documentation extraction worker actor
 /// - `"processor"` - Stateless documentation chunking worker actor
@@ -105,11 +107,12 @@ impl ActorSystem {
     /// 2. Spawns the Console actor and triggers initialization
     /// 3. Spawns the ConfigManager actor and loads configuration
     /// 4. Spawns the DatabaseActor for persistence operations
-    /// 5. Spawns the DownloaderActor for crate downloads
-    /// 6. Spawns the FileReaderActor for documentation extraction
-    /// 7. Spawns the ProcessorActor for documentation chunking
-    /// 8. Spawns the VectorizerActor for embedding generation
-    /// 9. Stores all actor handles in the registry
+    /// 5. Spawns the CrateCoordinatorActor for pipeline coordination
+    /// 6. Spawns the DownloaderActor for crate downloads
+    /// 7. Spawns the FileReaderActor for documentation extraction
+    /// 8. Spawns the ProcessorActor for documentation chunking
+    /// 9. Spawns the VectorizerActor for embedding generation
+    /// 10. Stores all actor handles in the registry
     ///
     /// # Arguments
     ///
@@ -186,6 +189,13 @@ impl ActorSystem {
                 db_info.db_path.display()
             )))
             .await;
+
+        // Spawn CrateCoordinatorActor with coordinator configuration
+        let coordinator = CrateCoordinatorActor::spawn(&mut runtime, config.pipeline.coordinator.clone())
+            .await
+            .context("Failed to spawn CrateCoordinatorActor")?;
+
+        actors.insert("coordinator".to_string(), coordinator.clone());
 
         // Spawn DownloaderActor with configuration
         let downloader = DownloaderActor::spawn(&mut runtime, config.pipeline.download.clone())
@@ -559,15 +569,17 @@ impl ActorSystem {
     /// 4. Stops ProcessorActor - finish any pending work
     /// 5. Stops FileReaderActor - finish any pending work
     /// 6. Stops DownloaderActor - finish any pending work
-    /// 7. Stops DatabaseActor - close database connections
-    /// 8. Stops ConfigManager actor - finish any pending work
-    /// 9. Stops Console actor - last so logging works throughout
-    /// 10. Clears actor registry
-    /// 11. Shuts down the acton-reactive runtime
+    /// 7. Stops CrateCoordinatorActor - finish coordination work
+    /// 8. Stops DatabaseActor - close database connections
+    /// 9. Stops ConfigManager actor - finish any pending work
+    /// 10. Stops Console actor - last so logging works throughout
+    /// 11. Clears actor registry
+    /// 12. Shuts down the acton-reactive runtime
     ///
     /// The shutdown order ensures that the server stops first, followed by
-    /// supporting actors, with logging remaining available until all other
-    /// actors have completed their shutdown procedures.
+    /// workers, then coordinator, then supporting actors, with logging
+    /// remaining available until all other actors have completed their
+    /// shutdown procedures.
     ///
     /// # Errors
     ///
@@ -655,6 +667,16 @@ impl ActorSystem {
                 Ok(()) => {}
                 Err(e) => {
                     error!("Failed to stop DownloaderActor: {:?}", e);
+                }
+            }
+        }
+
+        // Stop CrateCoordinatorActor
+        if let Some(coordinator) = self.get_actor("coordinator") {
+            match coordinator.stop().await {
+                Ok(()) => {}
+                Err(e) => {
+                    error!("Failed to stop CrateCoordinatorActor: {:?}", e);
                 }
             }
         }
@@ -777,6 +799,13 @@ impl ActorSystem {
             )))
             .await;
 
+        // Spawn CrateCoordinatorActor with test configuration
+        let coordinator = CrateCoordinatorActor::spawn(&mut runtime, config.pipeline.coordinator.clone())
+            .await
+            .context("Failed to spawn CrateCoordinatorActor")?;
+
+        actors.insert("coordinator".to_string(), coordinator.clone());
+
         // Spawn DownloaderActor with test configuration
         let downloader = DownloaderActor::spawn(&mut runtime, config.pipeline.download.clone())
             .await
@@ -882,6 +911,33 @@ mod tests {
             assert!(
                 system.get_actor("vectorizer").is_some(),
                 "VectorizerActor should be registered"
+            );
+
+            system.shutdown().await.expect("Shutdown should succeed");
+
+            // Cleanup
+            let _ = std::fs::remove_dir_all(&test_db_path);
+        })
+        .await
+        .expect("Test should complete within timeout");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_actor_system_registers_coordinator_actor() {
+        tokio::time::timeout(tokio::time::Duration::from_secs(10), async {
+            let color_config = ColorConfig::new(crate::cli::ColorChoice::Never);
+
+            // Create unique temp path for this test
+            let test_db_path = env::temp_dir().join("crately_test_runtime_registers_coordinator_actor");
+            let _ = std::fs::remove_dir_all(&test_db_path);
+
+            let system = ActorSystem::initialize_with_db_path(color_config, test_db_path.clone())
+                .await
+                .expect("Initialization should succeed");
+
+            assert!(
+                system.get_actor("coordinator").is_some(),
+                "CrateCoordinatorActor should be registered"
             );
 
             system.shutdown().await.expect("Shutdown should succeed");
@@ -1016,7 +1072,7 @@ mod tests {
                 .expect("Initialization should succeed");
 
             let actors = system.actors();
-            assert_eq!(actors.len(), 7, "Should have exactly 7 actors registered");
+            assert_eq!(actors.len(), 8, "Should have exactly 8 actors registered");
 
             system.shutdown().await.expect("Shutdown should succeed");
 
@@ -1041,7 +1097,7 @@ mod tests {
                 .expect("Initialization should succeed");
 
             let actors_before = system.actors();
-            assert_eq!(actors_before.len(), 7, "Should start with 7 actors");
+            assert_eq!(actors_before.len(), 8, "Should start with 8 actors");
 
             // Shutdown should succeed and clean up
             system.shutdown().await.expect("Shutdown should succeed");
@@ -1155,8 +1211,8 @@ mod tests {
             let actors = system.actors();
             assert_eq!(
                 actors.len(),
-                8,
-                "Should have exactly 8 actors (7 core + 1 server, keyboard_handler skipped in tests)"
+                9,
+                "Should have exactly 9 actors (8 core + 1 server, keyboard_handler skipped in tests)"
             );
 
             system.shutdown().await.expect("Shutdown should succeed");
