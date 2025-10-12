@@ -14,11 +14,11 @@ use std::str::FromStr;
 
 use crate::crate_specifier::CrateSpecifier;
 use crate::messages::{
-    CrateDownloaded, CrateListResponse, CrateProcessingComplete, CrateProcessingFailed,
-    CrateQueryResponse, CrateSummary, DatabaseError, DatabaseReady, DocumentationChunked,
-    DocumentationExtracted, DocumentationVectorized, ListCrates, PersistCodeSample,
-    PersistCrate, PersistDocChunk, PersistEmbedding, QueryCrate, QuerySimilarDocs,
-    SimilarDocsResponse,
+    CrateDownloadFailed, CrateDownloaded, CrateListResponse, CrateProcessingComplete,
+    CrateProcessingFailed, CrateQueryResponse, CrateReceived, CrateSummary, DatabaseError,
+    DatabaseReady, DocumentationChunked, DocumentationExtracted, DocumentationExtractionFailed,
+    DocumentationVectorized, ListCrates, PersistCodeSample, PersistCrate, PersistDocChunk,
+    PersistEmbedding, QueryCrate, QuerySimilarDocs, SimilarDocsResponse,
 };
 use crate::types::SearchResult;
 
@@ -501,12 +501,66 @@ impl DatabaseActor {
         });
 
         // Subscribe to pipeline events for state tracking
+        builder.handle().subscribe::<CrateReceived>().await;
         builder.handle().subscribe::<CrateDownloaded>().await;
+        builder.handle().subscribe::<CrateDownloadFailed>().await;
         builder.handle().subscribe::<DocumentationExtracted>().await;
+        builder.handle().subscribe::<DocumentationExtractionFailed>().await;
         builder.handle().subscribe::<DocumentationChunked>().await;
         builder.handle().subscribe::<DocumentationVectorized>().await;
         builder.handle().subscribe::<CrateProcessingComplete>().await;
         builder.handle().subscribe::<CrateProcessingFailed>().await;
+
+        // Handle CrateReceived - create initial crate record with pending status
+        builder.act_on::<CrateReceived>(|agent, envelope| {
+            let msg = envelope.message().clone();
+            let db = agent.model.db.clone();
+            let broker = agent.broker().clone();
+
+            AgentReply::from_async(async move {
+                let name = msg.specifier.name().to_string();
+                let version = msg.specifier.version().to_string();
+
+                // Create initial crate record with pending status
+                let create_query = r#"
+                    CREATE crate CONTENT {
+                        name: $name,
+                        version: $version,
+                        features: $features,
+                        status: 'pending',
+                        requested_at: time::now(),
+                        status_updated_at: time::now(),
+                        retry_count: 0,
+                        dependencies: [],
+                        cargo_metadata: NONE
+                    }
+                "#;
+
+                match db
+                    .query(create_query)
+                    .bind(("name", name.clone()))
+                    .bind(("version", version.clone()))
+                    .bind(("features", msg.features.clone()))
+                    .await
+                {
+                    Ok(_) => {
+                        debug!(
+                            "Created crate record with pending status: {}@{}",
+                            name, version
+                        );
+                    }
+                    Err(e) => {
+                        error!("Failed to create crate record: {}", e);
+                        broker
+                            .broadcast(DatabaseError {
+                                operation: format!("create crate record for {}@{}", name, version),
+                                error: e.to_string(),
+                            })
+                            .await;
+                    }
+                }
+            })
+        });
 
         // Handle CrateDownloaded - update status and record download completion
         builder.act_on::<CrateDownloaded>(|agent, envelope| {
@@ -559,6 +613,58 @@ impl DatabaseActor {
             })
         });
 
+        // Handle CrateDownloadFailed - record download failure details
+        builder.act_on::<CrateDownloadFailed>(|agent, envelope| {
+            let msg = envelope.message().clone();
+            let db = agent.model.db.clone();
+            let broker = agent.broker().clone();
+
+            AgentReply::from_async(async move {
+                let name = msg.specifier.name().to_string();
+                let version = msg.specifier.version().to_string();
+                let error_message = msg.error_message.clone();
+                let error_kind = format!("{:?}", msg.error_kind);
+
+                let update_query = r#"
+                    UPDATE crate SET
+                        status = 'download_failed',
+                        status_updated_at = time::now(),
+                        error_stage = 'download',
+                        error_message = $error_message,
+                        error_timestamp = time::now(),
+                        retry_count = retry_count + 1
+                    WHERE name = $name AND version = $version
+                "#;
+
+                match db
+                    .query(update_query)
+                    .bind(("name", name.clone()))
+                    .bind(("version", version.clone()))
+                    .bind(("error_message", format!("{}: {}", error_kind, error_message)))
+                    .await
+                {
+                    Ok(_) => {
+                        debug!(
+                            "Updated crate status to download_failed: {}@{} (error: {})",
+                            name, version, error_message
+                        );
+                    }
+                    Err(e) => {
+                        error!("Failed to update crate download failure status: {}", e);
+                        broker
+                            .broadcast(DatabaseError {
+                                operation: format!(
+                                    "update download failure status for {}@{}",
+                                    name, version
+                                ),
+                                error: e.to_string(),
+                            })
+                            .await;
+                    }
+                }
+            })
+        });
+
         // Handle DocumentationExtracted - update status and record extraction
         builder.act_on::<DocumentationExtracted>(|agent, envelope| {
             let msg = envelope.message().clone();
@@ -597,6 +703,59 @@ impl DatabaseActor {
                             .broadcast(DatabaseError {
                                 operation: format!(
                                     "update extraction status for {}@{}",
+                                    name, version
+                                ),
+                                error: e.to_string(),
+                            })
+                            .await;
+                    }
+                }
+            })
+        });
+
+        // Handle DocumentationExtractionFailed - record extraction failure details
+        builder.act_on::<DocumentationExtractionFailed>(|agent, envelope| {
+            let msg = envelope.message().clone();
+            let db = agent.model.db.clone();
+            let broker = agent.broker().clone();
+
+            AgentReply::from_async(async move {
+                let name = msg.specifier.name().to_string();
+                let version = msg.specifier.version().to_string();
+                let error_message = msg.error_message.clone();
+                let error_kind = format!("{:?}", msg.error_kind);
+                let elapsed_ms = msg.elapsed_ms;
+
+                let update_query = r#"
+                    UPDATE crate SET
+                        status = 'extraction_failed',
+                        status_updated_at = time::now(),
+                        error_stage = 'extraction',
+                        error_message = $error_message,
+                        error_timestamp = time::now(),
+                        retry_count = retry_count + 1
+                    WHERE name = $name AND version = $version
+                "#;
+
+                match db
+                    .query(update_query)
+                    .bind(("name", name.clone()))
+                    .bind(("version", version.clone()))
+                    .bind(("error_message", format!("{}: {} (elapsed: {}ms)", error_kind, error_message, elapsed_ms)))
+                    .await
+                {
+                    Ok(_) => {
+                        debug!(
+                            "Updated crate status to extraction_failed: {}@{} (error: {}, elapsed: {}ms)",
+                            name, version, error_message, elapsed_ms
+                        );
+                    }
+                    Err(e) => {
+                        error!("Failed to update crate extraction failure status: {}", e);
+                        broker
+                            .broadcast(DatabaseError {
+                                operation: format!(
+                                    "update extraction failure status for {}@{}",
                                     name, version
                                 ),
                                 error: e.to_string(),
@@ -1369,8 +1528,9 @@ impl DatabaseActor {
 
                     -- Processing state machine
                     DEFINE FIELD status ON TABLE crate TYPE string DEFAULT 'pending'
-                        ASSERT $value IN ['pending', 'downloading', 'downloaded', 'extracting',
-                                          'extracted', 'compiling_docs', 'docs_compiled',
+                        ASSERT $value IN ['pending', 'downloading', 'downloaded', 'download_failed',
+                                          'extracting', 'extracted', 'extraction_failed',
+                                          'compiling_docs', 'docs_compiled',
                                           'chunking', 'chunked', 'vectorizing', 'vectorized',
                                           'complete', 'failed'];
 
@@ -2163,6 +2323,412 @@ mod tests {
 
         // Cleanup
         cleanup_test_db(&test_db_path).await;
+        })
+        .await
+        .expect("Test should complete within timeout");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_database_actor_crate_received_event() {
+        tokio::time::timeout(Duration::from_secs(15), async {
+            use std::str::FromStr;
+
+            let mut runtime = ActonApp::launch();
+            let test_db_path = create_test_db_path("crate_received");
+
+            let (handle, _db_info) = DatabaseActor::spawn(&mut runtime, test_db_path.clone())
+                .await
+                .unwrap();
+
+            // Wait for schema initialization
+            tokio::time::sleep(Duration::from_millis(300)).await;
+
+            // Broadcast CrateReceived event
+            let specifier = CrateSpecifier::from_str("serde@1.0.0").unwrap();
+            runtime
+                .broker()
+                .broadcast(CrateReceived {
+                    specifier: specifier.clone(),
+                    features: vec!["derive".to_string()],
+                })
+                .await;
+
+            // Wait for event processing
+            tokio::time::sleep(Duration::from_millis(200)).await;
+
+            // Query the crate to verify it was created
+            let mut subscriber_builder = runtime.new_agent::<TestSubscriber>().await;
+
+            subscriber_builder.mutate_on::<CrateQueryResponse>(|agent, envelope| {
+                let msg = envelope.message().clone();
+                agent.model.query_responses.push(msg);
+                AgentReply::immediate()
+            });
+
+            subscriber_builder.after_stop(|agent| {
+                assert_eq!(
+                    agent.model.query_responses.len(),
+                    1,
+                    "Should receive exactly one query response"
+                );
+
+                let response = &agent.model.query_responses[0];
+                assert!(response.specifier.is_some(), "Should find the crate");
+
+                let spec = response.specifier.as_ref().unwrap();
+                assert_eq!(spec.name(), "serde");
+                assert_eq!(spec.version().to_string(), "1.0.0");
+                assert_eq!(response.features, vec!["derive"]);
+                assert_eq!(response.status, "pending", "Status should be pending");
+
+                AgentReply::immediate()
+            });
+
+            subscriber_builder
+                .handle()
+                .subscribe::<CrateQueryResponse>()
+                .await;
+            let subscriber_handle = subscriber_builder.start().await;
+
+            // Query the crate
+            handle
+                .send(QueryCrate {
+                    name: "serde".to_string(),
+                    version: Some("1.0.0".to_string()),
+                })
+                .await;
+
+            tokio::time::sleep(Duration::from_millis(200)).await;
+
+            // Clean shutdown
+            subscriber_handle.stop().await.unwrap();
+            handle.stop().await.unwrap();
+            runtime.shutdown_all().await.unwrap();
+
+            cleanup_test_db(&test_db_path).await;
+        })
+        .await
+        .expect("Test should complete within timeout");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_database_actor_crate_download_failed_event() {
+        tokio::time::timeout(Duration::from_secs(15), async {
+            use std::str::FromStr;
+
+            let mut runtime = ActonApp::launch();
+            let test_db_path = create_test_db_path("download_failed");
+
+            let (handle, _db_info) = DatabaseActor::spawn(&mut runtime, test_db_path.clone())
+                .await
+                .unwrap();
+
+            tokio::time::sleep(Duration::from_millis(300)).await;
+
+            // Create initial crate record via CrateReceived
+            let specifier = CrateSpecifier::from_str("broken-crate@1.0.0").unwrap();
+            runtime
+                .broker()
+                .broadcast(CrateReceived {
+                    specifier: specifier.clone(),
+                    features: vec![],
+                })
+                .await;
+
+            tokio::time::sleep(Duration::from_millis(200)).await;
+
+            // Broadcast CrateDownloadFailed event
+            use crate::messages::DownloadErrorKind;
+            runtime
+                .broker()
+                .broadcast(CrateDownloadFailed {
+                    specifier: specifier.clone(),
+                    features: vec![],
+                    error_message: "Network timeout".to_string(),
+                    error_kind: DownloadErrorKind::Timeout,
+                })
+                .await;
+
+            tokio::time::sleep(Duration::from_millis(200)).await;
+
+            // Query to verify failure was recorded
+            let mut subscriber_builder = runtime.new_agent::<TestSubscriber>().await;
+
+            subscriber_builder.mutate_on::<CrateQueryResponse>(|agent, envelope| {
+                let msg = envelope.message().clone();
+                agent.model.query_responses.push(msg);
+                AgentReply::immediate()
+            });
+
+            subscriber_builder.after_stop(|agent| {
+                assert_eq!(
+                    agent.model.query_responses.len(),
+                    1,
+                    "Should receive exactly one query response"
+                );
+
+                let response = &agent.model.query_responses[0];
+                assert!(response.specifier.is_some(), "Should find the crate");
+                assert_eq!(
+                    response.status, "download_failed",
+                    "Status should be download_failed"
+                );
+
+                AgentReply::immediate()
+            });
+
+            subscriber_builder
+                .handle()
+                .subscribe::<CrateQueryResponse>()
+                .await;
+            let subscriber_handle = subscriber_builder.start().await;
+
+            handle
+                .send(QueryCrate {
+                    name: "broken-crate".to_string(),
+                    version: Some("1.0.0".to_string()),
+                })
+                .await;
+
+            tokio::time::sleep(Duration::from_millis(200)).await;
+
+            subscriber_handle.stop().await.unwrap();
+            handle.stop().await.unwrap();
+            runtime.shutdown_all().await.unwrap();
+
+            cleanup_test_db(&test_db_path).await;
+        })
+        .await
+        .expect("Test should complete within timeout");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_database_actor_documentation_extraction_failed_event() {
+        tokio::time::timeout(Duration::from_secs(15), async {
+            use std::str::FromStr;
+
+            let mut runtime = ActonApp::launch();
+            let test_db_path = create_test_db_path("extraction_failed");
+
+            let (handle, _db_info) = DatabaseActor::spawn(&mut runtime, test_db_path.clone())
+                .await
+                .unwrap();
+
+            tokio::time::sleep(Duration::from_millis(300)).await;
+
+            // Create initial crate record
+            let specifier = CrateSpecifier::from_str("invalid-crate@1.0.0").unwrap();
+            runtime
+                .broker()
+                .broadcast(CrateReceived {
+                    specifier: specifier.clone(),
+                    features: vec![],
+                })
+                .await;
+
+            tokio::time::sleep(Duration::from_millis(200)).await;
+
+            // Broadcast DocumentationExtractionFailed event
+            use crate::messages::ExtractionErrorKind;
+            runtime
+                .broker()
+                .broadcast(DocumentationExtractionFailed {
+                    specifier: specifier.clone(),
+                    features: vec![],
+                    error_message: "Cargo.toml not found".to_string(),
+                    error_kind: ExtractionErrorKind::FileNotFound,
+                    elapsed_ms: 50,
+                })
+                .await;
+
+            tokio::time::sleep(Duration::from_millis(200)).await;
+
+            // Query to verify failure was recorded
+            let mut subscriber_builder = runtime.new_agent::<TestSubscriber>().await;
+
+            subscriber_builder.mutate_on::<CrateQueryResponse>(|agent, envelope| {
+                let msg = envelope.message().clone();
+                agent.model.query_responses.push(msg);
+                AgentReply::immediate()
+            });
+
+            subscriber_builder.after_stop(|agent| {
+                assert_eq!(
+                    agent.model.query_responses.len(),
+                    1,
+                    "Should receive exactly one query response"
+                );
+
+                let response = &agent.model.query_responses[0];
+                assert!(response.specifier.is_some(), "Should find the crate");
+                assert_eq!(
+                    response.status, "extraction_failed",
+                    "Status should be extraction_failed"
+                );
+
+                AgentReply::immediate()
+            });
+
+            subscriber_builder
+                .handle()
+                .subscribe::<CrateQueryResponse>()
+                .await;
+            let subscriber_handle = subscriber_builder.start().await;
+
+            handle
+                .send(QueryCrate {
+                    name: "invalid-crate".to_string(),
+                    version: Some("1.0.0".to_string()),
+                })
+                .await;
+
+            tokio::time::sleep(Duration::from_millis(200)).await;
+
+            subscriber_handle.stop().await.unwrap();
+            handle.stop().await.unwrap();
+            runtime.shutdown_all().await.unwrap();
+
+            cleanup_test_db(&test_db_path).await;
+        })
+        .await
+        .expect("Test should complete within timeout");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_database_actor_full_pipeline_success_flow() {
+        tokio::time::timeout(Duration::from_secs(15), async {
+            use std::path::PathBuf;
+            use std::str::FromStr;
+
+            let mut runtime = ActonApp::launch();
+            let test_db_path = create_test_db_path("full_pipeline");
+
+            let (handle, _db_info) = DatabaseActor::spawn(&mut runtime, test_db_path.clone())
+                .await
+                .unwrap();
+
+            tokio::time::sleep(Duration::from_millis(300)).await;
+
+            let specifier = CrateSpecifier::from_str("test-crate@1.0.0").unwrap();
+
+            // Step 1: CrateReceived
+            runtime
+                .broker()
+                .broadcast(CrateReceived {
+                    specifier: specifier.clone(),
+                    features: vec!["test".to_string()],
+                })
+                .await;
+            tokio::time::sleep(Duration::from_millis(100)).await;
+
+            // Step 2: CrateDownloaded
+            runtime
+                .broker()
+                .broadcast(CrateDownloaded {
+                    specifier: specifier.clone(),
+                    features: vec!["test".to_string()],
+                    extracted_path: PathBuf::from("/tmp/test"),
+                    download_duration_ms: 100,
+                })
+                .await;
+            tokio::time::sleep(Duration::from_millis(100)).await;
+
+            // Step 3: DocumentationExtracted
+            runtime
+                .broker()
+                .broadcast(DocumentationExtracted {
+                    specifier: specifier.clone(),
+                    features: vec!["test".to_string()],
+                    documentation_bytes: 2048,
+                    file_count: 10,
+                    extracted_path: PathBuf::from("/tmp/test"),
+                })
+                .await;
+            tokio::time::sleep(Duration::from_millis(100)).await;
+
+            // Step 4: DocumentationChunked
+            runtime
+                .broker()
+                .broadcast(DocumentationChunked {
+                    specifier: specifier.clone(),
+                    features: vec!["test".to_string()],
+                    chunk_count: 5,
+                    total_tokens_estimated: 500,
+                })
+                .await;
+            tokio::time::sleep(Duration::from_millis(100)).await;
+
+            // Step 5: DocumentationVectorized
+            runtime
+                .broker()
+                .broadcast(DocumentationVectorized {
+                    specifier: specifier.clone(),
+                    features: vec!["test".to_string()],
+                    vector_count: 5,
+                    embedding_model: "test-model".to_string(),
+                    vectorization_duration_ms: 200,
+                })
+                .await;
+            tokio::time::sleep(Duration::from_millis(100)).await;
+
+            // Step 6: CrateProcessingComplete
+            runtime
+                .broker()
+                .broadcast(CrateProcessingComplete {
+                    specifier: specifier.clone(),
+                    features: vec!["test".to_string()],
+                    total_duration_ms: 625,
+                    record_id: "crate:test_crate_1_0_0".to_string(),
+                })
+                .await;
+            tokio::time::sleep(Duration::from_millis(200)).await;
+
+            // Query final status
+            let mut subscriber_builder = runtime.new_agent::<TestSubscriber>().await;
+
+            subscriber_builder.mutate_on::<CrateQueryResponse>(|agent, envelope| {
+                let msg = envelope.message().clone();
+                agent.model.query_responses.push(msg);
+                AgentReply::immediate()
+            });
+
+            subscriber_builder.after_stop(|agent| {
+                assert_eq!(
+                    agent.model.query_responses.len(),
+                    1,
+                    "Should receive exactly one query response"
+                );
+
+                let response = &agent.model.query_responses[0];
+                assert!(response.specifier.is_some(), "Should find the crate");
+                assert_eq!(
+                    response.status, "complete",
+                    "Final status should be complete"
+                );
+
+                AgentReply::immediate()
+            });
+
+            subscriber_builder
+                .handle()
+                .subscribe::<CrateQueryResponse>()
+                .await;
+            let subscriber_handle = subscriber_builder.start().await;
+
+            handle
+                .send(QueryCrate {
+                    name: "test-crate".to_string(),
+                    version: Some("1.0.0".to_string()),
+                })
+                .await;
+
+            tokio::time::sleep(Duration::from_millis(200)).await;
+
+            subscriber_handle.stop().await.unwrap();
+            handle.stop().await.unwrap();
+            runtime.shutdown_all().await.unwrap();
+
+            cleanup_test_db(&test_db_path).await;
         })
         .await
         .expect("Test should complete within timeout");
