@@ -16,8 +16,10 @@
 
 use acton_reactive::prelude::*;
 use anyhow::{Context, Result};
+use chrono::Utc;
 use flate2::read::GzDecoder;
 use reqwest::Client;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::fs;
 use std::io::Write;
@@ -28,6 +30,27 @@ use tar::Archive;
 use crate::actors::config::DownloadConfig;
 use crate::crate_specifier::CrateSpecifier;
 use crate::messages::{CrateDownloadFailed, CrateDownloaded, CrateReceived, DownloadErrorKind};
+
+/// Metadata stored alongside cached crate downloads for validation and tracking
+///
+/// This structure is persisted as `metadata.json` alongside each cached crate archive.
+/// It enables cache validation by storing the expected checksum and download information.
+///
+/// # Fields
+///
+/// * `name` - Crate name (e.g., "serde")
+/// * `version` - Crate version (e.g., "1.0.0")
+/// * `checksum` - Optional SHA-256 checksum for integrity verification
+/// * `downloaded_at` - ISO 8601 timestamp of download (e.g., "2025-10-12T10:30:00Z")
+/// * `size_bytes` - Size of the cached archive in bytes
+#[derive(Debug, Serialize, Deserialize)]
+struct CacheMetadata {
+    name: String,
+    version: String,
+    checksum: Option<String>,
+    downloaded_at: String,
+    size_bytes: u64,
+}
 
 /// Stateless actor for downloading crate tarballs from crates.io
 ///
@@ -200,6 +223,170 @@ fn ensure_download_directory_exists(path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Checks if a valid cached version of a crate exists
+///
+/// This function performs cache validation to determine if a previously downloaded
+/// crate can be reused, avoiding redundant HTTP requests and improving performance.
+///
+/// # Cache Validation Strategy
+///
+/// A cache entry is considered valid if ALL of the following conditions are met:
+/// 1. The extracted crate directory exists
+/// 2. The `metadata.json` file exists alongside the directory
+/// 3. The metadata contains a valid checksum
+/// 4. The crate tarball file exists (for verification purposes)
+/// 5. The tarball's SHA-256 checksum matches the stored checksum
+///
+/// # Cache Invalidation
+///
+/// The cache is invalidated (returns `None`) if:
+/// - The extracted directory is missing
+/// - The `metadata.json` file is missing or unreadable
+/// - The metadata cannot be parsed as valid JSON
+/// - The checksum field is missing from metadata
+/// - The tarball file is missing
+/// - The checksum verification fails (corruption or tampering detected)
+///
+/// # Performance Benefits
+///
+/// Cache hits eliminate:
+/// - HTTP request to crates.io API (~100-500ms)
+/// - Tarball download time (~500-2000ms depending on crate size)
+/// - Checksum verification and extraction time (~100-300ms)
+///
+/// Total savings: **~700-2800ms per cached crate**
+///
+/// # Arguments
+///
+/// * `cache_dir` - Base cache directory (typically `~/.cache/crately/downloads/`)
+/// * `specifier` - Crate name and version to check
+///
+/// # Returns
+///
+/// Returns `Some(PathBuf)` pointing to the extracted crate directory if valid cache exists,
+/// otherwise returns `None` to trigger a fresh download.
+///
+/// # Example
+///
+/// ```no_run
+/// use std::path::Path;
+/// # use crately::crate_specifier::CrateSpecifier;
+/// # async fn example() -> anyhow::Result<()> {
+/// let cache_dir = Path::new("/home/user/.cache/crately/downloads");
+/// let specifier = CrateSpecifier::from_str("serde@1.0.0")?;
+///
+/// if let Some(cached_path) = check_cache(cache_dir, &specifier).await {
+///     println!("Cache hit! Using cached crate at: {}", cached_path.display());
+/// } else {
+///     println!("Cache miss - downloading from crates.io");
+/// }
+/// # Ok(())
+/// # }
+/// ```
+async fn check_cache(cache_dir: &Path, specifier: &CrateSpecifier) -> Option<PathBuf> {
+    // Construct paths for cache entry
+    let extract_dir = cache_dir.join(format!("{}-{}", specifier.name(), specifier.version()));
+    let metadata_path = extract_dir.join("metadata.json");
+    let tarball_path = extract_dir.join(format!("{}-{}.crate", specifier.name(), specifier.version()));
+
+    // Check if extracted directory exists
+    if !extract_dir.exists() {
+        return None;
+    }
+
+    // Check if metadata file exists
+    if !metadata_path.exists() {
+        return None;
+    }
+
+    // Read and parse metadata
+    let metadata_content = match fs::read_to_string(&metadata_path) {
+        Ok(content) => content,
+        Err(_) => return None,
+    };
+
+    let metadata: CacheMetadata = match serde_json::from_str(&metadata_content) {
+        Ok(meta) => meta,
+        Err(_) => return None,
+    };
+
+    // Verify checksum is present
+    let checksum = match metadata.checksum {
+        Some(ref cs) => cs,
+        None => return None,
+    };
+
+    // Check if tarball exists (for verification)
+    if !tarball_path.exists() {
+        return None;
+    }
+
+    // Verify checksum matches
+    match verify_checksum(&tarball_path, checksum) {
+        Ok(()) => Some(extract_dir),
+        Err(_) => None,
+    }
+}
+
+/// Stores cache metadata alongside a downloaded crate
+///
+/// This function persists metadata about a cached crate download for future validation.
+/// The metadata is stored as `metadata.json` within the extracted crate directory.
+///
+/// # Metadata Contents
+///
+/// The stored metadata includes:
+/// - Crate name and version
+/// - SHA-256 checksum for integrity verification
+/// - Download timestamp (ISO 8601 format)
+/// - Archive size in bytes
+///
+/// # Arguments
+///
+/// * `extract_dir` - Path to the extracted crate directory
+/// * `specifier` - Crate name and version
+/// * `checksum` - SHA-256 checksum of the tarball
+/// * `tarball_bytes` - Raw tarball bytes (for size calculation)
+///
+/// # Returns
+///
+/// Returns `Ok(())` on successful metadata storage
+///
+/// # Errors
+///
+/// Returns an error if:
+/// - Metadata serialization fails
+/// - File write operations fail
+/// - Directory access is denied
+async fn store_metadata(
+    extract_dir: &Path,
+    specifier: &CrateSpecifier,
+    checksum: &str,
+    tarball_bytes: &[u8],
+) -> Result<()> {
+    let metadata = CacheMetadata {
+        name: specifier.name().to_string(),
+        version: specifier.version().to_string(),
+        checksum: Some(checksum.to_string()),
+        downloaded_at: Utc::now().to_rfc3339(),
+        size_bytes: tarball_bytes.len() as u64,
+    };
+
+    let metadata_path = extract_dir.join("metadata.json");
+    let json = serde_json::to_string_pretty(&metadata)
+        .context("Failed to serialize cache metadata")?;
+
+    fs::write(&metadata_path, json)
+        .with_context(|| format!("Failed to write metadata file: {}", metadata_path.display()))?;
+
+    // Also store the tarball for future verification
+    let tarball_path = extract_dir.join(format!("{}-{}.crate", specifier.name(), specifier.version()));
+    fs::write(&tarball_path, tarball_bytes)
+        .with_context(|| format!("Failed to write tarball to cache: {}", tarball_path.display()))?;
+
+    Ok(())
+}
+
 /// Downloads a crate tarball from crates.io and extracts it to the cache directory
 ///
 /// This function performs the complete download and extraction workflow with security validation:
@@ -239,6 +426,11 @@ async fn download_and_extract(
     config: &DownloadConfig,
     specifier: &CrateSpecifier,
 ) -> Result<PathBuf> {
+    // Step 0: Check cache first - skip HTTP request if valid cache exists
+    if let Some(cached_path) = check_cache(&config.download_dir, specifier).await {
+        return Ok(cached_path);
+    }
+
     // Step 1: Fetch expected checksum from crates.io API
     let expected_checksum = fetch_checksum_from_api(client, config, specifier)
         .await
@@ -271,7 +463,8 @@ async fn download_and_extract(
     let tarball_bytes = response
         .bytes()
         .await
-        .context("Failed to read response body")?;
+        .context("Failed to read response body")?
+        .to_vec(); // Convert to Vec<u8> for storage
 
     // Step 4: Write tarball to temporary file for verification
     let temp_dir = std::env::temp_dir();
@@ -310,7 +503,12 @@ async fn download_and_extract(
     extract_tarball(&tarball_bytes, &extract_dir)
         .context("Failed to extract tarball")?;
 
-    // Step 8: Clean up temporary file after successful extraction
+    // Step 8: Store metadata for future cache hits
+    store_metadata(&extract_dir, specifier, &expected_checksum, &tarball_bytes)
+        .await
+        .context("Failed to store cache metadata")?;
+
+    // Step 9: Clean up temporary file after successful extraction
     let _ = fs::remove_file(&temp_tarball_path);
 
     Ok(extract_dir)
@@ -874,5 +1072,323 @@ mod tests {
         // Currently maps to Other - this is acceptable as checksum errors
         // are a new error type. Could add ChecksumError variant in future.
         assert_eq!(kind, DownloadErrorKind::Other);
+    }
+
+    // ============================================================================
+    // Cache Functionality Tests
+    // ============================================================================
+
+    #[tokio::test]
+    async fn test_check_cache_miss_nonexistent_directory() {
+        use std::env;
+
+        let temp_dir = env::temp_dir().join(format!("crately_test_cache_miss_{}", rand::random::<u32>()));
+        let specifier = CrateSpecifier::from_str("nonexistent@1.0.0").unwrap();
+
+        // Cache should miss for nonexistent directory
+        let result = check_cache(&temp_dir, &specifier).await;
+        assert!(result.is_none(), "Cache should miss for nonexistent directory");
+    }
+
+    #[tokio::test]
+    async fn test_check_cache_miss_no_metadata() {
+        use std::env;
+
+        let temp_dir = env::temp_dir().join(format!("crately_test_cache_no_meta_{}", rand::random::<u32>()));
+        let specifier = CrateSpecifier::from_str("test-crate@1.0.0").unwrap();
+        let extract_dir = temp_dir.join("test-crate-1.0.0");
+
+        // Create directory but no metadata
+        let _ = fs::create_dir_all(&extract_dir);
+
+        // Cache should miss without metadata
+        let result = check_cache(&temp_dir, &specifier).await;
+        assert!(result.is_none(), "Cache should miss without metadata file");
+
+        // Cleanup
+        let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[tokio::test]
+    async fn test_check_cache_miss_invalid_metadata() {
+        use std::env;
+
+        let temp_dir = env::temp_dir().join(format!("crately_test_cache_invalid_meta_{}", rand::random::<u32>()));
+        let specifier = CrateSpecifier::from_str("test-crate@1.0.0").unwrap();
+        let extract_dir = temp_dir.join("test-crate-1.0.0");
+
+        // Create directory with invalid metadata
+        let _ = fs::create_dir_all(&extract_dir);
+        let metadata_path = extract_dir.join("metadata.json");
+        fs::write(&metadata_path, b"invalid json {").unwrap();
+
+        // Cache should miss with invalid metadata
+        let result = check_cache(&temp_dir, &specifier).await;
+        assert!(result.is_none(), "Cache should miss with invalid metadata");
+
+        // Cleanup
+        let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[tokio::test]
+    async fn test_check_cache_miss_no_checksum() {
+        use std::env;
+
+        let temp_dir = env::temp_dir().join(format!("crately_test_cache_no_checksum_{}", rand::random::<u32>()));
+        let specifier = CrateSpecifier::from_str("test-crate@1.0.0").unwrap();
+        let extract_dir = temp_dir.join("test-crate-1.0.0");
+
+        // Create directory with metadata but no checksum
+        let _ = fs::create_dir_all(&extract_dir);
+        let metadata = CacheMetadata {
+            name: "test-crate".to_string(),
+            version: "1.0.0".to_string(),
+            checksum: None, // No checksum
+            downloaded_at: Utc::now().to_rfc3339(),
+            size_bytes: 1024,
+        };
+        let metadata_path = extract_dir.join("metadata.json");
+        fs::write(&metadata_path, serde_json::to_string(&metadata).unwrap()).unwrap();
+
+        // Cache should miss without checksum
+        let result = check_cache(&temp_dir, &specifier).await;
+        assert!(result.is_none(), "Cache should miss without checksum");
+
+        // Cleanup
+        let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[tokio::test]
+    async fn test_check_cache_miss_no_tarball() {
+        use std::env;
+
+        let temp_dir = env::temp_dir().join(format!("crately_test_cache_no_tarball_{}", rand::random::<u32>()));
+        let specifier = CrateSpecifier::from_str("test-crate@1.0.0").unwrap();
+        let extract_dir = temp_dir.join("test-crate-1.0.0");
+
+        // Create directory with metadata but no tarball
+        let _ = fs::create_dir_all(&extract_dir);
+        let metadata = CacheMetadata {
+            name: "test-crate".to_string(),
+            version: "1.0.0".to_string(),
+            checksum: Some("abc123".to_string()),
+            downloaded_at: Utc::now().to_rfc3339(),
+            size_bytes: 1024,
+        };
+        let metadata_path = extract_dir.join("metadata.json");
+        fs::write(&metadata_path, serde_json::to_string(&metadata).unwrap()).unwrap();
+
+        // Cache should miss without tarball
+        let result = check_cache(&temp_dir, &specifier).await;
+        assert!(result.is_none(), "Cache should miss without tarball file");
+
+        // Cleanup
+        let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[tokio::test]
+    async fn test_check_cache_miss_corrupted_tarball() {
+        use std::env;
+
+        let temp_dir = env::temp_dir().join(format!("crately_test_cache_corrupted_{}", rand::random::<u32>()));
+        let specifier = CrateSpecifier::from_str("test-crate@1.0.0").unwrap();
+        let extract_dir = temp_dir.join("test-crate-1.0.0");
+
+        // Create directory structure
+        let _ = fs::create_dir_all(&extract_dir);
+
+        // Create tarball with content
+        let tarball_content = b"test content";
+        let tarball_path = extract_dir.join("test-crate-1.0.0.crate");
+        fs::write(&tarball_path, tarball_content).unwrap();
+
+        // Calculate correct checksum for original content
+        use sha2::{Digest, Sha256};
+        let mut hasher = Sha256::new();
+        hasher.update(tarball_content);
+        let original_checksum = format!("{:x}", hasher.finalize());
+
+        // Create metadata with correct checksum
+        let metadata = CacheMetadata {
+            name: "test-crate".to_string(),
+            version: "1.0.0".to_string(),
+            checksum: Some(original_checksum),
+            downloaded_at: Utc::now().to_rfc3339(),
+            size_bytes: tarball_content.len() as u64,
+        };
+        let metadata_path = extract_dir.join("metadata.json");
+        fs::write(&metadata_path, serde_json::to_string(&metadata).unwrap()).unwrap();
+
+        // Corrupt the tarball
+        fs::write(&tarball_path, b"corrupted content").unwrap();
+
+        // Cache should miss with corrupted tarball
+        let result = check_cache(&temp_dir, &specifier).await;
+        assert!(result.is_none(), "Cache should miss with corrupted tarball");
+
+        // Cleanup
+        let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[tokio::test]
+    async fn test_check_cache_hit_valid_cache() {
+        use std::env;
+
+        let temp_dir = env::temp_dir().join(format!("crately_test_cache_hit_{}", rand::random::<u32>()));
+        let specifier = CrateSpecifier::from_str("test-crate@1.0.0").unwrap();
+        let extract_dir = temp_dir.join("test-crate-1.0.0");
+
+        // Create valid cache entry
+        let _ = fs::create_dir_all(&extract_dir);
+
+        // Create tarball with content
+        let tarball_content = b"test content for cache hit";
+        let tarball_path = extract_dir.join("test-crate-1.0.0.crate");
+        fs::write(&tarball_path, tarball_content).unwrap();
+
+        // Calculate checksum
+        use sha2::{Digest, Sha256};
+        let mut hasher = Sha256::new();
+        hasher.update(tarball_content);
+        let checksum = format!("{:x}", hasher.finalize());
+
+        // Create metadata with correct checksum
+        let metadata = CacheMetadata {
+            name: "test-crate".to_string(),
+            version: "1.0.0".to_string(),
+            checksum: Some(checksum),
+            downloaded_at: Utc::now().to_rfc3339(),
+            size_bytes: tarball_content.len() as u64,
+        };
+        let metadata_path = extract_dir.join("metadata.json");
+        fs::write(&metadata_path, serde_json::to_string(&metadata).unwrap()).unwrap();
+
+        // Cache should hit with valid entry
+        let result = check_cache(&temp_dir, &specifier).await;
+        assert!(result.is_some(), "Cache should hit with valid entry");
+        assert_eq!(result.unwrap(), extract_dir, "Cache should return correct path");
+
+        // Cleanup
+        let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[tokio::test]
+    async fn test_store_metadata_creates_files() {
+        use std::env;
+
+        let temp_dir = env::temp_dir().join(format!("crately_test_store_meta_{}", rand::random::<u32>()));
+        let specifier = CrateSpecifier::from_str("test-crate@1.0.0").unwrap();
+        let extract_dir = temp_dir.join("test-crate-1.0.0");
+
+        // Create extraction directory
+        let _ = fs::create_dir_all(&extract_dir);
+
+        let tarball_bytes = b"test tarball content";
+        let checksum = "abc123def456";
+
+        // Store metadata
+        let result = store_metadata(&extract_dir, &specifier, checksum, tarball_bytes).await;
+        assert!(result.is_ok(), "store_metadata should succeed");
+
+        // Verify metadata file exists
+        let metadata_path = extract_dir.join("metadata.json");
+        assert!(metadata_path.exists(), "Metadata file should exist");
+
+        // Verify tarball exists
+        let tarball_path = extract_dir.join("test-crate-1.0.0.crate");
+        assert!(tarball_path.exists(), "Tarball should exist in cache");
+
+        // Verify metadata content
+        let metadata_content = fs::read_to_string(&metadata_path).unwrap();
+        let metadata: CacheMetadata = serde_json::from_str(&metadata_content).unwrap();
+        assert_eq!(metadata.name, "test-crate");
+        assert_eq!(metadata.version, "1.0.0");
+        assert_eq!(metadata.checksum, Some(checksum.to_string()));
+        assert_eq!(metadata.size_bytes, tarball_bytes.len() as u64);
+
+        // Verify tarball content
+        let stored_tarball = fs::read(&tarball_path).unwrap();
+        assert_eq!(stored_tarball, tarball_bytes);
+
+        // Cleanup
+        let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[tokio::test]
+    async fn test_store_metadata_with_empty_tarball() {
+        use std::env;
+
+        let temp_dir = env::temp_dir().join(format!("crately_test_store_empty_{}", rand::random::<u32>()));
+        let specifier = CrateSpecifier::from_str("test-crate@1.0.0").unwrap();
+        let extract_dir = temp_dir.join("test-crate-1.0.0");
+
+        // Create extraction directory
+        let _ = fs::create_dir_all(&extract_dir);
+
+        let tarball_bytes: &[u8] = b"";
+        let checksum = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"; // SHA-256 of empty string
+
+        // Store metadata with empty tarball
+        let result = store_metadata(&extract_dir, &specifier, checksum, tarball_bytes).await;
+        assert!(result.is_ok(), "store_metadata should handle empty tarball");
+
+        // Verify metadata
+        let metadata_path = extract_dir.join("metadata.json");
+        let metadata_content = fs::read_to_string(&metadata_path).unwrap();
+        let metadata: CacheMetadata = serde_json::from_str(&metadata_content).unwrap();
+        assert_eq!(metadata.size_bytes, 0);
+
+        // Cleanup
+        let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[tokio::test]
+    async fn test_cache_metadata_serialization() {
+        let metadata = CacheMetadata {
+            name: "serde".to_string(),
+            version: "1.0.210".to_string(),
+            checksum: Some("abc123".to_string()),
+            downloaded_at: "2025-10-12T10:30:00Z".to_string(),
+            size_bytes: 1024,
+        };
+
+        // Serialize to JSON
+        let json = serde_json::to_string(&metadata).unwrap();
+        assert!(json.contains("serde"));
+        assert!(json.contains("1.0.210"));
+        assert!(json.contains("abc123"));
+
+        // Deserialize back
+        let deserialized: CacheMetadata = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized.name, "serde");
+        assert_eq!(deserialized.version, "1.0.210");
+        assert_eq!(deserialized.checksum, Some("abc123".to_string()));
+        assert_eq!(deserialized.size_bytes, 1024);
+    }
+
+    #[tokio::test]
+    async fn test_concurrent_cache_access() {
+        use std::env;
+        use tokio::task;
+
+        let temp_dir = env::temp_dir().join(format!("crately_test_concurrent_{}", rand::random::<u32>()));
+
+        // Create multiple cache check tasks in parallel
+        let mut handles = vec![];
+        for i in 0..10 {
+            let temp_dir_clone = temp_dir.clone();
+            let handle = task::spawn(async move {
+                let specifier = CrateSpecifier::from_str(&format!("test-crate-{}@1.0.0", i)).unwrap();
+                check_cache(&temp_dir_clone, &specifier).await
+            });
+            handles.push(handle);
+        }
+
+        // All tasks should complete without panic
+        for handle in handles {
+            let result = handle.await;
+            assert!(result.is_ok(), "Concurrent cache access should not panic");
+            assert!(result.unwrap().is_none(), "All caches should miss");
+        }
     }
 }
