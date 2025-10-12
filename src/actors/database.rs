@@ -1684,7 +1684,9 @@ impl DatabaseActor {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::ChunkMetadata;
     use std::env;
+    use std::str::FromStr;
     use std::time::{SystemTime, UNIX_EPOCH};
     use tokio::time::Duration;
 
@@ -2713,6 +2715,231 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(200)).await;
 
             subscriber_handle.stop().await.unwrap();
+            handle.stop().await.unwrap();
+            runtime.shutdown_all().await.unwrap();
+
+            cleanup_test_db(&test_db_path).await;
+        })
+        .await
+        .expect("Test should complete within timeout");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_persist_doc_chunk_success() {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            let mut runtime = ActonApp::launch();
+            let test_db_path = create_test_db_path("persist_doc_chunk");
+
+            let (handle, _db_info) = DatabaseActor::spawn(&mut runtime, test_db_path.clone())
+                .await
+                .unwrap();
+
+            tokio::time::sleep(Duration::from_millis(200)).await;
+
+            // First persist a crate
+            let specifier = CrateSpecifier::from_str("tokio@1.35.0").unwrap();
+            handle
+                .send(PersistCrate {
+                    specifier: specifier.clone(),
+                    features: vec!["full".to_string()],
+                })
+                .await;
+
+            tokio::time::sleep(Duration::from_millis(200)).await;
+
+            // Now persist a doc chunk
+            let chunk_metadata = ChunkMetadata {
+                content_type: "rust".to_string(),
+                start_line: Some(100),
+                end_line: Some(200),
+                token_count: 512,
+                char_count: 2048,
+                parent_module: Some("tokio::runtime".to_string()),
+                item_type: Some("function".to_string()),
+                item_name: Some("spawn".to_string()),
+            };
+
+            handle
+                .send(PersistDocChunk {
+                    specifier: specifier.clone(),
+                    chunk_index: 0,
+                    chunk_id: "tokio_1.35.0_chunk_000".to_string(),
+                    content: "Documentation for tokio::runtime::spawn function".to_string(),
+                    source_file: "src/runtime/mod.rs".to_string(),
+                    metadata: chunk_metadata,
+                })
+                .await;
+
+            tokio::time::sleep(Duration::from_millis(200)).await;
+
+            handle.stop().await.unwrap();
+            runtime.shutdown_all().await.unwrap();
+
+            cleanup_test_db(&test_db_path).await;
+        })
+        .await
+        .expect("Test should complete within timeout");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_persist_doc_chunk_crate_not_found() {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            let mut runtime = ActonApp::launch();
+            let test_db_path = create_test_db_path("persist_doc_chunk_not_found");
+
+            let (handle, _db_info) = DatabaseActor::spawn(&mut runtime, test_db_path.clone())
+                .await
+                .unwrap();
+
+            tokio::time::sleep(Duration::from_millis(200)).await;
+
+            // Try to persist a doc chunk for a non-existent crate
+            // This should log an error and broadcast DatabaseError,
+            // but the test verifies the message is handled gracefully
+            let specifier = CrateSpecifier::from_str("nonexistent@1.0.0").unwrap();
+            let chunk_metadata = ChunkMetadata {
+                content_type: "rust".to_string(),
+                start_line: Some(1),
+                end_line: Some(10),
+                token_count: 128,
+                char_count: 512,
+                parent_module: None,
+                item_type: Some("module".to_string()),
+                item_name: Some("lib".to_string()),
+            };
+
+            handle
+                .send(PersistDocChunk {
+                    specifier,
+                    chunk_index: 0,
+                    chunk_id: "nonexistent_1.0.0_chunk_000".to_string(),
+                    content: "Some documentation".to_string(),
+                    source_file: "src/lib.rs".to_string(),
+                    metadata: chunk_metadata,
+                })
+                .await;
+
+            // Give time for error handling to complete
+            tokio::time::sleep(Duration::from_millis(200)).await;
+
+            handle.stop().await.unwrap();
+            runtime.shutdown_all().await.unwrap();
+
+            cleanup_test_db(&test_db_path).await;
+        })
+        .await
+        .expect("Test should complete within timeout");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_persist_doc_chunk_multiple_chunks() {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            let mut runtime = ActonApp::launch();
+            let test_db_path = create_test_db_path("persist_multiple_chunks");
+
+            let (handle, _db_info) = DatabaseActor::spawn(&mut runtime, test_db_path.clone())
+                .await
+                .unwrap();
+
+            tokio::time::sleep(Duration::from_millis(200)).await;
+
+            // First persist a crate
+            let specifier = CrateSpecifier::from_str("serde@1.0.0").unwrap();
+            handle
+                .send(PersistCrate {
+                    specifier: specifier.clone(),
+                    features: vec!["derive".to_string()],
+                })
+                .await;
+
+            tokio::time::sleep(Duration::from_millis(200)).await;
+
+            // Persist multiple doc chunks
+            for i in 0..5 {
+                let chunk_metadata = ChunkMetadata {
+                    content_type: "markdown".to_string(),
+                    start_line: Some(i * 100),
+                    end_line: Some((i + 1) * 100),
+                    token_count: 256,
+                    char_count: 1024,
+                    parent_module: Some(format!("serde::module_{}", i)),
+                    item_type: Some("struct".to_string()),
+                    item_name: Some(format!("Item{}", i)),
+                };
+
+                handle
+                    .send(PersistDocChunk {
+                        specifier: specifier.clone(),
+                        chunk_index: i,
+                        chunk_id: format!("serde_1.0.0_chunk_{:03}", i),
+                        content: format!("Documentation chunk {} for serde", i),
+                        source_file: format!("src/module_{}.rs", i),
+                        metadata: chunk_metadata,
+                    })
+                    .await;
+
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+
+            tokio::time::sleep(Duration::from_millis(200)).await;
+
+            handle.stop().await.unwrap();
+            runtime.shutdown_all().await.unwrap();
+
+            cleanup_test_db(&test_db_path).await;
+        })
+        .await
+        .expect("Test should complete within timeout");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_persist_doc_chunk_with_optional_metadata() {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            let mut runtime = ActonApp::launch();
+            let test_db_path = create_test_db_path("persist_chunk_optional_metadata");
+
+            let (handle, _db_info) = DatabaseActor::spawn(&mut runtime, test_db_path.clone())
+                .await
+                .unwrap();
+
+            tokio::time::sleep(Duration::from_millis(200)).await;
+
+            // First persist a crate
+            let specifier = CrateSpecifier::from_str("actix-web@4.0.0").unwrap();
+            handle
+                .send(PersistCrate {
+                    specifier: specifier.clone(),
+                    features: vec![],
+                })
+                .await;
+
+            tokio::time::sleep(Duration::from_millis(200)).await;
+
+            // Persist doc chunk with minimal metadata (no line numbers, no structural info)
+            let chunk_metadata = ChunkMetadata {
+                content_type: "markdown".to_string(),
+                start_line: None,
+                end_line: None,
+                token_count: 64,
+                char_count: 256,
+                parent_module: None,
+                item_type: None,
+                item_name: None,
+            };
+
+            handle
+                .send(PersistDocChunk {
+                    specifier: specifier.clone(),
+                    chunk_index: 0,
+                    chunk_id: "actix_web_4.0.0_chunk_000".to_string(),
+                    content: "General crate overview documentation".to_string(),
+                    source_file: "README.md".to_string(),
+                    metadata: chunk_metadata,
+                })
+                .await;
+
+            tokio::time::sleep(Duration::from_millis(200)).await;
+
             handle.stop().await.unwrap();
             runtime.shutdown_all().await.unwrap();
 
