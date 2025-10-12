@@ -364,7 +364,7 @@ fn default_extract_source_code() -> bool {
 /// Configuration for the vectorization stage
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct VectorizeConfig {
-    /// Embedding model name (default: "all-MiniLM-L6-v2")
+    /// Embedding model name (default: "text-embedding-3-small")
     #[serde(default = "default_model_name")]
     pub model_name: String,
 
@@ -376,7 +376,7 @@ pub struct VectorizeConfig {
     #[serde(default = "default_batch_size")]
     pub batch_size: usize,
 
-    /// Vector dimension (default: 384 for all-MiniLM-L6-v2)
+    /// Vector dimension (default: 1536 for text-embedding-3-small)
     #[serde(default = "default_vector_dimension")]
     pub vector_dimension: usize,
 
@@ -387,6 +387,28 @@ pub struct VectorizeConfig {
     /// Vectorization timeout in seconds (default: 60)
     #[serde(default = "default_vectorize_timeout")]
     pub timeout_secs: u64,
+
+    /// OpenAI-compatible API endpoint for embeddings
+    /// (default: "https://api.openai.com/v1/embeddings")
+    #[serde(default = "default_api_endpoint")]
+    pub api_endpoint: String,
+
+    /// API key for embedding service (read from environment variable)
+    /// Set OPENAI_API_KEY or EMBEDDING_API_KEY in the environment
+    #[serde(skip)]
+    pub api_key: Option<String>,
+
+    /// HTTP request timeout in seconds for embedding API calls (default: 30)
+    #[serde(default = "default_request_timeout_secs")]
+    pub request_timeout_secs: u64,
+
+    /// Maximum retry attempts for failed API requests (default: 3)
+    #[serde(default = "default_embedding_max_retries")]
+    pub max_retries: u32,
+
+    /// Initial retry delay in seconds for exponential backoff (default: 2)
+    #[serde(default = "default_embedding_retry_delay_secs")]
+    pub retry_delay_secs: u64,
 }
 
 impl Default for VectorizeConfig {
@@ -398,6 +420,11 @@ impl Default for VectorizeConfig {
             vector_dimension: default_vector_dimension(),
             max_concurrent: default_max_concurrent_vectorize(),
             timeout_secs: default_vectorize_timeout(),
+            api_endpoint: default_api_endpoint(),
+            api_key: None, // Set via environment variable at runtime
+            request_timeout_secs: default_request_timeout_secs(),
+            max_retries: default_embedding_max_retries(),
+            retry_delay_secs: default_embedding_retry_delay_secs(),
         }
     }
 }
@@ -429,12 +456,43 @@ impl VectorizeConfig {
                 "vectorize.timeout_secs must be > 0".to_string(),
             ));
         }
+
+        // Validate API endpoint is not empty
+        if self.api_endpoint.is_empty() {
+            return Err(ConfigError::InvalidValue(
+                "vectorize.api_endpoint must not be empty".to_string(),
+            ));
+        }
+
+        // Validate API endpoint is a valid URL format (basic check)
+        if !self.api_endpoint.starts_with("http://") && !self.api_endpoint.starts_with("https://") {
+            return Err(ConfigError::InvalidValue(
+                "vectorize.api_endpoint must be a valid HTTP(S) URL".to_string(),
+            ));
+        }
+
+        if self.request_timeout_secs == 0 {
+            return Err(ConfigError::InvalidValue(
+                "vectorize.request_timeout_secs must be > 0".to_string(),
+            ));
+        }
+        if self.max_retries == 0 {
+            return Err(ConfigError::InvalidValue(
+                "vectorize.max_retries must be > 0".to_string(),
+            ));
+        }
+        if self.retry_delay_secs == 0 {
+            return Err(ConfigError::InvalidValue(
+                "vectorize.retry_delay_secs must be > 0".to_string(),
+            ));
+        }
+
         Ok(())
     }
 }
 
 fn default_model_name() -> String {
-    "all-MiniLM-L6-v2".to_string()
+    "text-embedding-3-small".to_string()
 }
 
 fn default_model_version() -> String {
@@ -446,7 +504,7 @@ fn default_batch_size() -> usize {
 }
 
 fn default_vector_dimension() -> usize {
-    384
+    1536
 }
 
 fn default_max_concurrent_vectorize() -> usize {
@@ -455,6 +513,22 @@ fn default_max_concurrent_vectorize() -> usize {
 
 fn default_vectorize_timeout() -> u64 {
     60
+}
+
+fn default_api_endpoint() -> String {
+    "https://api.openai.com/v1/embeddings".to_string()
+}
+
+fn default_request_timeout_secs() -> u64 {
+    30
+}
+
+fn default_embedding_max_retries() -> u32 {
+    3
+}
+
+fn default_embedding_retry_delay_secs() -> u64 {
+    2
 }
 
 /// Configuration for the crate processing coordinator
@@ -1131,12 +1205,20 @@ mod tests {
         assert!(pipeline.process.extract_source_code);
 
         // Vectorize config defaults
-        assert_eq!(pipeline.vectorize.model_name, "all-MiniLM-L6-v2");
+        assert_eq!(pipeline.vectorize.model_name, "text-embedding-3-small");
         assert_eq!(pipeline.vectorize.model_version, "1.0");
         assert_eq!(pipeline.vectorize.batch_size, 32);
-        assert_eq!(pipeline.vectorize.vector_dimension, 384);
+        assert_eq!(pipeline.vectorize.vector_dimension, 1536);
         assert_eq!(pipeline.vectorize.max_concurrent, 2);
         assert_eq!(pipeline.vectorize.timeout_secs, 60);
+        assert_eq!(
+            pipeline.vectorize.api_endpoint,
+            "https://api.openai.com/v1/embeddings"
+        );
+        assert!(pipeline.vectorize.api_key.is_none()); // Set via environment variable
+        assert_eq!(pipeline.vectorize.request_timeout_secs, 30);
+        assert_eq!(pipeline.vectorize.max_retries, 3);
+        assert_eq!(pipeline.vectorize.retry_delay_secs, 2);
     }
 
     #[test]
@@ -1335,6 +1417,81 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("vectorize.max_concurrent must be > 0"));
+    }
+
+    #[test]
+    fn test_vectorize_config_validation_empty_api_endpoint() {
+        let config = VectorizeConfig {
+            api_endpoint: String::new(),
+            ..Default::default()
+        };
+
+        let result = config.validate();
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("vectorize.api_endpoint must not be empty"));
+    }
+
+    #[test]
+    fn test_vectorize_config_validation_invalid_api_endpoint() {
+        let config = VectorizeConfig {
+            api_endpoint: "not-a-valid-url".to_string(),
+            ..Default::default()
+        };
+
+        let result = config.validate();
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("vectorize.api_endpoint must be a valid HTTP(S) URL"));
+    }
+
+    #[test]
+    fn test_vectorize_config_validation_zero_request_timeout() {
+        let config = VectorizeConfig {
+            request_timeout_secs: 0,
+            ..Default::default()
+        };
+
+        let result = config.validate();
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("vectorize.request_timeout_secs must be > 0"));
+    }
+
+    #[test]
+    fn test_vectorize_config_validation_zero_max_retries() {
+        let config = VectorizeConfig {
+            max_retries: 0,
+            ..Default::default()
+        };
+
+        let result = config.validate();
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("vectorize.max_retries must be > 0"));
+    }
+
+    #[test]
+    fn test_vectorize_config_validation_zero_retry_delay() {
+        let config = VectorizeConfig {
+            retry_delay_secs: 0,
+            ..Default::default()
+        };
+
+        let result = config.validate();
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("vectorize.retry_delay_secs must be > 0"));
     }
 
     #[test]

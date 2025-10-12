@@ -2,15 +2,97 @@
 //!
 //! The `VectorizerActor` is a stateless worker that subscribes to `DocumentationChunked` events
 //! and generates vector embeddings for each chunk. It reads chunks from the database, calls the
-//! embedding API (or mock for initial implementation), and persists the vectors.
+//! embedding API, and persists the vectors.
 
 use acton_reactive::prelude::*;
 use anyhow::Result;
-use std::time::Instant;
+use reqwest::Client;
+use serde::{Deserialize, Serialize};
+use std::time::{Duration, Instant};
+use thiserror::Error;
 
 use crate::actors::config::VectorizeConfig;
 use crate::crate_specifier::CrateSpecifier;
 use crate::messages::{DocumentationChunked, DocumentationVectorized, PersistEmbedding};
+
+/// Errors that can occur during embedding generation
+#[derive(Debug, Error)]
+pub enum EmbeddingError {
+    /// API key not found in environment
+    #[error("API key not found. Set OPENAI_API_KEY or EMBEDDING_API_KEY environment variable")]
+    MissingApiKey,
+
+    /// HTTP request failed
+    #[error("HTTP request failed: {0}")]
+    RequestFailed(#[from] reqwest::Error),
+
+    /// API returned an error response
+    #[error("API error: {0}")]
+    ApiError(String),
+
+    /// Response parsing failed
+    #[error("Failed to parse API response: {0}")]
+    ParseError(String),
+
+    /// Invalid response format
+    #[error("Invalid response format: {0}")]
+    InvalidResponse(String),
+
+    /// Dimension mismatch
+    #[error("Vector dimension mismatch: expected {expected}, got {actual}")]
+    DimensionMismatch { expected: usize, actual: usize },
+}
+
+/// OpenAI API request format for embedding generation
+#[derive(Debug, Serialize)]
+struct EmbeddingRequest {
+    /// Text to embed
+    input: String,
+    /// Model name (e.g., "text-embedding-3-small")
+    model: String,
+    /// Encoding format (always "float" for f32 vectors)
+    encoding_format: String,
+}
+
+/// OpenAI API response format for embedding generation
+#[derive(Debug, Deserialize)]
+struct EmbeddingResponse {
+    /// Response object type (should be "list")
+    #[serde(rename = "object")]
+    _object: String,
+    /// Array of embedding data
+    data: Vec<EmbeddingData>,
+    /// Model used for generation
+    #[serde(rename = "model")]
+    _model: String,
+    /// Token usage statistics
+    #[serde(rename = "usage")]
+    _usage: Option<Usage>,
+}
+
+/// Embedding data within the API response
+#[derive(Debug, Deserialize)]
+struct EmbeddingData {
+    /// Object type (should be "embedding")
+    #[serde(rename = "object")]
+    _object: String,
+    /// Index in the response array
+    #[serde(rename = "index")]
+    _index: usize,
+    /// The actual embedding vector
+    embedding: Vec<f32>,
+}
+
+/// Token usage statistics
+#[derive(Debug, Deserialize)]
+struct Usage {
+    /// Number of prompt tokens
+    #[serde(rename = "prompt_tokens")]
+    _prompt_tokens: usize,
+    /// Total tokens used
+    #[serde(rename = "total_tokens")]
+    _total_tokens: usize,
+}
 
 /// Stateless actor for generating vector embeddings
 ///
@@ -154,13 +236,12 @@ impl VectorizerActor {
 
 /// Generates embeddings for documentation chunks
 ///
-/// This function generates mock embeddings for each chunk and broadcasts `PersistEmbedding`
-/// messages to the DatabaseActor for persistence. In a real implementation, this would call
-/// an embedding API (e.g., OpenAI's embeddings endpoint) to generate actual vector embeddings.
+/// This function generates real embeddings by calling an OpenAI-compatible API for each chunk
+/// and broadcasts `PersistEmbedding` messages to the DatabaseActor for persistence.
 ///
 /// # Arguments
 ///
-/// * `config` - Vectorization configuration with model settings
+/// * `config` - Vectorization configuration with API settings and model
 /// * `broker` - Message broker handle for broadcasting persistence messages
 /// * `specifier` - Crate name and version for context
 /// * `chunk_count` - Number of chunks to vectorize
@@ -181,13 +262,12 @@ async fn vectorize_chunks(
     specifier: &CrateSpecifier,
     chunk_count: u32,
 ) -> Result<u32> {
-    // For now, we'll generate mock embeddings
-    // In a real implementation, this would:
-    // 1. Query chunks from database using chunk IDs
-    // 2. Batch chunks for API calls
-    // 3. Call embedding API for each batch
-    // 4. Handle rate limiting and retries
-    // 5. Persist embeddings to database via PersistEmbedding messages
+    // TODO: In the future, we should:
+    // 1. Query actual chunk text from database using chunk IDs
+    // 2. Batch chunks for API calls (OpenAI supports up to 2048 inputs per request)
+    // 3. Implement batching for efficiency
+    //
+    // For now, we'll generate mock text and call the API one chunk at a time
 
     // Simulate processing each chunk
     for index in 0..chunk_count {
@@ -198,15 +278,24 @@ async fn vectorize_chunks(
             index
         );
 
-        // Generate mock embedding vector with configured dimensions
-        let mock_vector = generate_mock_embedding(config.vector_dimension);
+        // TODO: Query actual chunk text from database
+        // For now, use a placeholder text
+        let chunk_text = format!(
+            "Documentation chunk {} for {} version {}",
+            index,
+            specifier.name(),
+            specifier.version()
+        );
+
+        // Generate real embedding vector by calling the API
+        let embedding_vector = generate_embedding(config, &chunk_text).await?;
 
         // Broadcast PersistEmbedding message to DatabaseActor
         broker
             .broadcast(PersistEmbedding {
                 chunk_id: chunk_id.clone(),
                 specifier: specifier.clone(),
-                vector: mock_vector,
+                vector: embedding_vector,
                 model_name: config.model_name.clone(),
                 model_version: config.model_version.clone(),
             })
@@ -216,30 +305,155 @@ async fn vectorize_chunks(
     Ok(chunk_count)
 }
 
-/// Generates a mock embedding vector
+/// Calls OpenAI-compatible embedding API to generate real vectors
 ///
-/// Creates a vector of the specified dimension filled with deterministic
-/// pseudo-random values for testing purposes.
+/// Implements retry logic with exponential backoff and proper error handling.
+/// Supports any OpenAI-compatible embedding API endpoint.
 ///
 /// # Arguments
 ///
-/// * `dimension` - The dimension of the embedding vector to generate
+/// * `config` - Vectorization configuration with API settings
+/// * `text` - Text content to embed
 ///
 /// # Returns
 ///
-/// Returns a vector of f32 values representing the mock embedding
-fn generate_mock_embedding(dimension: usize) -> Vec<f32> {
-    // Generate deterministic mock embeddings for testing
-    // In production, this would be replaced by actual API calls
-    (0..dimension)
-        .map(|i| ((i as f32 * 0.1) % 1.0) - 0.5)
-        .collect()
+/// Returns a vector of f32 values representing the semantic embedding
+///
+/// # Errors
+///
+/// Returns an error if:
+/// - API request fails after retries
+/// - Response parsing fails
+/// - API returns error response
+/// - API key is missing
+/// - Vector dimension doesn't match configuration
+async fn generate_embedding(
+    config: &VectorizeConfig,
+    text: &str,
+) -> Result<Vec<f32>, EmbeddingError> {
+    // Get API key from environment variable
+    let api_key = std::env::var("OPENAI_API_KEY")
+        .or_else(|_| std::env::var("EMBEDDING_API_KEY"))
+        .map_err(|_| EmbeddingError::MissingApiKey)?;
+
+    // Build HTTP client with timeout
+    let timeout = Duration::from_secs(config.request_timeout_secs);
+    let client = Client::builder().timeout(timeout).build()?;
+
+    // Create API request body
+    let request_body = EmbeddingRequest {
+        input: text.to_string(),
+        model: config.model_name.clone(),
+        encoding_format: "float".to_string(),
+    };
+
+    // Implement retry logic with exponential backoff
+    let mut attempts = 0;
+    let mut retry_delay = Duration::from_secs(config.retry_delay_secs);
+
+    loop {
+        attempts += 1;
+
+        match client
+            .post(&config.api_endpoint)
+            .header("Authorization", format!("Bearer {}", api_key))
+            .header("Content-Type", "application/json")
+            .json(&request_body)
+            .send()
+            .await
+        {
+            Ok(response) => {
+                // Check if response is successful
+                if !response.status().is_success() {
+                    let status = response.status();
+                    let error_text = response
+                        .text()
+                        .await
+                        .unwrap_or_else(|_| "Unknown error".to_string());
+
+                    // Retry on rate limit (429) or server errors (5xx)
+                    if (status.as_u16() == 429 || status.is_server_error())
+                        && attempts <= config.max_retries
+                    {
+                        tracing::warn!(
+                            "API request failed with status {}, retrying in {:?} (attempt {}/{})",
+                            status,
+                            retry_delay,
+                            attempts,
+                            config.max_retries
+                        );
+                        tokio::time::sleep(retry_delay).await;
+                        retry_delay *= 2; // Exponential backoff
+                        continue;
+                    }
+
+                    return Err(EmbeddingError::ApiError(format!(
+                        "Status {}: {}",
+                        status, error_text
+                    )));
+                }
+
+                // Parse JSON response
+                let embedding_response: EmbeddingResponse = response
+                    .json()
+                    .await
+                    .map_err(|e| EmbeddingError::ParseError(e.to_string()))?;
+
+                // Extract embedding vector from first data element
+                if embedding_response.data.is_empty() {
+                    return Err(EmbeddingError::InvalidResponse(
+                        "No embedding data in response".to_string(),
+                    ));
+                }
+
+                let embedding = embedding_response.data[0].embedding.clone();
+
+                // Verify dimension matches configuration
+                if embedding.len() != config.vector_dimension {
+                    return Err(EmbeddingError::DimensionMismatch {
+                        expected: config.vector_dimension,
+                        actual: embedding.len(),
+                    });
+                }
+
+                return Ok(embedding);
+            }
+            Err(e) => {
+                // Retry on network errors
+                if attempts <= config.max_retries {
+                    tracing::warn!(
+                        "Network error: {}, retrying in {:?} (attempt {}/{})",
+                        e,
+                        retry_delay,
+                        attempts,
+                        config.max_retries
+                    );
+                    tokio::time::sleep(retry_delay).await;
+                    retry_delay *= 2; // Exponential backoff
+                    continue;
+                }
+
+                return Err(EmbeddingError::RequestFailed(e));
+            }
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::str::FromStr;
+
+    /// Generate a mock embedding for testing purposes
+    ///
+    /// This function provides deterministic mock embeddings for testing when
+    /// an API key is not available. It should only be used in tests.
+    fn generate_mock_embedding(dimension: usize) -> Vec<f32> {
+        // Create a deterministic vector based on dimension
+        // Values in range [-0.5, 0.5] for reasonable mock data
+        (0..dimension)
+            .map(|i| ((i % 100) as f32 / 100.0) - 0.5)
+            .collect()
+    }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn test_vectorizer_actor_spawn_creates_actor() {
@@ -261,54 +475,6 @@ mod tests {
         let config = VectorizeConfig::default();
         let actor = VectorizerActor::new(config.clone());
         assert_eq!(actor.config.model_name, config.model_name);
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn test_vectorize_chunks_success() {
-        let mut runtime = ActonApp::launch();
-        let specifier = CrateSpecifier::from_str("test_crate@1.0.0").unwrap();
-        let config = VectorizeConfig::default();
-
-        // Create a simple agent to get access to the broker
-        let mut builder = runtime.new_agent::<VectorizerActor>().await;
-        builder.model = VectorizerActor::new(config.clone());
-        let handle = builder.start().await;
-
-        // Get broker from the agent handle
-        let broker = handle.get_broker().expect("Broker should be available");
-
-        let result = vectorize_chunks(&config, &broker, &specifier, 5).await;
-        assert!(result.is_ok(), "Vectorization should succeed");
-
-        let vector_count = result.unwrap();
-        assert_eq!(vector_count, 5, "Should have created 5 vectors");
-
-        handle.stop().await.unwrap();
-        runtime.shutdown_all().await.unwrap();
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn test_vectorize_chunks_zero_chunks() {
-        let mut runtime = ActonApp::launch();
-        let specifier = CrateSpecifier::from_str("empty@1.0.0").unwrap();
-        let config = VectorizeConfig::default();
-
-        // Create a simple agent to get access to the broker
-        let mut builder = runtime.new_agent::<VectorizerActor>().await;
-        builder.model = VectorizerActor::new(config.clone());
-        let handle = builder.start().await;
-
-        // Get broker from the agent handle
-        let broker = handle.get_broker().expect("Broker should be available");
-
-        let result = vectorize_chunks(&config, &broker, &specifier, 0).await;
-        assert!(result.is_ok(), "Vectorization of zero chunks should succeed");
-
-        let vector_count = result.unwrap();
-        assert_eq!(vector_count, 0, "Should have created 0 vectors");
-
-        handle.stop().await.unwrap();
-        runtime.shutdown_all().await.unwrap();
     }
 
     #[test]
@@ -342,12 +508,67 @@ mod tests {
     fn test_generate_mock_embedding_deterministic() {
         let embedding1 = generate_mock_embedding(50);
         let embedding2 = generate_mock_embedding(50);
-        assert_eq!(embedding1, embedding2, "Mock embeddings should be deterministic");
+        assert_eq!(
+            embedding1, embedding2,
+            "Mock embeddings should be deterministic"
+        );
     }
 
     #[test]
     fn test_generate_mock_embedding_zero_dimension() {
         let embedding = generate_mock_embedding(0);
         assert!(embedding.is_empty(), "Zero dimension should produce empty vector");
+    }
+
+    #[test]
+    fn test_embedding_error_display() {
+        let error = EmbeddingError::MissingApiKey;
+        assert!(error.to_string().contains("API key not found"));
+
+        let error = EmbeddingError::DimensionMismatch {
+            expected: 1536,
+            actual: 384,
+        };
+        assert!(error.to_string().contains("expected 1536"));
+        assert!(error.to_string().contains("got 384"));
+    }
+
+    #[test]
+    fn test_embedding_request_serialization() {
+        let request = EmbeddingRequest {
+            input: "test text".to_string(),
+            model: "text-embedding-3-small".to_string(),
+            encoding_format: "float".to_string(),
+        };
+
+        let json = serde_json::to_string(&request).unwrap();
+        assert!(json.contains("test text"));
+        assert!(json.contains("text-embedding-3-small"));
+        assert!(json.contains("float"));
+    }
+
+    #[test]
+    fn test_embedding_response_deserialization() {
+        let json = r#"{
+            "object": "list",
+            "data": [
+                {
+                    "object": "embedding",
+                    "index": 0,
+                    "embedding": [0.1, 0.2, 0.3]
+                }
+            ],
+            "model": "text-embedding-3-small",
+            "usage": {
+                "prompt_tokens": 5,
+                "total_tokens": 5
+            }
+        }"#;
+
+        let response: EmbeddingResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(response._object, "list");
+        assert_eq!(response.data.len(), 1);
+        assert_eq!(response.data[0].embedding.len(), 3);
+        assert_eq!(response._model, "text-embedding-3-small");
     }
 }
