@@ -60,5 +60,60 @@ async fn main() -> anyhow::Result<()> {
     // Display total
     println!("Total crates: {}", crates.len());
 
+    println!("\n=== Querying embeddings ===\n");
+
+    // Query all embeddings - use a specific struct
+    #[derive(Debug, serde::Deserialize)]
+    struct EmbeddingRecord {
+        id: Thing,
+        chunk_id: String,
+        crate_id: Thing,
+        vector_dimension: i32,
+        model_name: String,
+        model_version: String,
+        created_at: Option<String>,
+    }
+
+    let mut result = db
+        .query("SELECT id, chunk_id, crate_id, vector_dimension, model_name, model_version, created_at FROM embedding")
+        .await?;
+    let embeddings: Vec<EmbeddingRecord> = result.take(0)?;
+
+    if embeddings.is_empty() {
+        println!("No embeddings found in database.");
+    } else {
+        println!("Found {} embedding(s):\n", embeddings.len());
+
+        for embedding in &embeddings {
+            println!("  Embedding ID: {}", embedding.id);
+            println!("    Chunk: {}", embedding.chunk_id);
+            println!("    Crate: {}", embedding.crate_id);
+            println!("    Model: {} (v{})", embedding.model_name, embedding.model_version);
+            println!("    Dimensions: {}", embedding.vector_dimension);
+            if let Some(created_at) = &embedding.created_at {
+                println!("    Created: {}", created_at);
+            }
+            println!();
+        }
+
+        // Display statistics
+        println!("Total embeddings: {}", embeddings.len());
+
+        // Count by model
+        use std::collections::HashMap;
+        let mut model_counts: HashMap<String, usize> = HashMap::new();
+        for embedding in &embeddings {
+            let model_key = format!("{} v{}", embedding.model_name, embedding.model_version);
+            *model_counts.entry(model_key).or_insert(0) += 1;
+        }
+
+        if !model_counts.is_empty() {
+            println!("\nEmbeddings by model:");
+            for (model, count) in model_counts {
+                println!("  {}: {}", model, count);
+            }
+        }
+    }
+
     Ok(())
 }
