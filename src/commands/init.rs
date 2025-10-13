@@ -61,7 +61,8 @@ pub fn run(args: InitArgs) -> Result<()> {
         println!("  4. Setup completion");
         println!();
 
-        // TODO: Implement interactive wizard
+        // TODO(#73): Implement interactive wizard
+        // See: https://github.com/Govcraft/crately/issues/73
         // - Prompt for OpenAI API key with validation
         // - Configure cache location and size limits
         // - Run test query to validate setup

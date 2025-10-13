@@ -9,10 +9,11 @@ use crate::actors::retry_coordinator::ScheduleRetry;
 use crate::crate_specifier::CrateSpecifier;
 use crate::errors::{DownloadError, ExtractionError, PipelineError};
 use crate::messages::{
-    CheckProcessingTimeouts, ChunksPersistenceComplete, CrateDownloadFailed, CrateDownloaded,
-    CrateProcessingComplete, CrateProcessingFailed, CrateReceived, DocChunkPersisted,
-    DocumentationChunked, DocumentationExtracted, DocumentationExtractionFailed,
-    DocumentationVectorized, EmbeddingPersisted, EmbeddingsPersistenceComplete,
+    CheckProcessingTimeouts, ChunkPersistenceProgress, ChunksPersistenceComplete,
+    CrateDownloadFailed, CrateDownloaded, CrateProcessingComplete, CrateProcessingFailed,
+    CrateReceived, DocChunkPersisted, DocumentationChunked, DocumentationExtracted,
+    DocumentationExtractionFailed, DocumentationVectorized, EmbeddingPersisted,
+    EmbeddingPersistenceProgress, EmbeddingsPersistenceComplete,
 };
 use acton_reactive::prelude::*;
 use std::collections::{HashMap, HashSet};
@@ -376,7 +377,8 @@ impl CrateCoordinatorActor {
             let msg = envelope.message();
             let specifier = &msg.specifier;
 
-            if let Some(state) = agent.model.processing_states.get_mut(specifier) {
+            // Extract state data and update it, then drop the mutable borrow
+            let broadcast_data = if let Some(state) = agent.model.processing_states.get_mut(specifier) {
                 // Track this chunk as persisted (idempotency via HashSet)
                 state.persisted_chunks.insert(msg.chunk_id.clone());
 
@@ -391,32 +393,56 @@ impl CrateCoordinatorActor {
                     "Chunk persisted"
                 );
 
-                // Check if all chunks have been persisted
-                if let Some(expected) = state.expected_chunks {
-                    if persisted_count == expected {
-                        // All chunks persisted - transition to Chunked, then Vectorizing
+                // Check if we have expected chunks set
+                if let Some(total) = state.expected_chunks {
+                    let chunk_index = msg.chunk_index;
+                    let is_complete = persisted_count == total;
+
+                    // Update status if complete
+                    if is_complete {
                         state.update_status(ProcessingStatus::Chunked);
                         debug!(
                             specifier = %specifier,
-                            total_chunks = expected,
+                            total_chunks = total,
                             "All chunks persisted, broadcasting completion and transitioning to vectorizing"
                         );
                         state.update_status(ProcessingStatus::Vectorizing);
-
-                        let specifier_clone = specifier.clone();
-                        let broker = agent.broker().clone();
-
-                        // Broadcast ChunksPersistenceComplete to notify DatabaseActor
-                        return AgentReply::from_async(async move {
-                            broker
-                                .broadcast(ChunksPersistenceComplete {
-                                    specifier: specifier_clone,
-                                    chunk_count: expected,
-                                })
-                                .await;
-                        });
                     }
+
+                    Some((chunk_index, persisted_count, total, is_complete))
+                } else {
+                    None
                 }
+            } else {
+                None
+            };
+
+            // Now handle broadcasting with the broker (mutable borrow dropped)
+            if let Some((chunk_index, persisted_count, total, is_complete)) = broadcast_data {
+                let specifier_clone = specifier.clone();
+                let broker = agent.broker().clone();
+
+                return AgentReply::from_async(async move {
+                    // Always broadcast progress first
+                    broker
+                        .broadcast(ChunkPersistenceProgress {
+                            specifier: specifier_clone.clone(),
+                            chunk_index,
+                            persisted_count,
+                            total_chunks: total,
+                        })
+                        .await;
+
+                    // If complete, broadcast completion message
+                    if is_complete {
+                        broker
+                            .broadcast(ChunksPersistenceComplete {
+                                specifier: specifier_clone,
+                                chunk_count: total,
+                            })
+                            .await;
+                    }
+                });
             }
 
             AgentReply::immediate()
@@ -427,7 +453,8 @@ impl CrateCoordinatorActor {
             let msg = envelope.message();
             let specifier = &msg.specifier;
 
-            if let Some(state) = agent.model.processing_states.get_mut(specifier) {
+            // Extract state data and update it, then drop the mutable borrow
+            let broadcast_data = if let Some(state) = agent.model.processing_states.get_mut(specifier) {
                 // Track this embedding as persisted (idempotency via HashSet)
                 state.persisted_vectors.insert(msg.chunk_id.clone());
 
@@ -442,21 +469,23 @@ impl CrateCoordinatorActor {
                     "Embedding persisted"
                 );
 
-                // Check if all embeddings have been persisted
-                if let Some(expected) = state.expected_vectors {
-                    if persisted_count == expected {
-                        // All embeddings persisted - transition to Vectorized, then Complete
+                // Check if we have expected vectors set
+                if let Some(total) = state.expected_vectors {
+                    let chunk_id = msg.chunk_id.clone();
+                    let embedding_model = state.embedding_model.clone().unwrap_or_else(|| "unknown".to_string());
+                    let is_complete = persisted_count == total;
+
+                    // Update status if complete
+                    if is_complete {
                         state.update_status(ProcessingStatus::Vectorized);
                         debug!(
                             specifier = %specifier,
-                            total_embeddings = expected,
+                            total_embeddings = total,
                             "All embeddings persisted, broadcasting completion and transitioning to complete"
                         );
 
                         let total_duration_ms = state.total_duration_ms();
                         let features = state.features.clone();
-                        let specifier_clone = specifier.clone();
-                        let embedding_model = state.embedding_model.clone().unwrap_or_else(|| "unknown".to_string());
 
                         info!(
                             specifier = %specifier,
@@ -466,14 +495,41 @@ impl CrateCoordinatorActor {
 
                         state.update_status(ProcessingStatus::Complete);
 
-                        let broker = agent.broker().clone();
+                        Some((chunk_id, persisted_count, total, embedding_model.clone(), is_complete, Some((features, total_duration_ms, embedding_model))))
+                    } else {
+                        Some((chunk_id, persisted_count, total, embedding_model, is_complete, None))
+                    }
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
 
-                        // Broadcast EmbeddingsPersistenceComplete first, then CrateProcessingComplete
-                        return AgentReply::from_async(async move {
+            // Now handle broadcasting with the broker (mutable borrow dropped)
+            if let Some((chunk_id, persisted_count, total, embedding_model, is_complete, completion_data)) = broadcast_data {
+                let specifier_clone = specifier.clone();
+                let broker = agent.broker().clone();
+
+                return AgentReply::from_async(async move {
+                    // Always broadcast progress first
+                    broker
+                        .broadcast(EmbeddingPersistenceProgress {
+                            specifier: specifier_clone.clone(),
+                            chunk_id,
+                            persisted_count,
+                            total_vectors: total,
+                            embedding_model: embedding_model.clone(),
+                        })
+                        .await;
+
+                    // If complete, broadcast completion messages
+                    if is_complete {
+                        if let Some((features, total_duration_ms, embedding_model)) = completion_data {
                             broker
                                 .broadcast(EmbeddingsPersistenceComplete {
                                     specifier: specifier_clone.clone(),
-                                    vector_count: expected,
+                                    vector_count: total,
                                     embedding_model,
                                 })
                                 .await;
@@ -486,9 +542,9 @@ impl CrateCoordinatorActor {
                                     stages_completed: 4, // download → extract → chunk → vectorize
                                 })
                                 .await;
-                        });
+                        }
                     }
-                }
+                });
             }
 
             AgentReply::immediate()

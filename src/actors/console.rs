@@ -14,9 +14,9 @@ use std::io::stdout;
 use crate::actors::config::ConfigLoaded;
 use crate::colors::{format_error, format_progress, format_success, format_warning, ColorConfig};
 use crate::messages::{
-    ChunksPersistenceComplete, ConfigReloadFailed, CrateListResponse, CrateProcessingComplete,
-    CratePersisted, CrateQueryResponse, DatabaseError, DatabaseWarning, DocChunkPersisted,
-    EmbeddingPersisted, EmbeddingsPersistenceComplete, Init, PrintError, PrintProgress,
+    ChunkPersistenceProgress, ChunksPersistenceComplete, ConfigReloadFailed, CrateListResponse,
+    CrateProcessingComplete, CratePersisted, CrateQueryResponse, DatabaseError, DatabaseWarning,
+    EmbeddingPersistenceProgress, EmbeddingsPersistenceComplete, Init, PrintError, PrintProgress,
     PrintSeparator, PrintSpinner, PrintSuccess, PrintWarning, ServerReloaded, ServerStarted,
     SetRawMode, StopSpinner, UpdateSpinner,
 };
@@ -442,13 +442,14 @@ impl Console {
 
                 AgentReply::immediate()
             })
-            .act_on::<DocChunkPersisted>(|agent, envelope| {
+            .act_on::<ChunkPersistenceProgress>(|agent, envelope| {
                 let msg = envelope.message();
 
-                // Use chunk_index to show progress
+                // Display progress with complete information
                 let progress_msg = format!(
-                    "Persisting chunk {}/? for {}@{}",
-                    msg.chunk_index + 1, // Display as 1-indexed
+                    "Persisting chunk {}/{} for {}@{}",
+                    msg.persisted_count,
+                    msg.total_chunks,
                     msg.specifier.name(),
                     msg.specifier.version()
                 );
@@ -461,15 +462,17 @@ impl Console {
 
                 AgentReply::immediate()
             })
-            .act_on::<EmbeddingPersisted>(|agent, envelope| {
+            .act_on::<EmbeddingPersistenceProgress>(|agent, envelope| {
                 let msg = envelope.message();
 
-                // Use model_name to show which embedding model is being used
+                // Display progress with complete information
                 let progress_msg = format!(
-                    "Vectorized chunk for {}@{} with {}",
+                    "Vectorizing embedding {}/{} for {}@{} with {}",
+                    msg.persisted_count,
+                    msg.total_vectors,
                     msg.specifier.name(),
                     msg.specifier.version(),
-                    msg.model_name
+                    msg.embedding_model
                 );
 
                 print_progress(
@@ -547,8 +550,14 @@ impl Console {
         builder.handle().subscribe::<DatabaseWarning>().await;
         builder.handle().subscribe::<CrateQueryResponse>().await;
         builder.handle().subscribe::<CrateListResponse>().await;
-        builder.handle().subscribe::<DocChunkPersisted>().await;
-        builder.handle().subscribe::<EmbeddingPersisted>().await;
+        builder
+            .handle()
+            .subscribe::<ChunkPersistenceProgress>()
+            .await;
+        builder
+            .handle()
+            .subscribe::<EmbeddingPersistenceProgress>()
+            .await;
         builder
             .handle()
             .subscribe::<ChunksPersistenceComplete>()
@@ -1234,13 +1243,14 @@ mod tests {
         let color_config = ColorConfig::new(ColorChoice::Never);
         let console = Console::spawn(&mut runtime, color_config).await.unwrap();
 
-        // Broadcast DocChunkPersisted event
+        // Broadcast ChunkPersistenceProgress event
         runtime
             .broker()
-            .broadcast(DocChunkPersisted {
-                chunk_id: "test_chunk_001".to_string(),
+            .broadcast(ChunkPersistenceProgress {
                 specifier: CrateSpecifier::from_str("serde@1.0.0").unwrap(),
                 chunk_index: 5,
+                persisted_count: 6,
+                total_chunks: 20,
             })
             .await;
 
@@ -1252,7 +1262,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn test_console_actor_handles_embedding_persisted() {
+    async fn test_console_actor_handles_embedding_persistence_progress() {
         use crate::cli::ColorChoice;
         use crate::crate_specifier::CrateSpecifier;
         use std::str::FromStr;
@@ -1261,13 +1271,15 @@ mod tests {
         let color_config = ColorConfig::new(ColorChoice::Never);
         let console = Console::spawn(&mut runtime, color_config).await.unwrap();
 
-        // Broadcast EmbeddingPersisted event
+        // Broadcast EmbeddingPersistenceProgress event
         runtime
             .broker()
-            .broadcast(EmbeddingPersisted {
-                chunk_id: "test_chunk_001".to_string(),
+            .broadcast(EmbeddingPersistenceProgress {
                 specifier: CrateSpecifier::from_str("tokio@1.35.0").unwrap(),
-                model_name: "text-embedding-3-small".to_string(),
+                chunk_id: "test_chunk_001".to_string(),
+                persisted_count: 15,
+                total_vectors: 58,
+                embedding_model: "text-embedding-3-small".to_string(),
             })
             .await;
 
@@ -1290,14 +1302,15 @@ mod tests {
 
         let specifier = CrateSpecifier::from_str("axum@0.7.0").unwrap();
 
-        // Simulate persisting multiple chunks
+        // Simulate persisting multiple chunks with progress
         for chunk_idx in 0..5 {
             runtime
                 .broker()
-                .broadcast(DocChunkPersisted {
-                    chunk_id: format!("axum_chunk_{:03}", chunk_idx),
+                .broadcast(ChunkPersistenceProgress {
                     specifier: specifier.clone(),
                     chunk_index: chunk_idx,
+                    persisted_count: (chunk_idx + 1) as u32,
+                    total_chunks: 5,
                 })
                 .await;
 

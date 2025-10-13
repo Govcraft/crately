@@ -262,7 +262,8 @@ async fn vectorize_chunks(
     specifier: &CrateSpecifier,
     chunk_count: u32,
 ) -> Result<u32> {
-    // TODO: In the future, we should:
+    // TODO(#58): In the future, we should:
+    // See: https://github.com/Govcraft/crately/issues/58
     // 1. Query actual chunk text from database using chunk IDs
     // 2. Batch chunks for API calls (OpenAI supports up to 2048 inputs per request)
     // 3. Implement batching for efficiency
@@ -278,7 +279,9 @@ async fn vectorize_chunks(
             index
         );
 
-        // TODO: Query actual chunk text from database
+        // TODO(#57, #58): Query actual chunk text from database
+        // See: https://github.com/Govcraft/crately/issues/57
+        // See: https://github.com/Govcraft/crately/issues/58
         // For now, use a placeholder text
         let chunk_text = format!(
             "Documentation chunk {} for {} version {}",

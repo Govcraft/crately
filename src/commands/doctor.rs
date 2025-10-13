@@ -49,7 +49,8 @@ pub fn run(args: DoctorArgs) -> Result<()> {
     println!("  - Runtime environment checks");
     println!();
 
-    // TODO: Implement actual diagnostic checks
+    // TODO(#74): Implement actual diagnostic checks
+    // See: https://github.com/Govcraft/crately/issues/74
     // - Check configuration file exists and is valid
     // - Verify database connection and schema
     // - Check XDG directories exist and are writable
@@ -58,7 +59,8 @@ pub fn run(args: DoctorArgs) -> Result<()> {
 
     if args.fix {
         println!("Auto-fix mode would attempt to resolve issues here");
-        // TODO: Implement automatic fixes
+        // TODO(#75): Implement automatic fixes
+        // See: https://github.com/Govcraft/crately/issues/75
         // - Create missing configuration files
         // - Fix file permissions
         // - Initialize database schema

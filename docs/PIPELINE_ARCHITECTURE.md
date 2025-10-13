@@ -1,8 +1,8 @@
 # Crately Pipeline Architecture
 
-**Document Version**: 1.0
-**Last Updated**: 2025-10-12
-**Status**: Complete Implementation
+**Document Version**: 1.1
+**Last Updated**: 2025-10-13
+**Status**: Complete Implementation (Updated with event-driven vectorization design)
 
 ## Table of Contents
 
@@ -285,15 +285,25 @@ pub struct ChunkMetadata {
 
 **Actor**: `VectorizerActor`
 **Input**: `DocumentationChunked` event
-**Output**: `DocumentationVectorized` broadcast, multiple `PersistEmbedding` broadcasts
+**Output**: `QueryDocChunks`, `EmbeddingGenerated` (multiple), `EmbeddingFailed`, `DocumentationVectorized` broadcasts
 
 **Responsibilities**:
-- Generate embeddings for each chunk using OpenAI-compatible API
-- Implement retry logic with exponential backoff
-- Handle rate limiting (429) and server errors (5xx)
+- Query documentation chunks from database via event broadcast
+- Batch chunks for efficient API calls (up to 2048 inputs per OpenAI request)
+- Generate embeddings using OpenAI-compatible API
 - Validate vector dimensions match configuration
-- Broadcast `PersistEmbedding` for each vector
-- Track vectorization duration
+- Broadcast success/failure events for each batch
+- NO retry logic (handled by `RetryCoordinator`)
+
+**Event-Driven Flow**:
+1. Receives `DocumentationChunked` event
+2. Broadcasts `QueryDocChunks` to request chunk content
+3. Receives `DocChunksResponse` from DatabaseActor
+4. Batches chunks based on `batch_size` configuration
+5. Calls embedding API for each batch (simple call, no retries)
+6. On success: Broadcasts `EmbeddingGenerated` for each chunk
+7. On failure: Broadcasts `EmbeddingFailed` (triggers retry coordination)
+8. After all batches: Broadcasts `DocumentationVectorized`
 
 **API Integration**:
 - **Endpoint**: Configurable (default OpenAI)
@@ -301,12 +311,18 @@ pub struct ChunkMetadata {
 - **Dimension**: 1536 (configurable)
 - **Format**: `float` (f32 vectors)
 - **Authentication**: Bearer token from `OPENAI_API_KEY` or `EMBEDDING_API_KEY`
+- **Batch Support**: Up to 2048 texts per request (OpenAI limit)
 
-**Retry Strategy**:
-- Exponential backoff starting at configured delay
-- Retry on rate limits (429) and server errors (5xx)
-- Network error retry with backoff
-- Maximum retry attempts: configurable
+**Retry Architecture**:
+- VectorizerActor does NOT implement retry logic
+- Broadcasts `EmbeddingFailed` with `is_retryable` classification
+- `RetryCoordinator` subscribes to failures and orchestrates retries
+- Exponential backoff with jitter handled by coordinator
+- Receives `RetryCrateProcessing` to retry failed batches
+
+**Error Classification**:
+- **Retryable**: Rate limits (429), server errors (5xx), timeouts, network errors
+- **Non-Retryable**: Invalid API key, dimension mismatch, malformed requests
 
 **Configuration**:
 ```rust
@@ -316,14 +332,13 @@ pub struct VectorizeConfig {
     pub vector_dimension: usize,     // Expected vector size
     pub api_endpoint: String,        // API URL
     pub request_timeout_secs: u64,   // HTTP timeout
-    pub max_retries: u32,            // Retry attempts
-    pub retry_delay_secs: u64,       // Initial retry delay
+    pub batch_size: usize,           // Chunks per API call (default: 100, max: 2048)
 }
 ```
 
 **Message Types**:
-- **Subscribes to**: `DocumentationChunked`
-- **Broadcasts**: `PersistEmbedding` (multiple), `DocumentationVectorized`
+- **Subscribes to**: `DocumentationChunked`, `DocChunksResponse`, `RetryCrateProcessing`
+- **Broadcasts**: `QueryDocChunks`, `EmbeddingGenerated` (multiple), `EmbeddingFailed`, `DocumentationVectorized`
 
 ---
 
@@ -378,17 +393,21 @@ pub struct CrateProcessingComplete {
 **State**: Database connection and schema
 **Connection**: `rocksdb://<path>` with namespace `crately`, database `production`
 **Messages**:
-- **Query**: `QueryCrate`, `ListCrates`, `QuerySimilarDocs`
+- **Query**: `QueryCrate`, `ListCrates`, `QuerySimilarDocs`, `QueryDocChunks`
 - **Persist**: `PersistCrate`, `PersistDocChunk`, `PersistEmbedding`, `PersistCodeSample`
 - **Events**: `DatabaseReady`, `DatabaseError`
-- **Responses**: `CrateQueryResponse`, `CrateListResponse`, `SimilarDocsResponse`
+- **Responses**: `CrateQueryResponse`, `CrateListResponse`, `SimilarDocsResponse`, `DocChunksResponse`
+- **Subscribes to**: `QueryDocChunks`, `PersistDocChunk`, `PersistEmbedding`, `EmbeddingGenerated`
+- **Broadcasts**: `DocChunksResponse`, `DatabaseReady`, `DatabaseError`
 
 #### RetryCoordinator
 **Purpose**: Centralized retry management with policy-based retry logic
 **Pattern**: Simple actor (returns handle only)
-**State**: Retry policy configuration
-**Messages**: `RetryCrateProcessing`
-**Behavior**: Subscribes to `RetryCrateProcessing` and re-broadcasts `CrateReceived` after validation
+**State**: Retry policy configuration, active retry counters per crate
+**Messages**: `ScheduleRetry`, `RetryCrateProcessing`
+**Subscribes to**: `EmbeddingFailed` (and other failure events)
+**Broadcasts**: `RetryCrateProcessing` after exponential backoff delay
+**Behavior**: Receives failure events, applies retry policy with exponential backoff and jitter, re-broadcasts retry events
 
 ### Pipeline Actors (Always Active)
 
@@ -557,6 +576,60 @@ pub struct DocumentationChunked {
 **Broadcasted by**: `ProcessorActor`
 **Subscribed by**: `VectorizerActor`, `CrateCoordinatorActor`
 
+#### QueryDocChunks
+```rust
+pub struct QueryDocChunks {
+    pub specifier: CrateSpecifier,
+}
+```
+**Broadcasted by**: `VectorizerActor`
+**Subscribed by**: `DatabaseActor`
+**Purpose**: Request documentation chunks from database for vectorization
+
+#### DocChunksResponse
+```rust
+pub struct DocChunksResponse {
+    pub specifier: CrateSpecifier,
+    pub chunks: Vec<ChunkData>,
+}
+
+pub struct ChunkData {
+    pub chunk_id: String,
+    pub content: String,
+    pub sequence_number: u32,
+}
+```
+**Broadcasted by**: `DatabaseActor`
+**Subscribed by**: `VectorizerActor`
+**Purpose**: Return requested chunks from database query
+
+#### EmbeddingGenerated
+```rust
+pub struct EmbeddingGenerated {
+    pub chunk_id: String,
+    pub specifier: CrateSpecifier,
+    pub vector: Vec<f32>,
+    pub model_name: String,
+    pub model_version: String,
+}
+```
+**Broadcasted by**: `VectorizerActor`
+**Subscribed by**: `DatabaseActor`, `Console`, `CrateCoordinatorActor`
+**Purpose**: Indicates successful embedding generation for a chunk
+
+#### EmbeddingFailed
+```rust
+pub struct EmbeddingFailed {
+    pub specifier: CrateSpecifier,
+    pub chunk_ids: Vec<String>,
+    pub error: String,
+    pub is_retryable: bool,
+}
+```
+**Broadcasted by**: `VectorizerActor`
+**Subscribed by**: `RetryCoordinator`, `Console`, `CrateCoordinatorActor`
+**Purpose**: Indicates embedding generation failure, triggers retry coordination
+
 #### DocumentationVectorized
 ```rust
 pub struct DocumentationVectorized {
@@ -672,12 +745,25 @@ pub struct CheckProcessingTimeouts;
    VectorizerActor receives DocumentationChunked
    CrateCoordinatorActor receives DocumentationChunked → Update state (Chunked → Vectorizing)
    ↓
-10. VectorizerActor → Generate embeddings → Broadcast: PersistEmbedding (multiple) + DocumentationVectorized
+10. VectorizerActor → Broadcast: QueryDocChunks
     ↓
-11. DatabaseActor receives PersistEmbedding messages → Store vectors
-    CrateCoordinatorActor receives DocumentationVectorized → Update state (Vectorized → Complete)
+11. DatabaseActor receives QueryDocChunks → Query chunks → Broadcast: DocChunksResponse
     ↓
-12. CrateCoordinatorActor → Broadcast: CrateProcessingComplete
+12. VectorizerActor receives DocChunksResponse → Batch chunks → Generate embeddings
+    ↓
+13. For each batch:
+    Success → Broadcast: EmbeddingGenerated (one per chunk)
+    Failure → Broadcast: EmbeddingFailed (triggers retry)
+    ↓
+14. DatabaseActor receives EmbeddingGenerated messages → Store vectors
+    Console receives EmbeddingGenerated → Display progress
+    CrateCoordinatorActor receives EmbeddingGenerated → Track progress
+    ↓
+15. VectorizerActor → After all batches → Broadcast: DocumentationVectorized
+    ↓
+16. CrateCoordinatorActor receives DocumentationVectorized → Update state (Vectorized → Complete)
+    ↓
+17. CrateCoordinatorActor → Broadcast: CrateProcessingComplete
 ```
 
 ### Error Path: Download Failure with Retry
@@ -973,5 +1059,10 @@ The current architecture is designed to support future enhancements without majo
 ---
 
 **Document Status**: Complete and accurate as of implementation.
-**Last Updated**: 2025-10-12
-**Related Issues**: Closes #50, Part of EPIC #51
+**Last Updated**: 2025-10-13
+**Related Issues**: Closes #50, Part of EPIC #51, Updated for #78 (Event-driven vectorization with batch support and retry coordination)
+**Architecture Changes**:
+- Added event-driven query/response pattern for chunk retrieval
+- Implemented batch vectorization support (up to 2048 inputs per API call)
+- Separated retry logic from VectorizerActor into RetryCoordinator
+- Added new message types: QueryDocChunks, DocChunksResponse, EmbeddingGenerated, EmbeddingFailed

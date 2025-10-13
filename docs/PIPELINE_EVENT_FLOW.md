@@ -2,6 +2,10 @@
 
 **Visual Documentation of Message Passing and Actor Interactions**
 
+**Document Version**: 1.1
+**Last Updated**: 2025-10-13
+**Status**: Updated with event-driven vectorization design
+
 ## Table of Contents
 
 1. [Event Flow Diagrams](#event-flow-diagrams)
@@ -93,24 +97,64 @@
        │             │ Vectorizing  │
        ↓             └──────────────┘
 ┌──────────────┐
-│  Generate    │
-│ embeddings   │
-│ via OpenAI   │
-│     API      │
+│  Broadcast:  │
+│QueryDocChunks│
 └──────┬───────┘
        │
-       │ Broadcast: PersistEmbedding (multiple)
        ↓
 ┌──────────────┐
 │   Database   │
-│Store vectors │
-└──────────────┘
+│ Query chunks │
+└──────┬───────┘
        │
-       │ Broadcast: DocumentationVectorized
+       │ Broadcast: DocChunksResponse
        ↓
-┌──────────────────────────┐
-│      Coordinator         │
-│  Vectorized → Complete   │
+┌──────────────┐
+│ Vectorizer   │
+│ Batch chunks │
+│ (100 each)   │
+└──────┬───────┘
+       │
+       │ For each batch:
+       ↓
+┌──────────────┐
+│  Call OpenAI │
+│ Embedding API│
+│(simple, no   │
+│   retries)   │
+└──────┬───────┘
+       │
+       ├──── Success ──────┬──── Failure
+       │                   │
+       ↓                   ↓
+┌──────────────┐    ┌──────────────┐
+│  Broadcast:  │    │  Broadcast:  │
+│ Embedding    │    │ Embedding    │
+│ Generated    │    │  Failed      │
+│(per chunk)   │    │(w/ chunk_ids)│
+└──────┬───────┘    └──────┬───────┘
+       │                   │
+       ├────────┬──────────┼─────────┬────────┐
+       ↓        ↓          ↓         ↓        ↓
+┌───────────┐ ┌─────┐ ┌────────┐ ┌───────┐ ┌────────┐
+│ Database  │ │Con- │ │ Coord- │ │ Retry │ │Console │
+│ (persist) │ │sole │ │ inator │ │ Coord │ │(error) │
+└───────────┘ └─────┘ └────────┘ └───┬───┘ └────────┘
+                                     │
+                                     │ (retry flow)
+       │                             ↓
+       │                      ┌──────────────┐
+       │ All batches done     │ Exponential  │
+       ↓                      │ Backoff +    │
+┌──────────────────────────┐ │   Jitter     │
+│ Broadcast:               │ └──────┬───────┘
+│ DocumentationVectorized  │        │
+└──────┬───────────────────┘        │ Broadcast:
+       │                            │ RetryCrate
+       ↓                            │ Processing
+┌──────────────────────────┐        │
+│      Coordinator         │        │
+│  Vectorized → Complete   │        └──► (restart query)
 └──────┬───────────────────┘
        │
        │ Broadcast: CrateProcessingComplete
@@ -314,6 +358,80 @@ Background task uses direct messaging:
 - coordinator_handle.send(CheckProcessingTimeouts).await
 ```
 
+### Event-Driven Query/Response Pattern (Vectorization)
+
+```
+┌──────────────────────────────────────────────────────────────┐
+│             Event-Driven Query/Response Pattern              │
+│                  (No Synchronous Waiting)                    │
+└──────────────────────────────────────────────────────────────┘
+
+Step 1: Request Phase
+┌──────────────┐
+│ Vectorizer   │
+│   Actor      │
+└──────┬───────┘
+       │
+       │ broker.broadcast(QueryDocChunks { specifier })
+       │
+       ├────────────────────────────────────┐
+       ↓                                    ↓
+┌──────────────┐                    ┌──────────────┐
+│ Database     │                    │ Vectorizer   │
+│ (receives    │                    │ (continues   │
+│  request)    │                    │  processing) │
+└──────┬───────┘                    └──────────────┘
+       │
+       │ Query database
+       │
+       ↓
+┌──────────────┐
+│ Execute      │
+│ SurrealDB    │
+│ query        │
+└──────┬───────┘
+
+Step 2: Response Phase
+       │
+       │ broker.broadcast(DocChunksResponse { chunks })
+       │
+       ├────────────────────────────────────┐
+       ↓                                    ↓
+┌──────────────┐                    ┌──────────────┐
+│ Vectorizer   │                    │   (other     │
+│ (receives    │                    │  subscribers │
+│  response)   │                    │   if any)    │
+└──────┬───────┘                    └──────────────┘
+       │
+       │ Batch chunks
+       │ Call API
+       │
+       ├──── Success ──────┬──── Failure
+       │                   │
+       ↓                   ↓
+┌──────────────┐    ┌──────────────┐
+│  Broadcast:  │    │  Broadcast:  │
+│ Embedding    │    │ Embedding    │
+│ Generated    │    │  Failed      │
+└──────────────┘    └──────┬───────┘
+                           │
+                           ↓
+                    ┌──────────────┐
+                    │    Retry     │
+                    │ Coordinator  │
+                    │  (handles    │
+                    │   retry)     │
+                    └──────────────┘
+
+Key Characteristics:
+- No synchronous waiting (no oneshot channels, no .await on response)
+- VectorizerActor continues processing after broadcasting request
+- DatabaseActor responds via broadcast (loosely coupled)
+- Multiple actors can subscribe to response
+- Retry handled by separate coordinator actor
+- Natural backpressure through message queues
+```
+
 ## Message Routing
 
 ### Message Type Registry
@@ -343,13 +461,29 @@ Pipeline Events (Broadcast):
 │   ├─► VectorizerActor
 │   └─► CrateCoordinatorActor
 │
+├── QueryDocChunks
+│   └─► DatabaseActor
+│
+├── DocChunksResponse
+│   └─► VectorizerActor
+│
+├── EmbeddingGenerated
+│   ├─► DatabaseActor (persist)
+│   ├─► Console (display)
+│   └─► CrateCoordinatorActor (track)
+│
+├── EmbeddingFailed
+│   ├─► RetryCoordinator (orchestrate retry)
+│   ├─► Console (display error)
+│   └─► CrateCoordinatorActor (track failure)
+│
 ├── DocumentationVectorized
 │   └─► CrateCoordinatorActor
 │
 ├── PersistDocChunk
 │   └─► DatabaseActor
 │
-├── PersistEmbedding
+├── PersistEmbedding (DEPRECATED - replaced by EmbeddingGenerated)
 │   └─► DatabaseActor
 │
 ├── RetryCrateProcessing
@@ -538,3 +672,10 @@ fn increment_retry(&mut self) {
 ---
 
 **Related Documentation**: See [PIPELINE_ARCHITECTURE.md](./PIPELINE_ARCHITECTURE.md) for detailed component descriptions and configuration.
+
+**Architecture Updates**:
+- Added Event-Driven Query/Response Pattern section showing vectorization flow
+- Updated happy path diagram with batch vectorization and retry coordination
+- Added new messages: QueryDocChunks, DocChunksResponse, EmbeddingGenerated, EmbeddingFailed
+- Documented separation of retry logic from VectorizerActor into RetryCoordinator
+- Illustrated multi-subscriber pattern for embedding events (Database, Console, Coordinator, RetryCoordinator)
