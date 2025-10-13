@@ -30,7 +30,7 @@ use crate::messages::{
 
 #[cfg(test)]
 use crate::messages::{DocumentationChunked, DocumentationVectorized};
-use crate::types::SearchResult;
+use crate::types::{BuildId, SearchResult};
 
 /// Information about the database connection returned at spawn time.
 ///
@@ -370,7 +370,7 @@ impl DatabaseActor {
         // Set the custom model before starting
         builder.model = database_actor;
 
-        // Handle PersistCrate requests
+        // Handle PersistCrate requests - Graph-based implementation
         builder.mutate_on::<PersistCrate>(|agent, envelope| {
             let msg = envelope.message().clone();
             let db = agent.model.db.clone();
@@ -380,66 +380,291 @@ impl DatabaseActor {
                 let name = msg.specifier.name().to_string();
                 let version = msg.specifier.version().to_string();
 
-                // Step 1: Clean up any existing chunks/embeddings for idempotency
-                // This ensures reprocessing doesn't create duplicates
-                let cleanup_query = r#"
-                    -- First, delete embeddings that reference chunks for this crate
-                    DELETE embedding WHERE crate_id.name = $name AND crate_id.version = $version;
-                    -- Then delete the doc chunks themselves
-                    DELETE doc_chunk WHERE crate_id.name = $name AND crate_id.version = $version;
-                    -- Also delete any code samples
-                    DELETE code_sample WHERE crate_id.name = $name AND crate_id.version = $version;
-                "#;
+                // Step 1: Generate content-addressable BuildId
+                let build_id = BuildId::generate(&msg.specifier, &msg.features);
+                let build_id_str = build_id.as_str().to_string();
 
-                match db
-                    .query(cleanup_query)
+                debug!(
+                    build_id = %build_id_str,
+                    crate_name = %name,
+                    crate_version = %version,
+                    features = ?msg.features,
+                    "Generating BuildId for crate build"
+                );
+
+                // Step 2: Create or get crate entity (idempotent)
+                let crate_result = match db
+                    .query(
+                        r#"
+                        LET $existing = (SELECT id FROM crate WHERE name = $name AND version = $version LIMIT 1);
+                        RETURN IF $existing[0].id THEN
+                            $existing[0].id
+                        ELSE
+                            (CREATE crate SET name = $name, version = $version, created_at = time::now()).id
+                        END;
+                        "#,
+                    )
                     .bind(("name", name.clone()))
                     .bind(("version", version.clone()))
                     .await
                 {
-                    Ok(_) => {
-                        debug!(
-                            "Cleaned up existing chunks/embeddings for {}@{} before reprocessing",
-                            name, version
-                        );
+                    Ok(mut response) => {
+                        match response.take::<Option<surrealdb::sql::Thing>>(0) {
+                            Ok(Some(crate_thing)) => {
+                                debug!(
+                                    crate_id = %crate_thing,
+                                    "Crate entity created or retrieved"
+                                );
+                                Ok(crate_thing)
+                            }
+                            Ok(None) => {
+                                error!("Crate query returned no result");
+                                Err(anyhow::anyhow!("Failed to create/get crate entity"))
+                            }
+                            Err(e) => {
+                                error!(error = %e, "Failed to deserialize crate result");
+                                Err(anyhow::anyhow!("Crate entity deserialization failed: {}", e))
+                            }
+                        }
                     }
                     Err(e) => {
-                        // Log warning but continue - cleanup failure shouldn't block new processing
-                        warn!(
-                            "Failed to cleanup existing data for {}@{}: {}",
-                            name, version, e
-                        );
-                    }
-                }
-
-                // Step 2: Create or update the crate record
-                let record_data = serde_json::json!({
-                    "name": name,
-                    "version": version,
-                    "features": msg.features,
-                    "status": "pending",
-                    "requested_at": "time::now()",
-                });
-
-                // Execute the create statement
-                match db
-                    .query("CREATE crate CONTENT $data")
-                    .bind(("data", record_data))
-                    .await
-                {
-                    Ok(_) => {
-                        debug!("Persisted crate: {}@{}", name, version);
-                    }
-                    Err(e) => {
-                        error!("Failed to persist crate: {}", e);
+                        error!(error = %e, "Crate entity query failed");
                         broker
                             .broadcast(DatabaseError {
-                                operation: format!("persist crate {}@{}", name, version),
+                                operation: format!("create/get crate entity {}@{}", name, version),
                                 error: e.to_string(),
                             })
                             .await;
+                        Err(anyhow::anyhow!("Crate entity query failed: {}", e))
+                    }
+                };
+
+                let crate_thing = match crate_result {
+                    Ok(thing) => thing,
+                    Err(_) => return, // Error already logged and broadcast
+                };
+
+                // Step 3: Create or get feature entities (idempotent)
+                let mut feature_things = Vec::new();
+                for feature_name in &msg.features {
+                    let feature_result = match db
+                        .query(
+                            r#"
+                            LET $existing = (SELECT id FROM feature WHERE name = $name LIMIT 1);
+                            RETURN IF $existing[0].id THEN
+                                $existing[0].id
+                            ELSE
+                                (CREATE feature SET name = $name, created_at = time::now()).id
+                            END;
+                            "#,
+                        )
+                        .bind(("name", feature_name.clone()))
+                        .await
+                    {
+                        Ok(mut response) => {
+                            match response.take::<Option<surrealdb::sql::Thing>>(0) {
+                                Ok(Some(feature_thing)) => {
+                                    debug!(
+                                        feature = %feature_name,
+                                        feature_id = %feature_thing,
+                                        "Feature entity created or retrieved"
+                                    );
+                                    Ok(feature_thing)
+                                }
+                                Ok(None) => {
+                                    error!(feature = %feature_name, "Feature query returned no result");
+                                    Err(anyhow::anyhow!("Failed to create/get feature entity"))
+                                }
+                                Err(e) => {
+                                    error!(error = %e, feature = %feature_name, "Failed to deserialize feature");
+                                    Err(anyhow::anyhow!("Feature entity deserialization failed: {}", e))
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            error!(error = %e, feature = %feature_name, "Feature entity query failed");
+                            broker
+                                .broadcast(DatabaseError {
+                                    operation: format!("create/get feature entity '{}'", feature_name),
+                                    error: e.to_string(),
+                                })
+                                .await;
+                            Err(anyhow::anyhow!("Feature entity query failed: {}", e))
+                        }
+                    };
+
+                    match feature_result {
+                        Ok(thing) => feature_things.push(thing),
+                        Err(_) => return, // Error already logged and broadcast
                     }
                 }
+
+                // Step 4: Create build entity with BuildId (idempotent by BuildId)
+                let build_result = match db
+                    .query(
+                        r#"
+                        LET $existing = (SELECT id FROM build WHERE build_id = $build_id LIMIT 1);
+                        RETURN IF $existing[0].id THEN
+                            $existing[0].id
+                        ELSE
+                            (CREATE build SET
+                                build_id = $build_id,
+                                status = 'pending',
+                                created_at = time::now()
+                            ).id
+                        END;
+                        "#,
+                    )
+                    .bind(("build_id", build_id_str.clone()))
+                    .await
+                {
+                    Ok(mut response) => {
+                        match response.take::<Option<surrealdb::sql::Thing>>(0) {
+                            Ok(Some(build_thing)) => {
+                                debug!(
+                                    build_id = %build_id_str,
+                                    record_id = %build_thing,
+                                    "Build entity created or retrieved"
+                                );
+                                Ok(build_thing)
+                            }
+                            Ok(None) => {
+                                error!("Build query returned no result");
+                                Err(anyhow::anyhow!("Failed to create/get build entity"))
+                            }
+                            Err(e) => {
+                                error!(error = %e, "Failed to deserialize build result");
+                                Err(anyhow::anyhow!("Build entity deserialization failed: {}", e))
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        error!(error = %e, build_id = %build_id_str, "Build entity query failed");
+                        broker
+                            .broadcast(DatabaseError {
+                                operation: format!("create/get build entity {}", build_id_str),
+                                error: e.to_string(),
+                            })
+                            .await;
+                        Err(anyhow::anyhow!("Build entity query failed: {}", e))
+                    }
+                };
+
+                let build_thing = match build_result {
+                    Ok(thing) => thing,
+                    Err(_) => return, // Error already logged and broadcast
+                };
+
+                // Step 5: Create build->of->crate relationship (idempotent)
+                if let Err(e) = db
+                    .query(
+                        r#"
+                        DELETE of WHERE in = $build_id;
+                        RELATE $build_id->of->$crate_id;
+                        "#,
+                    )
+                    .bind(("build_id", build_thing.clone()))
+                    .bind(("crate_id", crate_thing.clone()))
+                    .await
+                {
+                    error!(
+                        error = %e,
+                        build_id = %build_thing,
+                        crate_id = %crate_thing,
+                        "Failed to create build->of->crate relationship"
+                    );
+                    broker
+                        .broadcast(DatabaseError {
+                            operation: format!(
+                                "create relationship build->of->crate ({} -> {})",
+                                build_thing, crate_thing
+                            ),
+                            error: e.to_string(),
+                        })
+                        .await;
+                    return;
+                }
+
+                debug!(
+                    build_id = %build_thing,
+                    crate_id = %crate_thing,
+                    "Created build->of->crate relationship"
+                );
+
+                // Step 6: Create build->enables->feature relationships (idempotent)
+                for feature_thing in &feature_things {
+                    if let Err(e) = db
+                        .query(
+                            r#"
+                            DELETE enables WHERE in = $build_id AND out = $feature_id;
+                            RELATE $build_id->enables->$feature_id;
+                            "#,
+                        )
+                        .bind(("build_id", build_thing.clone()))
+                        .bind(("feature_id", feature_thing.clone()))
+                        .await
+                    {
+                        error!(
+                            error = %e,
+                            build_id = %build_thing,
+                            feature_id = %feature_thing,
+                            "Failed to create build->enables->feature relationship"
+                        );
+                        broker
+                            .broadcast(DatabaseError {
+                                operation: format!(
+                                    "create relationship build->enables->feature ({} -> {})",
+                                    build_thing, feature_thing
+                                ),
+                                error: e.to_string(),
+                            })
+                            .await;
+                        return;
+                    }
+
+                    debug!(
+                        build_id = %build_thing,
+                        feature_id = %feature_thing,
+                        "Created build->enables->feature relationship"
+                    );
+                }
+
+                // Step 7: Cleanup old build->contains relationships (content-addressed chunks remain)
+                if let Err(e) = db
+                    .query("DELETE contains WHERE in = $build_id;")
+                    .bind(("build_id", build_thing.clone()))
+                    .await
+                {
+                    warn!(
+                        error = %e,
+                        build_id = %build_thing,
+                        "Failed to cleanup old build->contains relationships (non-critical)"
+                    );
+                } else {
+                    debug!(
+                        build_id = %build_thing,
+                        "Cleaned up old build->contains relationships"
+                    );
+                }
+
+                // Step 8: Broadcast BuildCreated event
+                broker
+                    .broadcast(BuildCreated {
+                        build_id: build_id_str.clone(),
+                        crate_name: name.clone(),
+                        crate_version: version.clone(),
+                        features: msg.features.clone(),
+                        record_id: build_thing.to_string(),
+                    })
+                    .await;
+
+                debug!(
+                    build_id = %build_id_str,
+                    crate_name = %name,
+                    crate_version = %version,
+                    record_id = %build_thing,
+                    "Build creation complete, event broadcast"
+                );
             })
         });
 
