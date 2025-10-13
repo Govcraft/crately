@@ -146,7 +146,7 @@ pub fn init() -> Result<(WorkerGuard, PathBuf), LoggingError> {
     // Configure file filter: DEBUG and above, with framework noise filtered out
     // Can be overridden with RUST_LOG environment variable
     let file_filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| "crately=debug,tower_http=off,axum=off".into());
+        .unwrap_or_else(|_| "crately=info,tower_http=off,axum=off".into());
 
     // Create file layer: DEBUG+ to rotating files without colors
     let file_layer = tracing_subscriber::fmt::layer()

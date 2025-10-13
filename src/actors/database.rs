@@ -271,7 +271,7 @@ impl DatabaseActor {
                 )
             })?;
 
-        info!(
+        debug!(
             "Selected namespace '{}' and database '{}'",
             namespace, database
         );
@@ -768,7 +768,7 @@ impl DatabaseActor {
                     .await
                 {
                     Ok(_) => {
-                        debug!("Updated crate status to downloaded: {}@{}", name, version);
+                        trace!("Updated crate status to downloaded: {}@{}", name, version);
                     }
                     Err(e) => {
                         error!("Failed to update crate download status: {}", e);
@@ -820,7 +820,7 @@ impl DatabaseActor {
                     .await
                 {
                     Ok(_) => {
-                        debug!(
+                        trace!(
                             "Updated crate status to download_failed: {}@{} (error: {})",
                             name, version, error_message
                         );
@@ -868,7 +868,7 @@ impl DatabaseActor {
                     .await
                 {
                     Ok(_) => {
-                        debug!(
+                        trace!(
                             "Updated crate status to extracted: {}@{} ({} files, {} bytes)",
                             name, version, file_count, documentation_bytes
                         );
@@ -921,7 +921,7 @@ impl DatabaseActor {
                     .await
                 {
                     Ok(_) => {
-                        debug!(
+                        trace!(
                             "Updated crate status to extraction_failed: {}@{} (error: {}, elapsed: {}ms)",
                             name, version, error_message, elapsed_ms
                         );
@@ -969,8 +969,8 @@ impl DatabaseActor {
                     .await
                 {
                     Ok(_) => {
-                        debug!(
-                            "Updated crate status to chunked: {}@{} ({} chunks confirmed)",
+                        info!(
+                            "Crate chunking complete: {}@{} ({} chunks)",
                             name, version, chunk_count
                         );
                     }
@@ -1020,8 +1020,8 @@ impl DatabaseActor {
                     .await
                 {
                     Ok(_) => {
-                        debug!(
-                            "Updated crate status to complete: {}@{} ({} embeddings confirmed, model: {})",
+                        info!(
+                            "Crate processing complete: {}@{} ({} embeddings, model: {})",
                             name, version, vector_count, embedding_model
                         );
                     }
@@ -1073,8 +1073,8 @@ impl DatabaseActor {
                     .await
                 {
                     Ok(_) => {
-                        debug!(
-                            "Updated crate status to failed: {}@{} (stage: {}, error: {})",
+                        warn!(
+                            "Crate processing failed: {}@{} (stage: {}, error: {})",
                             name, version, stage, error
                         );
                     }
@@ -1162,6 +1162,13 @@ impl DatabaseActor {
                                                 debug!(
                                                     "Updated existing doc chunk {} for {}@{}",
                                                     msg.chunk_id, name, version
+                                                );
+                                                trace!(
+                                                    chunk_id = %msg.chunk_id,
+                                                    specifier = %format!("{}@{}", name, version),
+                                                    source_file = %msg.source_file,
+                                                    chunk_index = msg.chunk_index,
+                                                    "Doc chunk updated in database"
                                                 );
                                                 false
                                             }
