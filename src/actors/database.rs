@@ -19,13 +19,13 @@ use std::str::FromStr;
 
 use crate::crate_specifier::CrateSpecifier;
 use crate::messages::{
-    ChunksPersistenceComplete, CrateDownloadFailed, CrateDownloaded, CrateListResponse,
-    CrateProcessingFailed, CrateQueryResponse, CrateReceived, CrateSummary, DatabaseError,
-    DatabaseReady, DocChunkData, DocChunkPersisted, DocChunksQueryResponse,
-    DocumentationExtracted, DocumentationExtractionFailed, EmbeddingPersisted,
-    EmbeddingsPersistenceComplete, ListCrates, PersistCodeSample, PersistCrate,
-    PersistDocChunk, PersistEmbedding, PrintWarning, QueryCrate, QueryDocChunks,
-    QuerySimilarDocs, SimilarDocsResponse,
+    BuildCreated, ChunkDeduplicated, ChunkHashComputed, ChunksPersistenceComplete,
+    CrateDownloadFailed, CrateDownloaded, CrateListResponse, CrateProcessingFailed,
+    CrateQueryResponse, CrateReceived, CrateSummary, DatabaseError, DatabaseReady, DocChunkData,
+    DocChunkPersisted, DocChunksQueryResponse, DocumentationExtracted,
+    DocumentationExtractionFailed, EmbeddingPersisted, EmbeddingsPersistenceComplete, ListCrates,
+    PersistCodeSample, PersistCrate, PersistDocChunk, PersistEmbedding, PrintWarning, QueryCrate,
+    QueryDocChunks, QuerySimilarDocs, SimilarDocsResponse,
 };
 
 #[cfg(test)]
@@ -154,6 +154,85 @@ impl Default for DatabaseActor {
             db: Surreal::init(),
         }
     }
+}
+
+/// Validates preconditions before starting database migration.
+///
+/// This function checks that the database connection is healthy and ready
+/// for the migration process. It verifies basic connectivity and ensures
+/// the database can execute queries.
+///
+/// # Arguments
+///
+/// * `db` - Reference to the SurrealDB connection
+///
+/// # Returns
+///
+/// Returns `Ok(())` if all preconditions are met, or an error describing
+/// what failed during validation.
+///
+/// # Errors
+///
+/// Returns an error if:
+/// - Database connection is not responsive
+/// - Unable to execute test queries
+async fn validate_migration_preconditions(db: &Surreal<Db>) -> anyhow::Result<()> {
+    // Test basic connectivity with a simple query
+    db.query("SELECT 1 AS test")
+        .await
+        .context("Failed to execute test query - database connection not responsive")?;
+
+    debug!("Database connection validated");
+    Ok(())
+}
+
+/// Validates the structure of the newly created graph schema.
+///
+/// This function performs post-migration validation to ensure all tables,
+/// fields, and indexes were created correctly. It checks the existence of:
+/// - Core entity tables (crate, feature, build, doc_chunk, embedding)
+/// - Graph relationship tables (of, enables, contains, embedded_by)
+/// - Required indexes for query performance
+///
+/// # Arguments
+///
+/// * `db` - Reference to the SurrealDB connection
+///
+/// # Returns
+///
+/// Returns `Ok(())` if schema structure is valid, or an error describing
+/// what validation check failed.
+///
+/// # Errors
+///
+/// Returns an error if:
+/// - Required tables are missing
+/// - Table definitions are incorrect
+/// - Required indexes are missing
+async fn validate_schema_structure(db: &Surreal<Db>) -> anyhow::Result<()> {
+    // Verify core entity tables exist
+    let tables_to_check = vec![
+        "crate",
+        "feature",
+        "build",
+        "doc_chunk",
+        "embedding",
+        "of",
+        "enables",
+        "contains",
+        "embedded_by",
+        "processing_event",
+    ];
+
+    for table_name in tables_to_check {
+        let query = format!("INFO FOR TABLE {}", table_name);
+        db.query(&query)
+            .await
+            .with_context(|| format!("Table '{}' not found or invalid", table_name))?;
+    }
+
+    debug!("All required tables validated");
+    Ok(())
 }
 
 impl DatabaseActor {
@@ -1849,141 +1928,204 @@ impl DatabaseActor {
             })
         });
 
-        // Add before_start hook to initialize schema synchronously
-        // This blocks start() from completing until schema initialization finishes
+        // Add before_start hook to execute 4-phase migration to graph schema
+        // This blocks start() from completing until migration finishes
         builder.before_start(|agent| {
             let db = agent.model.db.clone();
             let broker = agent.broker().clone();
 
             AgentReply::from_async(async move {
-                debug!("Initializing database schema...");
+                debug!("Starting database schema migration to graph-based content deduplication...");
 
-                let schema_sql = r#"
-                    -- Core crate metadata and processing state
+                // Phase 1: Pre-flight validation
+                match validate_migration_preconditions(&db).await {
+                    Ok(()) => debug!("Pre-flight validation passed"),
+                    Err(e) => {
+                        error!("Pre-flight validation failed: {}", e);
+                        broker.broadcast(DatabaseError {
+                            operation: "migration validation".to_string(),
+                            error: e.to_string(),
+                        }).await;
+                        return;
+                    }
+                }
+
+                // Phase 2: Drop old schema
+                debug!("Dropping old schema...");
+                let drop_schema_sql = r#"
+                    -- Drop old indexes first (prevent constraint violations)
+                    REMOVE INDEX IF EXISTS idx_crate_id ON TABLE doc_chunk;
+                    REMOVE INDEX IF EXISTS idx_chunk_index ON TABLE doc_chunk;
+                    REMOVE INDEX IF EXISTS idx_vectorized ON TABLE doc_chunk;
+                    REMOVE INDEX IF EXISTS idx_crate_chunk ON TABLE doc_chunk;
+                    REMOVE INDEX IF EXISTS idx_chunk_id_unique ON TABLE doc_chunk;
+                    REMOVE INDEX IF EXISTS idx_chunk_id ON TABLE embedding;
+                    REMOVE INDEX IF EXISTS idx_crate_id_emb ON TABLE embedding;
+                    REMOVE INDEX IF EXISTS idx_model ON TABLE embedding;
+                    REMOVE INDEX IF EXISTS idx_content_hash ON TABLE embedding;
+                    REMOVE INDEX IF EXISTS idx_embedding_unique ON TABLE embedding;
+                    REMOVE INDEX IF EXISTS idx_crate_id_sample ON TABLE code_sample;
+                    REMOVE INDEX IF EXISTS idx_sample_index ON TABLE code_sample;
+                    REMOVE INDEX IF EXISTS idx_sample_type ON TABLE code_sample;
+                    REMOVE INDEX IF EXISTS idx_crate_sample ON TABLE code_sample;
+                    REMOVE INDEX IF EXISTS idx_crate_id_event ON TABLE processing_event;
+                    REMOVE INDEX IF EXISTS idx_timestamp ON TABLE processing_event;
+                    REMOVE INDEX IF EXISTS idx_event_type ON TABLE processing_event;
+                    REMOVE INDEX IF EXISTS idx_name_version ON TABLE crate;
+                    REMOVE INDEX IF EXISTS idx_status ON TABLE crate;
+                    REMOVE INDEX IF EXISTS idx_requested_at ON TABLE crate;
+
+                    -- Drop old tables (reverse dependency order)
+                    REMOVE TABLE IF EXISTS processing_event;
+                    REMOVE TABLE IF EXISTS code_sample;
+                    REMOVE TABLE IF EXISTS embedding;
+                    REMOVE TABLE IF EXISTS doc_chunk;
+                    REMOVE TABLE IF EXISTS crate;
+                "#;
+
+                match db.query(drop_schema_sql).await {
+                    Ok(_) => debug!("Old schema dropped successfully"),
+                    Err(e) => {
+                        error!("Failed to drop old schema: {}", e);
+                        broker.broadcast(DatabaseError {
+                            operation: "schema drop".to_string(),
+                            error: e.to_string(),
+                        }).await;
+                        return;
+                    }
+                }
+
+                // Phase 3: Create new graph-based schema
+                debug!("Creating new graph-based schema...");
+                let create_schema_sql = r#"
+                    -- ============================================================
+                    -- CORE ENTITY TABLES
+                    -- ============================================================
+
+                    -- Core crate entity
                     DEFINE TABLE crate SCHEMAFULL;
-
-                    -- Primary identification fields
                     DEFINE FIELD name ON TABLE crate TYPE string
                         ASSERT $value != NONE AND string::len($value) > 0;
                     DEFINE FIELD version ON TABLE crate TYPE string
                         ASSERT $value != NONE AND string::len($value) > 0;
-
-                    -- Request metadata
-                    DEFINE FIELD features ON TABLE crate TYPE array<string> DEFAULT [];
                     DEFINE FIELD requested_at ON TABLE crate TYPE datetime DEFAULT time::now();
-
-                    -- Processing state machine
-                    DEFINE FIELD status ON TABLE crate TYPE string DEFAULT 'pending'
-                        ASSERT $value IN ['pending', 'downloading', 'downloaded', 'download_failed',
-                                          'extracting', 'extracted', 'extraction_failed',
-                                          'compiling_docs', 'docs_compiled',
-                                          'chunking', 'chunked', 'vectorizing', 'vectorized',
-                                          'complete', 'failed'];
-
-                    -- State tracking timestamps
-                    DEFINE FIELD status_updated_at ON TABLE crate TYPE datetime DEFAULT time::now();
-                    DEFINE FIELD download_started_at ON TABLE crate TYPE option<datetime>;
-                    DEFINE FIELD download_completed_at ON TABLE crate TYPE option<datetime>;
-                    DEFINE FIELD extraction_completed_at ON TABLE crate TYPE option<datetime>;
-                    DEFINE FIELD docs_completed_at ON TABLE crate TYPE option<datetime>;
-                    DEFINE FIELD chunking_completed_at ON TABLE crate TYPE option<datetime>;
-                    DEFINE FIELD vectorization_completed_at ON TABLE crate TYPE option<datetime>;
                     DEFINE FIELD completed_at ON TABLE crate TYPE option<datetime>;
-
-                    -- Error tracking
+                    DEFINE FIELD status ON TABLE crate TYPE string DEFAULT 'pending'
+                        ASSERT $value IN ['pending', 'processing', 'complete', 'failed'];
+                    DEFINE FIELD status_updated_at ON TABLE crate TYPE datetime DEFAULT time::now();
                     DEFINE FIELD error_message ON TABLE crate TYPE option<string>;
-                    DEFINE FIELD error_stage ON TABLE crate TYPE option<string>;
-                    DEFINE FIELD error_timestamp ON TABLE crate TYPE option<datetime>;
                     DEFINE FIELD retry_count ON TABLE crate TYPE int DEFAULT 0;
-
-                    -- File system paths
                     DEFINE FIELD download_path ON TABLE crate TYPE option<string>;
-                    DEFINE FIELD extraction_path ON TABLE crate TYPE option<string>;
                     DEFINE FIELD docs_path ON TABLE crate TYPE option<string>;
-
-                    -- Metadata
                     DEFINE FIELD cargo_metadata ON TABLE crate TYPE option<object>;
-                    DEFINE FIELD dependencies ON TABLE crate TYPE array<object> DEFAULT [];
                     DEFINE FIELD size_bytes ON TABLE crate TYPE option<int>;
-
-                    -- Indexes
                     DEFINE INDEX idx_name_version ON TABLE crate COLUMNS name, version UNIQUE;
                     DEFINE INDEX idx_status ON TABLE crate COLUMNS status;
                     DEFINE INDEX idx_requested_at ON TABLE crate COLUMNS requested_at;
 
-                    -- Documentation chunks table
+                    -- Feature entity
+                    DEFINE TABLE feature SCHEMAFULL;
+                    DEFINE FIELD name ON TABLE feature TYPE string
+                        ASSERT $value != NONE AND string::len($value) > 0;
+                    DEFINE FIELD description ON TABLE feature TYPE option<string>;
+                    DEFINE FIELD created_at ON TABLE feature TYPE datetime DEFAULT time::now();
+                    DEFINE INDEX idx_feature_name ON TABLE feature COLUMNS name;
+
+                    -- Build entity
+                    DEFINE TABLE build SCHEMAFULL;
+                    DEFINE FIELD build_hash ON TABLE build TYPE string
+                        ASSERT $value != NONE AND string::len($value) == 64;
+                    DEFINE FIELD started_at ON TABLE build TYPE datetime DEFAULT time::now();
+                    DEFINE FIELD completed_at ON TABLE build TYPE option<datetime>;
+                    DEFINE FIELD status ON TABLE build TYPE string DEFAULT 'pending'
+                        ASSERT $value IN ['pending', 'compiling', 'complete', 'failed'];
+                    DEFINE FIELD doc_output_path ON TABLE build TYPE option<string>;
+                    DEFINE FIELD rustc_version ON TABLE build TYPE option<string>;
+                    DEFINE FIELD build_target ON TABLE build TYPE string DEFAULT 'x86_64-unknown-linux-gnu';
+                    DEFINE FIELD error_message ON TABLE build TYPE option<string>;
+                    DEFINE INDEX idx_build_hash ON TABLE build COLUMNS build_hash UNIQUE;
+                    DEFINE INDEX idx_build_status ON TABLE build COLUMNS status;
+
+                    -- Content-addressed doc chunk
                     DEFINE TABLE doc_chunk SCHEMAFULL;
-                    DEFINE FIELD crate_id ON TABLE doc_chunk TYPE record<crate>
-                        ASSERT $value != NONE;
-                    DEFINE FIELD chunk_index ON TABLE doc_chunk TYPE int
-                        ASSERT $value >= 0;
-                    DEFINE FIELD chunk_id ON TABLE doc_chunk TYPE string
-                        ASSERT $value != NONE;
+                    DEFINE FIELD content_hash ON TABLE doc_chunk TYPE string
+                        ASSERT $value != NONE AND string::len($value) == 64;
                     DEFINE FIELD content ON TABLE doc_chunk TYPE string
                         ASSERT $value != NONE AND string::len($value) > 0;
                     DEFINE FIELD content_type ON TABLE doc_chunk TYPE string DEFAULT 'markdown'
-                        ASSERT $value IN ['markdown', 'rust', 'toml', 'text'];
-                    DEFINE FIELD source_file ON TABLE doc_chunk TYPE string;
-                    DEFINE FIELD start_line ON TABLE doc_chunk TYPE option<int>;
-                    DEFINE FIELD end_line ON TABLE doc_chunk TYPE option<int>;
-                    DEFINE FIELD token_count ON TABLE doc_chunk TYPE int DEFAULT 0;
-                    DEFINE FIELD char_count ON TABLE doc_chunk TYPE int DEFAULT 0;
+                        ASSERT $value IN ['markdown', 'rust', 'toml', 'json', 'text', 'html'];
+                    DEFINE FIELD token_count ON TABLE doc_chunk TYPE int DEFAULT 0
+                        ASSERT $value >= 0;
+                    DEFINE FIELD char_count ON TABLE doc_chunk TYPE int DEFAULT 0
+                        ASSERT $value >= 0;
                     DEFINE FIELD created_at ON TABLE doc_chunk TYPE datetime DEFAULT time::now();
-                    DEFINE FIELD vectorized ON TABLE doc_chunk TYPE bool DEFAULT false;
-                    DEFINE FIELD vectorized_at ON TABLE doc_chunk TYPE option<datetime>;
-                    DEFINE FIELD parent_module ON TABLE doc_chunk TYPE option<string>;
-                    DEFINE FIELD item_type ON TABLE doc_chunk TYPE option<string>;
-                    DEFINE FIELD item_name ON TABLE doc_chunk TYPE option<string>;
-                    DEFINE INDEX idx_crate_id ON TABLE doc_chunk COLUMNS crate_id;
-                    DEFINE INDEX idx_chunk_index ON TABLE doc_chunk COLUMNS chunk_index;
-                    DEFINE INDEX idx_vectorized ON TABLE doc_chunk COLUMNS vectorized;
-                    DEFINE INDEX idx_crate_chunk ON TABLE doc_chunk COLUMNS crate_id, chunk_index UNIQUE;
-                    DEFINE INDEX idx_chunk_id_unique ON TABLE doc_chunk COLUMNS chunk_id UNIQUE;
+                    DEFINE FIELD reference_count ON TABLE doc_chunk TYPE int DEFAULT 1
+                        ASSERT $value >= 1;
+                    DEFINE FIELD last_referenced_at ON TABLE doc_chunk TYPE datetime DEFAULT time::now();
+                    DEFINE INDEX idx_content_hash ON TABLE doc_chunk COLUMNS content_hash UNIQUE;
+                    DEFINE INDEX idx_content_type ON TABLE doc_chunk COLUMNS content_type;
+                    DEFINE INDEX idx_created_at ON TABLE doc_chunk COLUMNS created_at;
 
-                    -- Vector embeddings table
+                    -- Vector embeddings
                     DEFINE TABLE embedding SCHEMAFULL;
-                    DEFINE FIELD chunk_id ON TABLE embedding TYPE record<doc_chunk>
-                        ASSERT $value != NONE;
-                    DEFINE FIELD crate_id ON TABLE embedding TYPE record<crate>
-                        ASSERT $value != NONE;
                     DEFINE FIELD vector ON TABLE embedding TYPE array<float>
                         ASSERT $value != NONE AND array::len($value) > 0;
                     DEFINE FIELD vector_dimension ON TABLE embedding TYPE int
                         ASSERT $value > 0;
-                    DEFINE FIELD model_name ON TABLE embedding TYPE string DEFAULT 'text-embedding-3-small';
+                    DEFINE FIELD model_name ON TABLE embedding TYPE string DEFAULT 'text-embedding-3-small'
+                        ASSERT $value != NONE;
                     DEFINE FIELD model_version ON TABLE embedding TYPE string;
                     DEFINE FIELD created_at ON TABLE embedding TYPE datetime DEFAULT time::now();
-                    DEFINE FIELD content_hash ON TABLE embedding TYPE string;
-                    DEFINE INDEX idx_chunk_id ON TABLE embedding COLUMNS chunk_id UNIQUE;
-                    DEFINE INDEX idx_crate_id_emb ON TABLE embedding COLUMNS crate_id;
                     DEFINE INDEX idx_model ON TABLE embedding COLUMNS model_name, model_version;
-                    DEFINE INDEX idx_content_hash ON TABLE embedding COLUMNS content_hash;
-                    DEFINE INDEX idx_embedding_unique ON TABLE embedding COLUMNS chunk_id, model_name, model_version UNIQUE;
+                    DEFINE INDEX idx_created_at_emb ON TABLE embedding COLUMNS created_at;
 
-                    -- Code samples table
-                    DEFINE TABLE code_sample SCHEMAFULL;
-                    DEFINE FIELD crate_id ON TABLE code_sample TYPE record<crate>
+                    -- ============================================================
+                    -- GRAPH RELATIONSHIP TABLES
+                    -- ============================================================
+
+                    -- Feature belongs to crate
+                    DEFINE TABLE of SCHEMAFULL TYPE RELATION FROM feature TO crate;
+                    DEFINE FIELD created_at ON TABLE of TYPE datetime DEFAULT time::now();
+                    DEFINE INDEX idx_of_unique ON TABLE of COLUMNS in, out UNIQUE;
+                    DEFINE INDEX idx_of_from ON TABLE of COLUMNS in;
+                    DEFINE INDEX idx_of_to ON TABLE of COLUMNS out;
+
+                    -- Build uses features
+                    DEFINE TABLE enables SCHEMAFULL TYPE RELATION FROM build TO feature;
+                    DEFINE FIELD enabled_at ON TABLE enables TYPE datetime DEFAULT time::now();
+                    DEFINE INDEX idx_enables_from ON TABLE enables COLUMNS in;
+                    DEFINE INDEX idx_enables_to ON TABLE enables COLUMNS out;
+
+                    -- Build produces doc chunks with context
+                    DEFINE TABLE contains SCHEMAFULL TYPE RELATION FROM build TO doc_chunk;
+                    DEFINE FIELD source_file ON TABLE contains TYPE string
                         ASSERT $value != NONE;
-                    DEFINE FIELD sample_index ON TABLE code_sample TYPE int
+                    DEFINE FIELD chunk_index ON TABLE contains TYPE int
                         ASSERT $value >= 0;
-                    DEFINE FIELD code ON TABLE code_sample TYPE string
-                        ASSERT $value != NONE AND string::len($value) > 0;
-                    DEFINE FIELD language ON TABLE code_sample TYPE string DEFAULT 'rust';
-                    DEFINE FIELD source_file ON TABLE code_sample TYPE string;
-                    DEFINE FIELD doc_context ON TABLE code_sample TYPE option<string>;
-                    DEFINE FIELD parent_item ON TABLE code_sample TYPE option<string>;
-                    DEFINE FIELD sample_type ON TABLE code_sample TYPE string
-                        ASSERT $value IN ['example', 'test', 'usage', 'snippet'];
-                    DEFINE FIELD tags ON TABLE code_sample TYPE array<string> DEFAULT [];
-                    DEFINE FIELD line_count ON TABLE code_sample TYPE int DEFAULT 0;
-                    DEFINE FIELD complexity_score ON TABLE code_sample TYPE option<float>;
-                    DEFINE FIELD created_at ON TABLE code_sample TYPE datetime DEFAULT time::now();
-                    DEFINE INDEX idx_crate_id_sample ON TABLE code_sample COLUMNS crate_id;
-                    DEFINE INDEX idx_sample_index ON TABLE code_sample COLUMNS sample_index;
-                    DEFINE INDEX idx_sample_type ON TABLE code_sample COLUMNS sample_type;
-                    DEFINE INDEX idx_crate_sample ON TABLE code_sample COLUMNS crate_id, sample_index UNIQUE;
+                    DEFINE FIELD start_line ON TABLE contains TYPE option<int>;
+                    DEFINE FIELD end_line ON TABLE contains TYPE option<int>;
+                    DEFINE FIELD parent_module ON TABLE contains TYPE option<string>;
+                    DEFINE FIELD item_type ON TABLE contains TYPE option<string>;
+                    DEFINE FIELD item_name ON TABLE contains TYPE option<string>;
+                    DEFINE FIELD created_at ON TABLE contains TYPE datetime DEFAULT time::now();
+                    DEFINE INDEX idx_contains_from ON TABLE contains COLUMNS in;
+                    DEFINE INDEX idx_contains_to ON TABLE contains COLUMNS out;
+                    DEFINE INDEX idx_contains_source ON TABLE contains COLUMNS in, source_file;
+                    DEFINE INDEX idx_contains_module ON TABLE contains COLUMNS parent_module;
+                    DEFINE INDEX idx_contains_unique ON TABLE contains COLUMNS in, out, source_file, chunk_index UNIQUE;
 
-                    -- Processing events audit log
+                    -- Doc chunk has embeddings
+                    DEFINE TABLE embedded_by SCHEMAFULL TYPE RELATION FROM doc_chunk TO embedding;
+                    DEFINE FIELD generated_at ON TABLE embedded_by TYPE datetime DEFAULT time::now();
+                    DEFINE FIELD generation_duration_ms ON TABLE embedded_by TYPE option<int>;
+                    DEFINE INDEX idx_embedded_unique ON TABLE embedded_by COLUMNS in, out UNIQUE;
+                    DEFINE INDEX idx_embedded_from ON TABLE embedded_by COLUMNS in;
+                    DEFINE INDEX idx_embedded_to ON TABLE embedded_by COLUMNS out;
+
+                    -- ============================================================
+                    -- AUDIT LOG TABLE (unchanged)
+                    -- ============================================================
+
                     DEFINE TABLE processing_event SCHEMAFULL;
                     DEFINE FIELD crate_id ON TABLE processing_event TYPE record<crate>
                         ASSERT $value != NONE;
@@ -2001,21 +2143,30 @@ impl DatabaseActor {
                     DEFINE INDEX idx_event_type ON TABLE processing_event COLUMNS event_type;
                 "#;
 
-                match db.query(schema_sql).await {
-                    Ok(_) => {
-                        debug!("Database schema initialized successfully");
+                match db.query(create_schema_sql).await {
+                    Ok(_) => debug!("New graph schema created successfully"),
+                    Err(e) => {
+                        error!("Failed to create new schema: {}", e);
+                        broker.broadcast(DatabaseError {
+                            operation: "schema creation".to_string(),
+                            error: e.to_string(),
+                        }).await;
+                        return;
+                    }
+                }
 
-                        // Broadcast DatabaseReady event
+                // Phase 4: Post-migration validation
+                match validate_schema_structure(&db).await {
+                    Ok(()) => {
+                        debug!("Schema validation passed - migration complete");
                         broker.broadcast(DatabaseReady).await;
                     }
                     Err(e) => {
-                        error!("Failed to initialize database schema: {}", e);
-                        broker
-                            .broadcast(DatabaseError {
-                                operation: "schema initialization".to_string(),
-                                error: e.to_string(),
-                            })
-                            .await;
+                        error!("Schema validation failed: {}", e);
+                        broker.broadcast(DatabaseError {
+                            operation: "schema validation".to_string(),
+                            error: e.to_string(),
+                        }).await;
                     }
                 }
             })
@@ -2035,6 +2186,11 @@ impl DatabaseActor {
 
         // Subscribe to query messages
         handle.subscribe::<QueryDocChunks>().await;
+
+        // Subscribe to phase 1 deduplication messages
+        handle.subscribe::<BuildCreated>().await;
+        handle.subscribe::<ChunkHashComputed>().await;
+        handle.subscribe::<ChunkDeduplicated>().await;
 
         let db_info = DatabaseInfo {
             db_path,
