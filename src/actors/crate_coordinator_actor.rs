@@ -388,6 +388,7 @@ impl CrateCoordinatorActor {
                 debug!(
                     specifier = %specifier,
                     chunk_id = %msg.chunk_id,
+                    source_file = %msg.source_file,
                     persisted = persisted_count,
                     expected = expected_count,
                     "Chunk persisted"
@@ -892,6 +893,7 @@ mod tests {
                     chunk_id: format!("test-crate_1_0_0_{:03}", i),
                     specifier: specifier.clone(),
                     chunk_index: i,
+                    source_file: "src/lib.rs".to_string(),
                 })
                 .await;
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
@@ -1005,6 +1007,7 @@ mod tests {
                     chunk_id: "test-crate_1_0_0_000".to_string(),
                     specifier: specifier.clone(),
                     chunk_index: 0,
+                    source_file: "src/lib.rs".to_string(),
                 })
                 .await;
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
@@ -1016,6 +1019,7 @@ mod tests {
                 chunk_id: "test-crate_1_0_0_001".to_string(),
                 specifier: specifier.clone(),
                 chunk_index: 1,
+                source_file: "src/module.rs".to_string(),
             })
             .await;
 

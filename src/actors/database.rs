@@ -1239,6 +1239,7 @@ impl DatabaseActor {
                                         chunk_id: msg.chunk_id.clone(),
                                         specifier: msg.specifier.clone(),
                                         chunk_index: msg.chunk_index,
+                                        source_file: msg.source_file.clone(),
                                     })
                                     .await;
                             }

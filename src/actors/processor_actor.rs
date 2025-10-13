@@ -379,6 +379,13 @@ fn process_content(
 
         *total_tokens += token_count as u32;
 
+        tracing::trace!(
+            source_file = %source_file,
+            content_type = %content_type.as_str(),
+            token_count = token_count,
+            "Processing chunk"
+        );
+
         result.push((
             chunk_str,
             source_file.to_string(),
