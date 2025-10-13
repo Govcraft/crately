@@ -116,6 +116,28 @@ impl DocChunkIdRecord {
     }
 }
 
+/// Response structure for queries that return only a record ID.
+///
+/// Used when we need to retrieve just the `id` field from a record
+/// after creation or update operations. This is a generic helper for any
+/// table that needs ID-only queries.
+///
+/// # Example
+///
+/// ```rust,ignore
+/// let query = "CREATE embedding CONTENT {...} RETURN id";
+/// let mut response = db.query(query).bind(params).await?;
+/// let record: Option<RecordIdOnly> = response.take(0)?;
+/// if let Some(rec) = record {
+///     let id = rec.id; // Use the Thing directly in subsequent queries
+/// }
+/// ```
+#[derive(Debug, Clone, serde::Deserialize)]
+struct RecordIdOnly {
+    /// The SurrealDB record ID (Thing type: table name + record identifier)
+    id: surrealdb::sql::Thing,
+}
+
 /// DatabaseActor manages the embedded SurrealDB lifecycle and persistence operations.
 ///
 /// This actor handles:
@@ -2008,7 +2030,53 @@ impl DatabaseActor {
             })
         });
 
-        // Handle PersistEmbedding - insert vector embedding
+        /// Compute content hash for chunk lookup by chunk_id.
+        ///
+        /// In Phase 4, chunks are content-addressed using BLAKE3 hash of their content.
+        /// The embedding system receives a `chunk_id` string (e.g., "serde_1.0.0_chunk_000")
+        /// but needs the `content_hash` to query chunks in the graph database.
+        ///
+        /// # Current Implementation
+        ///
+        /// This is a temporary solution that queries the database for the chunk's
+        /// content_hash given its chunk_id. In a fully optimized system, the embedding
+        /// pipeline would pass content_hash directly instead of chunk_id.
+        ///
+        /// # Arguments
+        ///
+        /// * `db` - Database handle for querying
+        /// * `chunk_id` - The chunk identifier string
+        ///
+        /// # Returns
+        ///
+        /// `Ok(String)` with the content hash if found, `Err` if chunk not found
+        /// or database query fails.
+        ///
+        /// # Note
+        ///
+        /// This function is a bridge between the chunk_id-based embedding messages
+        /// and the content_hash-based chunk storage. Future phases should eliminate
+        /// this by passing content_hash in embedding messages.
+        async fn get_chunk_content_hash(
+            db: &Surreal<Db>,
+            chunk_id: &str,
+        ) -> anyhow::Result<String> {
+            let query = "SELECT content_hash FROM doc_chunk WHERE chunk_id = $chunk_id LIMIT 1";
+            let chunk_id_owned = chunk_id.to_string();
+            let mut response = db.query(query).bind(("chunk_id", chunk_id_owned)).await?;
+
+            #[derive(serde::Deserialize)]
+            struct ContentHashResult {
+                content_hash: String,
+            }
+
+            match response.take::<Option<ContentHashResult>>(0)? {
+                Some(result) => Ok(result.content_hash),
+                None => anyhow::bail!("Chunk with chunk_id '{}' not found", chunk_id),
+            }
+        }
+
+        // Handle PersistEmbedding - Graph-based implementation with content-addressed lookups
         builder.mutate_on::<PersistEmbedding>(|agent, envelope| {
             let msg = envelope.message().clone();
             let db = agent.model.db.clone();
@@ -2020,33 +2088,62 @@ impl DatabaseActor {
                 let version = msg.specifier.version().to_string();
                 let chunk_id = msg.chunk_id.clone();
 
-                // Step 1: Verify doc_chunk exists first (fail fast if missing)
-                let chunk_query = "SELECT id FROM doc_chunk WHERE chunk_id = $chunk_id";
+                // Step 1: Get content hash for chunk lookup
+                let content_hash = match get_chunk_content_hash(&db, &chunk_id).await {
+                    Ok(hash) => hash,
+                    Err(e) => {
+                        let warning_msg = format!(
+                            "Cannot persist embedding: doc_chunk with chunk_id '{}' not found \
+                             for crate {}@{}. The chunk must be persisted before embeddings can be stored. \
+                             Error: {}",
+                            chunk_id, name, version, e
+                        );
+
+                        error!("{}", warning_msg);
+
+                        broker.broadcast(PrintWarning(warning_msg.clone())).await;
+
+                        broker
+                            .broadcast(DatabaseError {
+                                operation: format!(
+                                    "persist embedding for chunk {} (crate: {}@{})",
+                                    chunk_id, name, version
+                                ),
+                                error: format!(
+                                    "Documentation chunk with chunk_id '{}' not found in database. \
+                                     Ensure chunks are persisted before embedding vectorization.",
+                                    chunk_id
+                                ),
+                            })
+                            .await;
+
+                        return;
+                    }
+                };
+
+                // Step 2: Verify doc_chunk exists by content_hash
+                let chunk_query = "SELECT id FROM doc_chunk WHERE content_hash = $content_hash LIMIT 1";
 
                 let chunk_db_id = match db
                     .query(chunk_query)
-                    .bind(("chunk_id", chunk_id.clone()))
+                    .bind(("content_hash", content_hash.clone()))
                     .await
                 {
                     Ok(mut chunk_response) => {
                         match chunk_response.take::<Option<DocChunkIdRecord>>(0) {
                             Ok(Some(record)) => record.thing().clone(),
                             Ok(None) => {
-                                // Chunk not found - this is the key scenario we're improving
                                 let warning_msg = format!(
-                                    "Cannot persist embedding: doc_chunk '{}' not found for crate {}@{}. \
-                                     The chunk must be persisted before embeddings can be stored.",
-                                    chunk_id, name, version
+                                    "Cannot persist embedding: doc_chunk with content_hash '{}' not found \
+                                     for crate {}@{} (chunk_id: {}). The chunk must be persisted before \
+                                     embeddings can be stored.",
+                                    content_hash, name, version, chunk_id
                                 );
 
                                 error!("{}", warning_msg);
 
-                                // Send warning to Console actor for user visibility
-                                broker
-                                    .broadcast(PrintWarning(warning_msg.clone()))
-                                    .await;
+                                broker.broadcast(PrintWarning(warning_msg.clone())).await;
 
-                                // Also broadcast DatabaseError for error handling subscribers
                                 broker
                                     .broadcast(DatabaseError {
                                         operation: format!(
@@ -2054,9 +2151,9 @@ impl DatabaseActor {
                                             chunk_id, name, version
                                         ),
                                         error: format!(
-                                            "Documentation chunk '{}' not found in database. \
+                                            "Documentation chunk with content_hash '{}' not found in database. \
                                              Ensure chunks are persisted before embedding vectorization.",
-                                            chunk_id
+                                            content_hash
                                         ),
                                     })
                                     .await;
@@ -2065,8 +2162,9 @@ impl DatabaseActor {
                             }
                             Err(e) => {
                                 error!(
-                                    "Failed to parse chunk lookup result for chunk_id: {} (crate: {}@{}): {}",
-                                    chunk_id, name, version, e
+                                    "Failed to parse chunk lookup result for content_hash: {} \
+                                     (crate: {}@{}, chunk_id: {}): {}",
+                                    content_hash, name, version, chunk_id, e
                                 );
                                 broker
                                     .broadcast(DatabaseError {
@@ -2075,8 +2173,8 @@ impl DatabaseActor {
                                             chunk_id, name, version
                                         ),
                                         error: format!(
-                                            "Database query failed while checking chunk '{}': {}",
-                                            chunk_id, e
+                                            "Database query failed while checking chunk with hash '{}': {}",
+                                            content_hash, e
                                         ),
                                     })
                                     .await;
@@ -2086,8 +2184,9 @@ impl DatabaseActor {
                     }
                     Err(e) => {
                         error!(
-                            "Failed to lookup chunk for embedding (chunk_id: {}, crate: {}@{}): {}",
-                            chunk_id, name, version, e
+                            "Failed to lookup chunk by content_hash for embedding \
+                             (content_hash: {}, crate: {}@{}, chunk_id: {}): {}",
+                            content_hash, name, version, chunk_id, e
                         );
                         broker
                             .broadcast(DatabaseError {
@@ -2096,8 +2195,8 @@ impl DatabaseActor {
                                     chunk_id, name, version
                                 ),
                                 error: format!(
-                                    "Database connection error while looking up chunk '{}': {}",
-                                    chunk_id, e
+                                    "Database connection error while looking up chunk with hash '{}': {}",
+                                    content_hash, e
                                 ),
                             })
                             .await;
@@ -2105,8 +2204,8 @@ impl DatabaseActor {
                     }
                 };
 
-                // Step 2: Verify crate exists
-                let crate_query = "SELECT id FROM crate WHERE name = $name AND version = $version";
+                // Step 3: Verify crate exists
+                let crate_query = "SELECT id FROM crate WHERE name = $name AND version = $version LIMIT 1";
 
                 let crate_db_id = match db
                     .query(crate_query)
@@ -2119,15 +2218,14 @@ impl DatabaseActor {
                             Ok(Some(record)) => record.thing().clone(),
                             Ok(None) => {
                                 let warning_msg = format!(
-                                    "Cannot persist embedding: crate {}@{} not found in database (chunk: {})",
+                                    "Cannot persist embedding: crate {}@{} not found in database \
+                                     (chunk_id: {})",
                                     name, version, chunk_id
                                 );
 
                                 error!("{}", warning_msg);
 
-                                broker
-                                    .broadcast(PrintWarning(warning_msg.clone()))
-                                    .await;
+                                broker.broadcast(PrintWarning(warning_msg.clone())).await;
 
                                 broker
                                     .broadcast(DatabaseError {
@@ -2168,7 +2266,8 @@ impl DatabaseActor {
                     }
                     Err(e) => {
                         error!(
-                            "Failed to lookup crate for embedding persistence ({}@{}, chunk: {}): {}",
+                            "Failed to lookup crate for embedding persistence \
+                             ({}@{}, chunk: {}): {}",
                             name, version, chunk_id, e
                         );
                         broker
@@ -2187,15 +2286,18 @@ impl DatabaseActor {
                     }
                 };
 
-                // Step 3: Both prerequisites satisfied - upsert the embedding (idempotent)
+                // Step 4: Upsert the embedding (UPDATE RETURN BEFORE + INSERT pattern)
                 let vector_dim = msg.vector.len();
 
-                // Upsert pattern: Try UPDATE first, then INSERT if no rows affected
+                // Compute embedding content_hash for idempotency
+                let embedding_content_hash = format!("{}{}", content_hash, msg.model_name);
+
+                // Try UPDATE first
                 let update_query = r#"
                     UPDATE embedding SET
                         vector = $vector,
                         vector_dimension = $vector_dimension,
-                        content_hash = crypto::md5(string::concat($chunk_id_str, $model_name)),
+                        content_hash = $embedding_content_hash,
                         created_at = time::now()
                     WHERE chunk_id = $chunk_id AND model_name = $model_name AND model_version = $model_version
                     RETURN BEFORE
@@ -2204,9 +2306,9 @@ impl DatabaseActor {
                 let update_result = db
                     .query(update_query)
                     .bind(("chunk_id", chunk_db_id.clone()))
-                    .bind(("chunk_id_str", chunk_id.clone()))
                     .bind(("vector", msg.vector.clone()))
                     .bind(("vector_dimension", vector_dim as i64))
+                    .bind(("embedding_content_hash", embedding_content_hash.clone()))
                     .bind(("model_name", msg.model_name.clone()))
                     .bind(("model_version", msg.model_version.clone()))
                     .await;
@@ -2214,13 +2316,13 @@ impl DatabaseActor {
                 // Check if update affected any rows
                 let needs_insert = match update_result {
                     Ok(mut response) => {
-                        // Check if any rows were returned (indicating update succeeded)
                         let rows: Result<Vec<serde_json::Value>, _> = response.take(0);
                         match rows {
                             Ok(rows) if !rows.is_empty() => {
                                 debug!(
-                                    "Updated existing embedding for chunk {} (crate: {}@{}, dim: {}, model: {})",
-                                    chunk_id, name, version, vector_dim, msg.model_name
+                                    "Updated existing embedding for chunk with content_hash {} \
+                                     (crate: {}@{}, chunk_id: {}, dim: {}, model: {})",
+                                    content_hash, name, version, chunk_id, vector_dim, msg.model_name
                                 );
                                 false
                             }
@@ -2230,7 +2332,7 @@ impl DatabaseActor {
                     Err(_) => true, // Update failed, try insert
                 };
 
-                if needs_insert {
+                let embedding_db_id = if needs_insert {
                     // No existing embedding, insert new one
                     let insert_query = r#"
                         CREATE embedding CONTENT {
@@ -2240,26 +2342,62 @@ impl DatabaseActor {
                             vector_dimension: $vector_dimension,
                             model_name: $model_name,
                             model_version: $model_version,
-                            content_hash: crypto::md5(string::concat($chunk_id_str, $model_name))
+                            content_hash: $embedding_content_hash
                         }
+                        RETURN id
                     "#;
 
                     match db
                         .query(insert_query)
-                        .bind(("chunk_id", chunk_db_id))
+                        .bind(("chunk_id", chunk_db_id.clone()))
                         .bind(("crate_id", crate_db_id))
-                        .bind(("chunk_id_str", chunk_id.clone()))
                         .bind(("vector", msg.vector.clone()))
                         .bind(("vector_dimension", vector_dim as i64))
                         .bind(("model_name", msg.model_name.clone()))
                         .bind(("model_version", msg.model_version.clone()))
+                        .bind(("embedding_content_hash", embedding_content_hash))
                         .await
                     {
-                        Ok(_) => {
-                            debug!(
-                                "Inserted new embedding for chunk {} (crate: {}@{}, dim: {}, model: {})",
-                                chunk_id, name, version, vector_dim, msg.model_name
-                            );
+                        Ok(mut response) => {
+                            match response.take::<Option<RecordIdOnly>>(0) {
+                                Ok(Some(record)) => {
+                                    let embedding_id = record.id.clone();
+                                    debug!(
+                                        "Inserted new embedding for chunk with content_hash {} \
+                                         (crate: {}@{}, chunk_id: {}, dim: {}, model: {})",
+                                        content_hash, name, version, chunk_id, vector_dim, msg.model_name
+                                    );
+                                    Some(embedding_id)
+                                }
+                                Ok(None) => {
+                                    error!(
+                                        "Embedding insert succeeded but no ID returned \
+                                         (chunk_id: {}, crate: {}@{})",
+                                        chunk_id, name, version
+                                    );
+                                    None
+                                }
+                                Err(e) => {
+                                    error!(
+                                        "Failed to parse embedding insert result for chunk {} \
+                                         (crate: {}@{}): {}",
+                                        chunk_id, name, version, e
+                                    );
+                                    broker
+                                        .broadcast(DatabaseError {
+                                            operation: format!(
+                                                "persist embedding for chunk {} (crate: {}@{})",
+                                                chunk_id, name, version
+                                            ),
+                                            error: format!(
+                                                "Failed to parse embedding record ID for chunk '{}': {}",
+                                                chunk_id, e
+                                            ),
+                                        })
+                                        .await;
+                                    return;
+                                }
+                            }
                         }
                         Err(e) => {
                             error!(
@@ -2281,12 +2419,83 @@ impl DatabaseActor {
                             return;
                         }
                     }
+                } else {
+                    // Update succeeded, query for the embedding ID to create relationship
+                    let id_query = r#"
+                        SELECT id FROM embedding
+                        WHERE chunk_id = $chunk_id AND model_name = $model_name AND model_version = $model_version
+                        LIMIT 1
+                    "#;
+
+                    match db
+                        .query(id_query)
+                        .bind(("chunk_id", chunk_db_id.clone()))
+                        .bind(("model_name", msg.model_name.clone()))
+                        .bind(("model_version", msg.model_version.clone()))
+                        .await
+                    {
+                        Ok(mut response) => match response.take::<Option<RecordIdOnly>>(0) {
+                            Ok(Some(record)) => Some(record.id.clone()),
+                            Ok(None) => {
+                                error!(
+                                    "Embedding exists but ID query returned no results \
+                                     (chunk_id: {}, crate: {}@{})",
+                                    chunk_id, name, version
+                                );
+                                None
+                            }
+                            Err(e) => {
+                                error!(
+                                    "Failed to parse embedding ID query for chunk {} \
+                                     (crate: {}@{}): {}",
+                                    chunk_id, name, version, e
+                                );
+                                None
+                            }
+                        },
+                        Err(e) => {
+                            error!(
+                                "Failed to query embedding ID for chunk {} (crate: {}@{}): {}",
+                                chunk_id, name, version, e
+                            );
+                            None
+                        }
+                    }
+                };
+
+                // Step 5: Create graph relationship (doc_chunk->embedded_by->embedding)
+                if let Some(embedding_id) = embedding_db_id {
+                    let relate_query = r#"
+                        RELATE $chunk_id->embedded_by->$embedding_id
+                        SET created_at = time::now()
+                    "#;
+
+                    if let Err(e) = db
+                        .query(relate_query)
+                        .bind(("chunk_id", chunk_db_id.clone()))
+                        .bind(("embedding_id", embedding_id))
+                        .await
+                    {
+                        // Log error but don't fail - embedding is persisted, relationship is enhancement
+                        error!(
+                            "Failed to create embedded_by relationship for chunk {} (crate: {}@{}): {}. \
+                             Embedding persisted successfully, but graph edge missing.",
+                            chunk_id, name, version, e
+                        );
+                    } else {
+                        debug!(
+                            "Created embedded_by relationship: doc_chunk {} -> embedding (crate: {}@{})",
+                            content_hash, name, version
+                        );
+                    }
                 }
 
-                // Update chunk's vectorized flag and timestamp
+                // Step 6: Update chunk's vectorized flag
                 if let Err(e) = db
-                    .query("UPDATE doc_chunk SET vectorized = true, vectorized_at = time::now() WHERE chunk_id = $chunk_id")
-                    .bind(("chunk_id", chunk_id.clone()))
+                    .query(
+                        "UPDATE doc_chunk SET vectorized = true, vectorized_at = time::now() WHERE id = $chunk_id",
+                    )
+                    .bind(("chunk_id", chunk_db_id))
                     .await
                 {
                     error!(
@@ -2295,7 +2504,7 @@ impl DatabaseActor {
                     );
                 }
 
-                // Broadcast acknowledgment for completion tracking
+                // Step 7: Broadcast EmbeddingPersisted event
                 broker
                     .broadcast(EmbeddingPersisted {
                         chunk_id: msg.chunk_id.clone(),
