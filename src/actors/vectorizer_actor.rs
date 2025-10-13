@@ -191,7 +191,7 @@ impl VectorizerActor {
         builder.model = VectorizerActor::new(config);
 
         // Subscribe to DocumentationChunked events
-        builder.mutate_on::<DocumentationChunked>(|agent, envelope| {
+        builder.act_on::<DocumentationChunked>(|agent, envelope| {
             let msg = envelope.message().clone();
             let broker = agent.broker().clone();
             let config = agent.model.config.clone();
