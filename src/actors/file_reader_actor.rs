@@ -113,7 +113,7 @@ impl FileReaderActor {
         builder.model = FileReaderActor::new(config);
 
         // Subscribe to CrateDownloaded events
-        builder.mutate_on::<CrateDownloaded>(|agent, envelope| {
+        builder.act_on::<CrateDownloaded>(|agent, envelope| {
             let msg = envelope.message().clone();
             let broker = agent.broker().clone();
             let config = agent.model.config.clone();
@@ -194,18 +194,11 @@ async fn extract_documentation(
     // The extracted path is: download_dir/crate-version/
     // The tarball extracts to: download_dir/crate-version/crate-version/
     // So we need to look inside the nested directory
-    let crate_dir = extracted_path.join(format!(
-        "{}-{}",
-        specifier.name(),
-        specifier.version()
-    ));
+    let crate_dir = extracted_path.join(format!("{}-{}", specifier.name(), specifier.version()));
 
     // Verify the crate directory exists
     if !crate_dir.exists() {
-        anyhow::bail!(
-            "Crate directory does not exist: {}",
-            crate_dir.display()
-        );
+        anyhow::bail!("Crate directory does not exist: {}", crate_dir.display());
     }
 
     // Extract README.md (optional)
@@ -415,7 +408,8 @@ pub fn example() {}
 
     #[tokio::test]
     async fn test_extract_documentation_success() {
-        let temp_dir = env::temp_dir().join(format!("crately_test_extract_{}", rand::random::<u32>()));
+        let temp_dir =
+            env::temp_dir().join(format!("crately_test_extract_{}", rand::random::<u32>()));
         let _ = fs::create_dir_all(&temp_dir);
 
         let extracted_path = create_test_crate_structure(&temp_dir, "test_crate", "1.0.0");
@@ -427,7 +421,10 @@ pub fn example() {}
 
         let (bytes, file_count) = result.unwrap();
         assert!(bytes > 0, "Should have extracted some bytes");
-        assert_eq!(file_count, 3, "Should have extracted 3 files (README, Cargo.toml, lib.rs)");
+        assert_eq!(
+            file_count, 3,
+            "Should have extracted 3 files (README, Cargo.toml, lib.rs)"
+        );
 
         // Cleanup
         let _ = fs::remove_dir_all(&temp_dir);
@@ -435,7 +432,8 @@ pub fn example() {}
 
     #[tokio::test]
     async fn test_extract_documentation_missing_directory() {
-        let temp_dir = env::temp_dir().join(format!("crately_test_missing_{}", rand::random::<u32>()));
+        let temp_dir =
+            env::temp_dir().join(format!("crately_test_missing_{}", rand::random::<u32>()));
         let specifier = CrateSpecifier::from_str("nonexistent@1.0.0").unwrap();
         let config = ReadConfig::default();
 
@@ -448,7 +446,8 @@ pub fn example() {}
 
     #[tokio::test]
     async fn test_extract_documentation_missing_cargo_toml() {
-        let temp_dir = env::temp_dir().join(format!("crately_test_no_cargo_{}", rand::random::<u32>()));
+        let temp_dir =
+            env::temp_dir().join(format!("crately_test_no_cargo_{}", rand::random::<u32>()));
         let extracted_path = temp_dir.join("test_crate-1.0.0");
         let crate_dir = extracted_path.join("test_crate-1.0.0");
         fs::create_dir_all(&crate_dir).expect("Failed to create test directory");
@@ -473,7 +472,8 @@ pub fn example() {}
 
     #[tokio::test]
     async fn test_extract_documentation_missing_source() {
-        let temp_dir = env::temp_dir().join(format!("crately_test_no_source_{}", rand::random::<u32>()));
+        let temp_dir =
+            env::temp_dir().join(format!("crately_test_no_source_{}", rand::random::<u32>()));
         let extracted_path = temp_dir.join("test_crate-1.0.0");
         let crate_dir = extracted_path.join("test_crate-1.0.0");
         fs::create_dir_all(&crate_dir).expect("Failed to create test directory");
@@ -500,7 +500,8 @@ pub fn example() {}
 
     #[tokio::test]
     async fn test_extract_documentation_without_readme() {
-        let temp_dir = env::temp_dir().join(format!("crately_test_no_readme_{}", rand::random::<u32>()));
+        let temp_dir =
+            env::temp_dir().join(format!("crately_test_no_readme_{}", rand::random::<u32>()));
         let extracted_path = temp_dir.join("test_crate-1.0.0");
         let crate_dir = extracted_path.join("test_crate-1.0.0");
         fs::create_dir_all(crate_dir.join("src")).expect("Failed to create test directory");
@@ -523,7 +524,10 @@ pub fn example() {}
 
         let (bytes, file_count) = result.unwrap();
         assert!(bytes > 0, "Should have extracted some bytes");
-        assert_eq!(file_count, 2, "Should have extracted 2 files (Cargo.toml, lib.rs)");
+        assert_eq!(
+            file_count, 2,
+            "Should have extracted 2 files (Cargo.toml, lib.rs)"
+        );
 
         // Cleanup
         let _ = fs::remove_dir_all(&temp_dir);
@@ -549,7 +553,8 @@ pub fn example() {}
 
     #[test]
     fn test_read_file_with_size_check_too_large() {
-        let temp_dir = env::temp_dir().join(format!("crately_test_large_{}", rand::random::<u32>()));
+        let temp_dir =
+            env::temp_dir().join(format!("crately_test_large_{}", rand::random::<u32>()));
         let _ = fs::create_dir_all(&temp_dir);
 
         let test_file = temp_dir.join("large.txt");
@@ -573,7 +578,8 @@ pub fn example() {}
 
     #[test]
     fn test_read_optional_file_exists() {
-        let temp_dir = env::temp_dir().join(format!("crately_test_optional_{}", rand::random::<u32>()));
+        let temp_dir =
+            env::temp_dir().join(format!("crately_test_optional_{}", rand::random::<u32>()));
         let _ = fs::create_dir_all(&temp_dir);
 
         let test_file = temp_dir.join("test.txt");
@@ -590,13 +596,19 @@ pub fn example() {}
 
     #[test]
     fn test_read_optional_file_missing() {
-        let temp_dir = env::temp_dir().join(format!("crately_test_optional_missing_{}", rand::random::<u32>()));
+        let temp_dir = env::temp_dir().join(format!(
+            "crately_test_optional_missing_{}",
+            rand::random::<u32>()
+        ));
         let test_file = temp_dir.join("nonexistent.txt");
 
         let config = ReadConfig::default();
         let result = read_optional_file(&test_file, &config);
         assert!(result.is_ok(), "Should handle missing file gracefully");
-        assert!(result.unwrap().is_none(), "Should return None for missing file");
+        assert!(
+            result.unwrap().is_none(),
+            "Should return None for missing file"
+        );
     }
 
     #[test]
