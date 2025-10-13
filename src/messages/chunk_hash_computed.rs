@@ -13,9 +13,9 @@ pub struct ChunkHashComputed {
     /// Build identifier
     pub build_id: String,
     /// Chunk identifier
-    pub chunk_id: String,
+    pub _chunk_id: String,
     /// Content hash (SHA-256 hex)
-    pub content_hash: String,
+    pub _content_hash: String,
     /// Progress: how many chunks have been hashed so far
     pub hashed_count: u32,
     /// Total chunks in this build
@@ -33,16 +33,16 @@ mod tests {
         let msg = ChunkHashComputed {
             specifier: specifier.clone(),
             build_id: "build_123".to_string(),
-            chunk_id: "chunk_001".to_string(),
-            content_hash: "abc123def456".to_string(),
+            _chunk_id: "chunk_001".to_string(),
+            _content_hash: "abc123def456".to_string(),
             hashed_count: 5,
             total_chunks: 20,
         };
 
         assert_eq!(msg.specifier, specifier);
         assert_eq!(msg.build_id, "build_123");
-        assert_eq!(msg.chunk_id, "chunk_001");
-        assert_eq!(msg.content_hash, "abc123def456");
+        assert_eq!(msg._chunk_id, "chunk_001");
+        assert_eq!(msg._content_hash, "abc123def456");
         assert_eq!(msg.hashed_count, 5);
         assert_eq!(msg.total_chunks, 20);
     }
@@ -53,8 +53,8 @@ mod tests {
         let msg = ChunkHashComputed {
             specifier,
             build_id: "build_first".to_string(),
-            chunk_id: "chunk_000".to_string(),
-            content_hash: "hash_first".to_string(),
+            _chunk_id: "chunk_000".to_string(),
+            _content_hash: "hash_first".to_string(),
             hashed_count: 1,
             total_chunks: 50,
         };
@@ -70,8 +70,8 @@ mod tests {
         let msg = ChunkHashComputed {
             specifier,
             build_id: "build_last".to_string(),
-            chunk_id: "chunk_099".to_string(),
-            content_hash: "hash_last".to_string(),
+            _chunk_id: "chunk_099".to_string(),
+            _content_hash: "hash_last".to_string(),
             hashed_count: total,
             total_chunks: total,
         };
@@ -85,8 +85,8 @@ mod tests {
         let msg = ChunkHashComputed {
             specifier,
             build_id: "build_progress".to_string(),
-            chunk_id: "chunk_010".to_string(),
-            content_hash: "hash_progress".to_string(),
+            _chunk_id: "chunk_010".to_string(),
+            _content_hash: "hash_progress".to_string(),
             hashed_count: 10,
             total_chunks: 25,
         };
@@ -102,8 +102,8 @@ mod tests {
         let msg = ChunkHashComputed {
             specifier: specifier.clone(),
             build_id: "build_clone".to_string(),
-            chunk_id: "chunk_005".to_string(),
-            content_hash: "hash_clone".to_string(),
+            _chunk_id: "chunk_005".to_string(),
+            _content_hash: "hash_clone".to_string(),
             hashed_count: 7,
             total_chunks: 15,
         };
@@ -111,8 +111,8 @@ mod tests {
         let cloned = msg.clone();
         assert_eq!(msg.specifier, cloned.specifier);
         assert_eq!(msg.build_id, cloned.build_id);
-        assert_eq!(msg.chunk_id, cloned.chunk_id);
-        assert_eq!(msg.content_hash, cloned.content_hash);
+        assert_eq!(msg._chunk_id, cloned._chunk_id);
+        assert_eq!(msg._content_hash, cloned._content_hash);
         assert_eq!(msg.hashed_count, cloned.hashed_count);
         assert_eq!(msg.total_chunks, cloned.total_chunks);
     }

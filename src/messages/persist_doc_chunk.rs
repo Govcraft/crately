@@ -59,7 +59,7 @@ pub struct PersistDocChunk {
     pub chunk_index: usize,
 
     /// Unique identifier for this chunk
-    pub chunk_id: String,
+    pub _chunk_id: String,
 
     /// The documentation text content
     pub content: String,
@@ -100,7 +100,7 @@ mod tests {
         let msg = PersistDocChunk {
             specifier: specifier.clone(),
             chunk_index: 5,
-            chunk_id: "tokio_1.35.0_chunk_005".to_string(),
+            _chunk_id: "tokio_1.35.0_chunk_005".to_string(),
             content: "Tokio runtime documentation...".to_string(),
             source_file: "src/runtime/mod.rs".to_string(),
             metadata: metadata.clone(),
@@ -109,7 +109,7 @@ mod tests {
 
         assert_eq!(msg.specifier, specifier);
         assert_eq!(msg.chunk_index, 5);
-        assert_eq!(msg.chunk_id, "tokio_1.35.0_chunk_005");
+        assert_eq!(msg._chunk_id, "tokio_1.35.0_chunk_005");
         assert_eq!(msg.content, "Tokio runtime documentation...");
         assert_eq!(msg.source_file, "src/runtime/mod.rs");
         assert_eq!(msg.metadata.content_type, "rust");
@@ -120,7 +120,7 @@ mod tests {
         let msg = PersistDocChunk {
             specifier: CrateSpecifier::from_str("axum@0.7.0").unwrap(),
             chunk_index: 0,
-            chunk_id: "axum_0.7.0_chunk_000".to_string(),
+            _chunk_id: "axum_0.7.0_chunk_000".to_string(),
             content: "Axum web framework overview...".to_string(),
             source_file: "src/lib.rs".to_string(),
             metadata: ChunkMetadata {
@@ -145,7 +145,7 @@ mod tests {
         let msg = PersistDocChunk {
             specifier: CrateSpecifier::from_str("serde_json@1.0.0").unwrap(),
             chunk_index: 10,
-            chunk_id: "serde_json_1.0.0_chunk_010".to_string(),
+            _chunk_id: "serde_json_1.0.0_chunk_010".to_string(),
             content: "JSON serialization utilities...".to_string(),
             source_file: "src/ser.rs".to_string(),
             metadata: ChunkMetadata {
@@ -170,7 +170,7 @@ mod tests {
         let msg = PersistDocChunk {
             specifier: CrateSpecifier::from_str("tracing@0.1.0").unwrap(),
             chunk_index: 3,
-            chunk_id: "tracing_0.1.0_chunk_003".to_string(),
+            _chunk_id: "tracing_0.1.0_chunk_003".to_string(),
             content: "Tracing subscriber documentation...".to_string(),
             source_file: "src/subscriber.rs".to_string(),
             metadata: create_test_metadata(),
@@ -180,7 +180,7 @@ mod tests {
         let cloned = msg.clone();
         assert_eq!(msg.specifier, cloned.specifier);
         assert_eq!(msg.chunk_index, cloned.chunk_index);
-        assert_eq!(msg.chunk_id, cloned.chunk_id);
+        assert_eq!(msg._chunk_id, cloned._chunk_id);
         assert_eq!(msg.metadata.content_type, cloned.metadata.content_type);
     }
 

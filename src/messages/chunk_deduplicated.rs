@@ -15,7 +15,7 @@ pub struct ChunkDeduplicated {
     /// Duplicate chunk identifier
     pub duplicate_chunk_id: String,
     /// Content hash of the duplicate
-    pub content_hash: String,
+    pub _content_hash: String,
     /// Original chunk identifier that will be reused
     pub original_chunk_id: String,
     /// Total duplicates found so far in this build
@@ -34,7 +34,7 @@ mod tests {
             specifier: specifier.clone(),
             build_id: "build_dedup".to_string(),
             duplicate_chunk_id: "chunk_005".to_string(),
-            content_hash: "abc123def456".to_string(),
+            _content_hash: "abc123def456".to_string(),
             original_chunk_id: "chunk_002".to_string(),
             total_duplicates: 3,
         };
@@ -42,7 +42,7 @@ mod tests {
         assert_eq!(msg.specifier, specifier);
         assert_eq!(msg.build_id, "build_dedup");
         assert_eq!(msg.duplicate_chunk_id, "chunk_005");
-        assert_eq!(msg.content_hash, "abc123def456");
+        assert_eq!(msg._content_hash, "abc123def456");
         assert_eq!(msg.original_chunk_id, "chunk_002");
         assert_eq!(msg.total_duplicates, 3);
     }
@@ -54,7 +54,7 @@ mod tests {
             specifier,
             build_id: "build_first_dup".to_string(),
             duplicate_chunk_id: "chunk_010".to_string(),
-            content_hash: "hash_first_dup".to_string(),
+            _content_hash: "hash_first_dup".to_string(),
             original_chunk_id: "chunk_005".to_string(),
             total_duplicates: 1,
         };
@@ -69,7 +69,7 @@ mod tests {
             specifier,
             build_id: "build_many".to_string(),
             duplicate_chunk_id: "chunk_100".to_string(),
-            content_hash: "hash_common".to_string(),
+            _content_hash: "hash_common".to_string(),
             original_chunk_id: "chunk_001".to_string(),
             total_duplicates: 50,
         };
@@ -84,7 +84,7 @@ mod tests {
             specifier: specifier.clone(),
             build_id: "build_clone".to_string(),
             duplicate_chunk_id: "chunk_020".to_string(),
-            content_hash: "hash_clone".to_string(),
+            _content_hash: "hash_clone".to_string(),
             original_chunk_id: "chunk_010".to_string(),
             total_duplicates: 5,
         };
@@ -93,7 +93,7 @@ mod tests {
         assert_eq!(msg.specifier, cloned.specifier);
         assert_eq!(msg.build_id, cloned.build_id);
         assert_eq!(msg.duplicate_chunk_id, cloned.duplicate_chunk_id);
-        assert_eq!(msg.content_hash, cloned.content_hash);
+        assert_eq!(msg._content_hash, cloned._content_hash);
         assert_eq!(msg.original_chunk_id, cloned.original_chunk_id);
         assert_eq!(msg.total_duplicates, cloned.total_duplicates);
     }
@@ -105,13 +105,13 @@ mod tests {
             specifier,
             build_id: "build_same_hash".to_string(),
             duplicate_chunk_id: "chunk_015".to_string(),
-            content_hash: "shared_hash_value".to_string(),
+            _content_hash: "shared_hash_value".to_string(),
             original_chunk_id: "chunk_003".to_string(),
             total_duplicates: 2,
         };
 
         assert_ne!(msg.duplicate_chunk_id, msg.original_chunk_id);
-        assert_eq!(msg.content_hash, "shared_hash_value");
+        assert_eq!(msg._content_hash, "shared_hash_value");
     }
 
     #[test]

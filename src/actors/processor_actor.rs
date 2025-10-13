@@ -157,7 +157,7 @@ impl ProcessorActor {
                                 .broadcast(PersistDocChunk {
                                     specifier: msg.specifier.clone(),
                                     chunk_index: index,
-                                    chunk_id,
+                                    _chunk_id: chunk_id,
                                     content,
                                     source_file,
                                     metadata,

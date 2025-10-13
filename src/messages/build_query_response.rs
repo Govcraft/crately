@@ -46,13 +46,13 @@ use serde::{Deserialize, Serialize};
 #[acton_message]
 pub struct BuildQueryResponse {
     /// The crate identifier that was queried
-    pub specifier: CrateSpecifier,
+    pub _specifier: CrateSpecifier,
 
     /// The feature set that was queried
-    pub features: Vec<String>,
+    pub _features: Vec<String>,
 
     /// Build information if found, None if no matching build exists
-    pub build_info: Option<BuildInfo>,
+    pub _build_info: Option<BuildInfo>,
 }
 
 /// Complete information about a build
@@ -107,14 +107,14 @@ mod tests {
         let build_info = create_test_build_info();
 
         let response = BuildQueryResponse {
-            specifier: specifier.clone(),
-            features: features.clone(),
-            build_info: Some(build_info.clone()),
+            _specifier: specifier.clone(),
+            _features: features.clone(),
+            _build_info: Some(build_info.clone()),
         };
 
-        assert_eq!(response.specifier, specifier);
-        assert_eq!(response.features, features);
-        assert!(response.build_info.is_some());
+        assert_eq!(response._specifier, specifier);
+        assert_eq!(response._features, features);
+        assert!(response._build_info.is_some());
     }
 
     #[test]
@@ -123,12 +123,12 @@ mod tests {
         let features = vec!["full".to_string()];
 
         let response = BuildQueryResponse {
-            specifier: specifier.clone(),
-            features: features.clone(),
-            build_info: None,
+            _specifier: specifier.clone(),
+            _features: features.clone(),
+            _build_info: None,
         };
 
-        assert!(response.build_info.is_none());
+        assert!(response._build_info.is_none());
     }
 
     #[test]
@@ -182,14 +182,14 @@ mod tests {
     #[test]
     fn test_build_query_response_clone() {
         let original = BuildQueryResponse {
-            specifier: CrateSpecifier::from_str("axum@0.7.0").unwrap(),
-            features: vec!["json".to_string()],
-            build_info: Some(create_test_build_info()),
+            _specifier: CrateSpecifier::from_str("axum@0.7.0").unwrap(),
+            _features: vec!["json".to_string()],
+            _build_info: Some(create_test_build_info()),
         };
 
         let cloned = original.clone();
-        assert_eq!(original.specifier, cloned.specifier);
-        assert_eq!(original.features, cloned.features);
+        assert_eq!(original._specifier, cloned._specifier);
+        assert_eq!(original._features, cloned._features);
     }
 
     #[test]
@@ -203,9 +203,9 @@ mod tests {
     #[test]
     fn test_build_query_response_debug() {
         let response = BuildQueryResponse {
-            specifier: CrateSpecifier::from_str("test@1.0.0").unwrap(),
-            features: vec![],
-            build_info: Some(create_test_build_info()),
+            _specifier: CrateSpecifier::from_str("test@1.0.0").unwrap(),
+            _features: vec![],
+            _build_info: Some(create_test_build_info()),
         };
 
         let debug_str = format!("{:?}", response);

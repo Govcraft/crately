@@ -44,10 +44,10 @@ use serde::{Deserialize, Serialize};
 #[acton_message]
 pub struct BuildChunksQueryResponse {
     /// The BuildId these chunks belong to
-    pub build_id: BuildId,
+    pub _build_id: BuildId,
 
     /// Documentation chunks with edge metadata, ordered by chunk_index ascending
-    pub chunks: Vec<BuildChunkData>,
+    pub _chunks: Vec<BuildChunkData>,
 }
 
 /// Data for a single documentation chunk with graph relationship context
@@ -105,23 +105,23 @@ mod tests {
         let chunks = vec![create_test_chunk(0), create_test_chunk(1)];
 
         let response = BuildChunksQueryResponse {
-            build_id: build_id.clone(),
-            chunks: chunks.clone(),
+            _build_id: build_id.clone(),
+            _chunks: chunks.clone(),
         };
 
-        assert_eq!(response.build_id, build_id);
-        assert_eq!(response.chunks.len(), 2);
+        assert_eq!(response._build_id, build_id);
+        assert_eq!(response._chunks.len(), 2);
     }
 
     #[test]
     fn test_build_chunks_query_response_empty() {
         let build_id = BuildId::from_str("build_abc123def456abc123def456abc12345").unwrap();
         let response = BuildChunksQueryResponse {
-            build_id,
-            chunks: vec![],
+            _build_id: build_id,
+            _chunks: vec![],
         };
 
-        assert_eq!(response.chunks.len(), 0);
+        assert_eq!(response._chunks.len(), 0);
     }
 
     #[test]
@@ -163,13 +163,13 @@ mod tests {
     fn test_build_chunks_query_response_clone() {
         let build_id = BuildId::from_str("build_abc123def456abc123def456abc12345").unwrap();
         let original = BuildChunksQueryResponse {
-            build_id: build_id.clone(),
-            chunks: vec![create_test_chunk(0)],
+            _build_id: build_id.clone(),
+            _chunks: vec![create_test_chunk(0)],
         };
 
         let cloned = original.clone();
-        assert_eq!(original.build_id, cloned.build_id);
-        assert_eq!(original.chunks.len(), cloned.chunks.len());
+        assert_eq!(original._build_id, cloned._build_id);
+        assert_eq!(original._chunks.len(), cloned._chunks.len());
     }
 
     #[test]
@@ -188,8 +188,8 @@ mod tests {
     fn test_build_chunks_query_response_debug() {
         let build_id = BuildId::from_str("build_abc123def456abc123def456abc12345").unwrap();
         let response = BuildChunksQueryResponse {
-            build_id,
-            chunks: vec![],
+            _build_id: build_id,
+            _chunks: vec![],
         };
 
         let debug_str = format!("{:?}", response);

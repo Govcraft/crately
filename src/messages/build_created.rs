@@ -14,8 +14,8 @@ pub struct BuildCreated {
     pub build_id: String,
     /// Number of chunks to be analyzed
     pub total_chunks: u32,
-    /// Timestamp when build was created
-    pub created_at: std::time::SystemTime,
+    /// Timestamp when build was created (retained for future subscribers)
+    pub _created_at: std::time::SystemTime,
 }
 
 #[cfg(test)]
@@ -35,13 +35,13 @@ mod tests {
             specifier: specifier.clone(),
             build_id: build_id.clone(),
             total_chunks,
-            created_at,
+            _created_at: created_at,
         };
 
         assert_eq!(msg.specifier, specifier);
         assert_eq!(msg.build_id, build_id);
         assert_eq!(msg.total_chunks, total_chunks);
-        assert_eq!(msg.created_at, created_at);
+        assert_eq!(msg._created_at, created_at);
     }
 
     #[test]
@@ -51,14 +51,14 @@ mod tests {
             specifier: specifier.clone(),
             build_id: "build_xyz789".to_string(),
             total_chunks: 100,
-            created_at: SystemTime::now(),
+            _created_at: SystemTime::now(),
         };
 
         let cloned = msg.clone();
         assert_eq!(msg.specifier, cloned.specifier);
         assert_eq!(msg.build_id, cloned.build_id);
         assert_eq!(msg.total_chunks, cloned.total_chunks);
-        assert_eq!(msg.created_at, cloned.created_at);
+        assert_eq!(msg._created_at, cloned._created_at);
     }
 
     #[test]
@@ -68,7 +68,7 @@ mod tests {
             specifier,
             build_id: "build_empty".to_string(),
             total_chunks: 0,
-            created_at: SystemTime::now(),
+            _created_at: SystemTime::now(),
         };
 
         assert_eq!(msg.total_chunks, 0);
@@ -81,7 +81,7 @@ mod tests {
             specifier,
             build_id: "build_large".to_string(),
             total_chunks: 10_000,
-            created_at: SystemTime::now(),
+            _created_at: SystemTime::now(),
         };
 
         assert_eq!(msg.total_chunks, 10_000);

@@ -147,10 +147,10 @@ struct RecordIdOnly {
 /// event broadcasting with progress counts and deduplication statistics.
 #[derive(Debug, Clone)]
 struct BuildState {
-    /// The crate being processed
-    specifier: CrateSpecifier,
-    /// Unique build identifier
-    build_id: String,
+    /// The crate being processed (retained for debugging and future use)
+    _specifier: CrateSpecifier,
+    /// Unique build identifier (retained for debugging and future use)
+    _build_id: String,
     /// Total chunks expected for this build
     total_chunks: u32,
     /// Number of chunks hashed so far
@@ -968,9 +968,9 @@ impl DatabaseActor {
                                 // Broadcast successful response
                                 broker
                                     .broadcast(crate::messages::BuildQueryResponse {
-                                        specifier: msg.specifier.clone(),
-                                        features: msg.features.clone(),
-                                        build_info: Some(crate::messages::BuildInfo {
+                                        _specifier: msg.specifier.clone(),
+                                        _features: msg.features.clone(),
+                                        _build_info: Some(crate::messages::BuildInfo {
                                             build_id: build_id.clone(),
                                             features: msg.features.clone(),
                                             feature_hash: String::new(), // TODO: compute if needed
@@ -989,9 +989,9 @@ impl DatabaseActor {
                                 // Broadcast not-found response
                                 broker
                                     .broadcast(crate::messages::BuildQueryResponse {
-                                        specifier: msg.specifier.clone(),
-                                        features: msg.features.clone(),
-                                        build_info: None,
+                                        _specifier: msg.specifier.clone(),
+                                        _features: msg.features.clone(),
+                                        _build_info: None,
                                     })
                                     .await;
                             }
@@ -1073,8 +1073,8 @@ impl DatabaseActor {
 
                                 broker
                                     .broadcast(crate::messages::BuildChunksQueryResponse {
-                                        build_id: msg.build_id.clone(),
-                                        chunks,
+                                        _build_id: msg.build_id.clone(),
+                                        _chunks: chunks,
                                     })
                                     .await;
                             }
@@ -1082,8 +1082,8 @@ impl DatabaseActor {
                                 error!("Failed to parse chunk query results: {}", e);
                                 broker
                                     .broadcast(crate::messages::BuildChunksQueryResponse {
-                                        build_id: msg.build_id.clone(),
-                                        chunks: vec![],
+                                        _build_id: msg.build_id.clone(),
+                                        _chunks: vec![],
                                     })
                                     .await;
                             }
@@ -1093,8 +1093,8 @@ impl DatabaseActor {
                         error!("Failed to query build chunks: {}", e);
                         broker
                             .broadcast(crate::messages::BuildChunksQueryResponse {
-                                build_id: msg.build_id.clone(),
-                                chunks: vec![],
+                                _build_id: msg.build_id.clone(),
+                                _chunks: vec![],
                             })
                             .await;
                     }
@@ -1503,8 +1503,8 @@ impl DatabaseActor {
             // Initialize build tracking state
             let build_id = BuildId::generate(&msg.specifier, &msg.features).as_str().to_string();
             let build_state = BuildState {
-                specifier: msg.specifier.clone(),
-                build_id: build_id.clone(),
+                _specifier: msg.specifier.clone(),
+                _build_id: build_id.clone(),
                 total_chunks: msg.chunk_count,
                 hashed_count: 0,
                 duplicates_count: 0,
@@ -1698,7 +1698,7 @@ impl DatabaseActor {
                                 specifier: msg.specifier.clone(),
                                 build_id: build_id.clone(),
                                 total_chunks: build_state.total_chunks,
-                                created_at: build_state.created_at,
+                                _created_at: build_state.created_at,
                             })
                             .await;
 
@@ -1745,8 +1745,8 @@ impl DatabaseActor {
                         .broadcast(ChunkHashComputed {
                             specifier: msg.specifier.clone(),
                             build_id: build_id.clone(),
-                            chunk_id,
-                            content_hash: content_hash.clone(),
+                            _chunk_id: chunk_id,
+                            _content_hash: content_hash.clone(),
                             hashed_count,
                             total_chunks,
                         })
@@ -2081,7 +2081,7 @@ impl DatabaseActor {
                                 specifier: msg.specifier.clone(),
                                 build_id: build_id.clone(),
                                 duplicate_chunk_id,
-                                content_hash: content_hash.clone(),
+                                _content_hash: content_hash.clone(),
                                 original_chunk_id,
                                 total_duplicates,
                             })
@@ -4500,7 +4500,7 @@ mod tests {
                 .send(PersistDocChunk {
                     specifier: specifier.clone(),
                     chunk_index: 0,
-                    chunk_id: "tokio_1.35.0_chunk_000".to_string(),
+                    _chunk_id: "tokio_1.35.0_chunk_000".to_string(),
                     content: "Documentation for tokio::runtime::spawn function".to_string(),
                     source_file: "src/runtime/mod.rs".to_string(),
                     metadata: chunk_metadata,
@@ -4550,7 +4550,7 @@ mod tests {
                 .send(PersistDocChunk {
                     specifier,
                     chunk_index: 0,
-                    chunk_id: "nonexistent_1.0.0_chunk_000".to_string(),
+                    _chunk_id: "nonexistent_1.0.0_chunk_000".to_string(),
                     content: "Some documentation".to_string(),
                     source_file: "src/lib.rs".to_string(),
                     metadata: chunk_metadata,
@@ -4610,7 +4610,7 @@ mod tests {
                     .send(PersistDocChunk {
                         specifier: specifier.clone(),
                         chunk_index: i,
-                        chunk_id: format!("serde_1.0.0_chunk_{:03}", i),
+                        _chunk_id: format!("serde_1.0.0_chunk_{:03}", i),
                         content: format!("Documentation chunk {} for serde", i),
                         source_file: format!("src/module_{}.rs", i),
                         metadata: chunk_metadata,
@@ -4671,7 +4671,7 @@ mod tests {
                 .send(PersistDocChunk {
                     specifier: specifier.clone(),
                     chunk_index: 0,
-                    chunk_id: "actix_web_4.0.0_chunk_000".to_string(),
+                    _chunk_id: "actix_web_4.0.0_chunk_000".to_string(),
                     content: "General crate overview documentation".to_string(),
                     source_file: "README.md".to_string(),
                     metadata: chunk_metadata,
@@ -4732,7 +4732,7 @@ mod tests {
                     .send(PersistDocChunk {
                         specifier: specifier.clone(),
                         chunk_index: i,
-                        chunk_id: format!("test_crate_1.0.0_chunk_{:03}", i),
+                        _chunk_id: format!("test_crate_1.0.0_chunk_{:03}", i),
                         content: format!("Test chunk {}", i),
                         source_file: "test.rs".to_string(),
                         metadata: chunk_metadata,
@@ -4863,7 +4863,7 @@ mod tests {
                     .send(PersistDocChunk {
                         specifier: specifier.clone(),
                         chunk_index: i,
-                        chunk_id: format!("vec_test_1.0.0_chunk_{:03}", i),
+                        _chunk_id: format!("vec_test_1.0.0_chunk_{:03}", i),
                         content: format!("Chunk {}", i),
                         source_file: "vec.rs".to_string(),
                         metadata: chunk_metadata,
@@ -4989,7 +4989,7 @@ mod tests {
                 .send(PersistDocChunk {
                     specifier: specifier.clone(),
                     chunk_index: 0,
-                    chunk_id: "test_chunk_1".to_string(),
+                    _chunk_id: "test_chunk_1".to_string(),
                     content: "Test documentation content".to_string(),
                     source_file: "src/lib.rs".to_string(),
                     metadata: ChunkMetadata {
@@ -5034,7 +5034,7 @@ mod tests {
                 .send(PersistDocChunk {
                     specifier: specifier.clone(),
                     chunk_index: 0,
-                    chunk_id: "test_chunk_1".to_string(),
+                    _chunk_id: "test_chunk_1".to_string(),
                     content: "Updated documentation content".to_string(),
                     source_file: "src/lib.rs".to_string(),
                     metadata: ChunkMetadata {
@@ -5129,7 +5129,7 @@ mod tests {
                     .send(PersistDocChunk {
                         specifier: specifier.clone(),
                         chunk_index,
-                        chunk_id: format!("test_chunk_{}", chunk_index),
+                        _chunk_id: format!("test_chunk_{}", chunk_index),
                         source_file: "README.md".to_string(),
                         content: chunk_content.to_string(),
                         metadata: chunk_metadata,

@@ -397,7 +397,7 @@ async fn test_persist_and_retrieve_documentation_chunks() {
                 .send(PersistDocChunk {
                     specifier: specifier.clone(),
                     chunk_index: i,
-                    chunk_id: format!("serde_1.0.200_chunk_{:03}", i),
+                    _chunk_id: format!("serde_1.0.200_chunk_{:03}", i),
                     content: format!("This is documentation chunk {} for serde", i),
                     source_file: format!("src/module{}.rs", i),
                     metadata,
@@ -458,7 +458,7 @@ async fn test_chunk_metadata_accuracy() {
             .send(PersistDocChunk {
                 specifier: specifier.clone(),
                 chunk_index: 10,
-                chunk_id: "tokio_1.36.0_chunk_010".to_string(),
+                _chunk_id: "tokio_1.36.0_chunk_010".to_string(),
                 content: "Runtime struct provides the async runtime environment".to_string(),
                 source_file: "src/runtime/mod.rs".to_string(),
                 metadata,
@@ -577,7 +577,7 @@ async fn test_vector_search_accuracy_and_ranking() {
                 .send(PersistDocChunk {
                     specifier: specifier.clone(),
                     chunk_index: 0,
-                    chunk_id: chunk_id.clone(),
+                    _chunk_id: chunk_id.clone(),
                     content: format!("Async runtime documentation for {}", specifier.name()),
                     source_file: "src/lib.rs".to_string(),
                     metadata,
@@ -711,7 +711,7 @@ async fn test_vector_search_with_crate_filter() {
                 .send(PersistDocChunk {
                     specifier: specifier.clone(),
                     chunk_index: 0,
-                    chunk_id: chunk_id.clone(),
+                    _chunk_id: chunk_id.clone(),
                     content: format!("Documentation for {}", specifier.name()),
                     source_file: "src/lib.rs".to_string(),
                     metadata,
@@ -836,7 +836,7 @@ async fn test_vector_search_limit_parameter() {
                 .send(PersistDocChunk {
                     specifier: specifier.clone(),
                     chunk_index: i,
-                    chunk_id: chunk_id.clone(),
+                    _chunk_id: chunk_id.clone(),
                     content: format!("Documentation chunk {}", i),
                     source_file: format!("src/module{}.rs", i),
                     metadata,
@@ -949,7 +949,7 @@ async fn test_error_handling_invalid_crate_reference() {
             .send(PersistDocChunk {
                 specifier,
                 chunk_index: 0,
-                chunk_id: "nonexistent_1.0.0_chunk_000".to_string(),
+                _chunk_id: "nonexistent_1.0.0_chunk_000".to_string(),
                 content: "Test content".to_string(),
                 source_file: "src/lib.rs".to_string(),
                 metadata,
@@ -1115,7 +1115,7 @@ async fn test_recovery_after_database_error() {
             .send(PersistDocChunk {
                 specifier: invalid_specifier,
                 chunk_index: 0,
-                chunk_id: "invalid_chunk".to_string(),
+                _chunk_id: "invalid_chunk".to_string(),
                 content: "Test".to_string(),
                 source_file: "src/lib.rs".to_string(),
                 metadata,
