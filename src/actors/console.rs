@@ -14,8 +14,9 @@ use std::io::stdout;
 use crate::actors::config::ConfigLoaded;
 use crate::colors::{format_error, format_progress, format_success, format_warning, ColorConfig};
 use crate::messages::{
-    ConfigReloadFailed, CrateListResponse, CratePersisted, CrateQueryResponse, DatabaseError,
-    DatabaseWarning, DocChunkPersisted, EmbeddingPersisted, Init, PrintError, PrintProgress,
+    ChunksPersistenceComplete, ConfigReloadFailed, CrateListResponse, CrateProcessingComplete,
+    CratePersisted, CrateQueryResponse, DatabaseError, DatabaseWarning, DocChunkPersisted,
+    EmbeddingPersisted, EmbeddingsPersistenceComplete, Init, PrintError, PrintProgress,
     PrintSeparator, PrintSpinner, PrintSuccess, PrintWarning, ServerReloaded, ServerStarted,
     SetRawMode, StopSpinner, UpdateSpinner,
 };
@@ -478,6 +479,62 @@ impl Console {
                 );
 
                 AgentReply::immediate()
+            })
+            .act_on::<ChunksPersistenceComplete>(|agent, envelope| {
+                let msg = envelope.message();
+
+                let success_msg = format!(
+                    "All {} chunks persisted for {}@{}",
+                    msg.chunk_count,
+                    msg.specifier.name(),
+                    msg.specifier.version()
+                );
+
+                print_success(
+                    &success_msg,
+                    agent.model.raw_mode_active,
+                    agent.model.color_config,
+                );
+
+                AgentReply::immediate()
+            })
+            .act_on::<EmbeddingsPersistenceComplete>(|agent, envelope| {
+                let msg = envelope.message();
+
+                let success_msg = format!(
+                    "All {} embeddings persisted for {}@{} using {}",
+                    msg.vector_count,
+                    msg.specifier.name(),
+                    msg.specifier.version(),
+                    msg.embedding_model
+                );
+
+                print_success(
+                    &success_msg,
+                    agent.model.raw_mode_active,
+                    agent.model.color_config,
+                );
+
+                AgentReply::immediate()
+            })
+            .act_on::<CrateProcessingComplete>(|agent, envelope| {
+                let msg = envelope.message();
+
+                let success_msg = format!(
+                    "Crate processing complete: {}@{} ({} stages, {}ms)",
+                    msg.specifier.name(),
+                    msg.specifier.version(),
+                    msg.stages_completed,
+                    msg.total_duration_ms
+                );
+
+                print_success(
+                    &success_msg,
+                    agent.model.raw_mode_active,
+                    agent.model.color_config,
+                );
+
+                AgentReply::immediate()
             });
 
         // Subscribe to broadcast messages before starting
@@ -492,6 +549,18 @@ impl Console {
         builder.handle().subscribe::<CrateListResponse>().await;
         builder.handle().subscribe::<DocChunkPersisted>().await;
         builder.handle().subscribe::<EmbeddingPersisted>().await;
+        builder
+            .handle()
+            .subscribe::<ChunksPersistenceComplete>()
+            .await;
+        builder
+            .handle()
+            .subscribe::<EmbeddingsPersistenceComplete>()
+            .await;
+        builder
+            .handle()
+            .subscribe::<CrateProcessingComplete>()
+            .await;
 
         Ok(builder.start().await)
     }
