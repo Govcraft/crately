@@ -1,176 +1,129 @@
-//! QueryBuild - Request to query build information by BuildId
+//! QueryBuild - Request to find a build by crate identifier and feature set
 //!
-//! This message is sent to DatabaseActor to retrieve complete information about
-//! a specific build, including its metadata, associated chunks, and processing status.
+//! This message is sent to DatabaseActor to query for a specific build that matches
+//! both the crate (name + version) and the exact feature configuration. Uses graph
+//! traversal to efficiently locate the build.
 
-use crate::types::BuildId;
+use crate::crate_specifier::CrateSpecifier;
 use acton_reactive::prelude::*;
 
-/// Request to query build information from the database
+/// Query a specific build by crate identifier and feature set
 ///
-/// This message requests complete information about a specific build from the
-/// DatabaseActor. The response is broadcast via BuildQueryResponse, following
-/// the pub/sub pattern to decouple query from response handling.
+/// This message queries for a build record that matches both the crate
+/// (name + version) and the exact feature configuration. Unlike QueryCrate
+/// which returns crate metadata with all possible features, this returns
+/// a specific build with its realized feature set.
 ///
-/// # Query Pattern
+/// # Graph Traversal
 ///
-/// This follows the query-response pattern in the actor system:
-/// 1. Requester sends QueryBuild to DatabaseActor
-/// 2. DatabaseActor performs database query
-/// 3. DatabaseActor broadcasts BuildQueryResponse
-/// 4. Requester (and any other subscribers) receives response
+/// Uses single-query graph traversal:
+/// ```surql
+/// SELECT
+///     build.id as build_id,
+///     build.features as features,
+///     build.feature_hash as feature_hash,
+///     build.status as status,
+///     build.created_at as created_at,
+///     build.updated_at as updated_at,
+///     count(<-contains<-content_block) as chunk_count
+/// FROM crate WHERE name = $name AND version = $version
+/// ->has_build->build[WHERE features = $features]
+/// ```
 ///
-/// # Fields
+/// # Use Cases
 ///
-/// * `build_id` - Unique identifier of the build to query
-/// * `response_id` - Optional correlation ID for request/response matching
-/// * `include_chunks` - Whether to include associated chunk information
-/// * `include_metrics` - Whether to include processing metrics
+/// - Get BuildId for subsequent chunk queries
+/// - Verify a feature configuration exists
+/// - Check build processing status
+/// - Retrieve build-specific metadata
+///
+/// # Response
+///
+/// DatabaseActor broadcasts `BuildQueryResponse` with build information
+/// or None if no matching build exists.
 ///
 /// # Example
 ///
 /// ```no_run
 /// use crately::messages::QueryBuild;
-/// use crately::types::BuildId;
+/// use crately::crate_specifier::CrateSpecifier;
+/// use std::str::FromStr;
 ///
-/// let query = QueryBuild {
-///     build_id: BuildId::try_from("build_01HZQKR9VF8P6QXWM7YJDG2K4N".to_string()).unwrap(),
-///     response_id: Some("req_12345".to_string()),
-///     include_chunks: true,
-///     include_metrics: false,
+/// let message = QueryBuild {
+///     specifier: CrateSpecifier::from_str("serde@1.0.200").unwrap(),
+///     features: vec!["derive".to_string()],
 /// };
-/// // database_handle.send(query).await;
+/// // db_handle.send(message).await;
 /// ```
-///
-/// # Message Flow
-///
-/// 1. Actor sends QueryBuild to DatabaseActor
-/// 2. DatabaseActor queries: `SELECT * FROM build WHERE id = $build_id`
-/// 3. If `include_chunks`, join with chunk references
-/// 4. If `include_metrics`, compute processing statistics
-/// 5. DatabaseActor broadcasts BuildQueryResponse
-/// 6. Requester receives response via subscription
-///
-/// # Subscribers
-///
-/// - **DatabaseActor**: Primary handler, performs query and broadcasts response
 #[acton_message]
 pub struct QueryBuild {
-    /// Unique identifier of the build to query
-    pub build_id: BuildId,
+    /// The crate identifier (name + version)
+    pub specifier: CrateSpecifier,
 
-    /// Optional correlation ID for matching request to response
-    /// Useful when multiple queries are in flight simultaneously
-    pub response_id: Option<String>,
-
-    /// Whether to include associated chunk information in response
-    pub include_chunks: bool,
-
-    /// Whether to include processing metrics (deduplication rate, timing, etc.)
-    pub include_metrics: bool,
+    /// The exact feature set for this build
+    /// Empty vec means default features only
+    pub features: Vec<String>,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::str::FromStr;
 
     #[test]
-    fn test_query_build_minimal() {
-        let build_id = BuildId::new();
+    fn test_query_build_basic() {
+        let specifier = CrateSpecifier::from_str("serde@1.0.200").unwrap();
+        let features = vec!["derive".to_string()];
 
         let query = QueryBuild {
-            build_id: build_id.clone(),
-            response_id: None,
-            include_chunks: false,
-            include_metrics: false,
+            specifier: specifier.clone(),
+            features: features.clone(),
         };
 
-        assert_eq!(query.build_id, build_id);
-        assert!(query.response_id.is_none());
-        assert!(!query.include_chunks);
-        assert!(!query.include_metrics);
+        assert_eq!(query.specifier, specifier);
+        assert_eq!(query.features, features);
     }
 
     #[test]
-    fn test_query_build_with_response_id() {
+    fn test_query_build_no_features() {
+        let specifier = CrateSpecifier::from_str("anyhow@1.0.0").unwrap();
         let query = QueryBuild {
-            build_id: BuildId::new(),
-            response_id: Some("req_12345".to_string()),
-            include_chunks: false,
-            include_metrics: false,
+            specifier: specifier.clone(),
+            features: vec![],
         };
 
-        assert_eq!(query.response_id, Some("req_12345".to_string()));
+        assert_eq!(query.specifier, specifier);
+        assert!(query.features.is_empty());
     }
 
     #[test]
-    fn test_query_build_include_all() {
-        let query = QueryBuild {
-            build_id: BuildId::new(),
-            response_id: Some("req_full".to_string()),
-            include_chunks: true,
-            include_metrics: true,
-        };
-
-        assert!(query.include_chunks);
-        assert!(query.include_metrics);
-    }
-
-    #[test]
-    fn test_query_build_include_chunks_only() {
-        let query = QueryBuild {
-            build_id: BuildId::new(),
-            response_id: None,
-            include_chunks: true,
-            include_metrics: false,
-        };
-
-        assert!(query.include_chunks);
-        assert!(!query.include_metrics);
-    }
-
-    #[test]
-    fn test_query_build_include_metrics_only() {
-        let query = QueryBuild {
-            build_id: BuildId::new(),
-            response_id: None,
-            include_chunks: false,
-            include_metrics: true,
-        };
-
-        assert!(!query.include_chunks);
-        assert!(query.include_metrics);
-    }
-
-    #[test]
-    fn test_query_build_parsed_build_id() {
-        let build_id = BuildId::try_from("build_01HZQKR9VF8P6QXWM7YJDG2K4N".to_string())
-            .expect("Should parse valid BuildId");
+    fn test_query_build_multiple_features() {
+        let specifier = CrateSpecifier::from_str("tokio@1.35.0").unwrap();
+        let features = vec![
+            "full".to_string(),
+            "rt-multi-thread".to_string(),
+            "macros".to_string(),
+        ];
 
         let query = QueryBuild {
-            build_id: build_id.clone(),
-            response_id: None,
-            include_chunks: false,
-            include_metrics: false,
+            specifier: specifier.clone(),
+            features: features.clone(),
         };
 
-        assert_eq!(query.build_id.as_str(), "build_01HZQKR9VF8P6QXWM7YJDG2K4N");
+        assert_eq!(query.features.len(), 3);
+        assert!(query.features.contains(&"full".to_string()));
     }
 
     #[test]
     fn test_query_build_clone() {
         let original = QueryBuild {
-            build_id: BuildId::new(),
-            response_id: Some("req_clone".to_string()),
-            include_chunks: true,
-            include_metrics: false,
+            specifier: CrateSpecifier::from_str("axum@0.7.0").unwrap(),
+            features: vec!["json".to_string()],
         };
 
         let cloned = original.clone();
-        assert_eq!(original.build_id, cloned.build_id);
-        assert_eq!(original.response_id, cloned.response_id);
-        assert_eq!(original.include_chunks, cloned.include_chunks);
-        assert_eq!(original.include_metrics, cloned.include_metrics);
+        assert_eq!(original.specifier, cloned.specifier);
+        assert_eq!(original.features, cloned.features);
     }
 
     #[test]
@@ -184,67 +137,12 @@ mod tests {
     #[test]
     fn test_query_build_debug() {
         let query = QueryBuild {
-            build_id: BuildId::new(),
-            response_id: Some("req_debug".to_string()),
-            include_chunks: true,
-            include_metrics: true,
+            specifier: CrateSpecifier::from_str("test@1.0.0").unwrap(),
+            features: vec!["feature1".to_string()],
         };
 
         let debug_str = format!("{:?}", query);
         assert!(!debug_str.is_empty());
         assert!(debug_str.contains("QueryBuild"));
-    }
-
-    #[test]
-    fn test_query_build_various_response_ids() {
-        let response_ids = vec![
-            "req_001",
-            "query_abc123",
-            "correlation_uuid_xyz",
-            "build_query_42",
-        ];
-
-        for response_id in response_ids {
-            let query = QueryBuild {
-                build_id: BuildId::new(),
-                response_id: Some(response_id.to_string()),
-                include_chunks: false,
-                include_metrics: false,
-            };
-            assert_eq!(query.response_id, Some(response_id.to_string()));
-        }
-    }
-
-    #[test]
-    fn test_query_build_empty_response_id() {
-        let query = QueryBuild {
-            build_id: BuildId::new(),
-            response_id: Some(String::new()),
-            include_chunks: false,
-            include_metrics: false,
-        };
-
-        assert_eq!(query.response_id, Some(String::new()));
-    }
-
-    #[test]
-    fn test_query_build_flag_combinations() {
-        let combinations = vec![
-            (false, false),
-            (true, false),
-            (false, true),
-            (true, true),
-        ];
-
-        for (chunks, metrics) in combinations {
-            let query = QueryBuild {
-                build_id: BuildId::new(),
-                response_id: None,
-                include_chunks: chunks,
-                include_metrics: metrics,
-            };
-            assert_eq!(query.include_chunks, chunks);
-            assert_eq!(query.include_metrics, metrics);
-        }
     }
 }

@@ -24,8 +24,8 @@ use crate::messages::{
     CrateQueryResponse, CrateReceived, CrateSummary, DatabaseError, DatabaseReady, DocChunkData,
     DocChunkPersisted, DocChunksQueryResponse, DocumentationExtracted,
     DocumentationExtractionFailed, EmbeddingPersisted, EmbeddingsPersistenceComplete, ListCrates,
-    PersistCodeSample, PersistCrate, PersistDocChunk, PersistEmbedding, PrintWarning, QueryCrate,
-    QueryDocChunks, QuerySimilarDocs, SimilarDocsResponse,
+    PersistCodeSample, PersistCrate, PersistDocChunk, PersistEmbedding, PrintWarning, QueryBuild,
+    QueryCrate, QueryDocChunks, QuerySimilarDocs, SimilarDocsResponse,
 };
 
 #[cfg(test)]
@@ -871,6 +871,210 @@ impl DatabaseActor {
                             specifier: msg.specifier,
                             chunks: vec![],
                         }).await;
+                    }
+                }
+            })
+        });
+
+        // Handle QueryBuild - find build by crate + features using graph traversal
+        builder.mutate_on::<QueryBuild>(|agent, envelope| {
+            let msg = envelope.message().clone();
+            let db = agent.model.db.clone();
+            let broker = agent.broker().clone();
+
+            Box::pin(async move {
+                let name = msg.specifier.name().to_string();
+                let version = msg.specifier.version().to_string();
+
+                // Generate the BuildId that would have been created for this feature set
+                let build_id = BuildId::generate(&msg.specifier, &msg.features);
+                let build_id_str = build_id.as_str().to_string();
+
+                debug!(
+                    crate_name = %name,
+                    crate_version = %version,
+                    features = ?msg.features,
+                    build_id = %build_id_str,
+                    "Querying build by crate + features"
+                );
+
+                // Query build using the generated BuildId
+                let query = r#"
+                    SELECT
+                        build_id,
+                        status,
+                        created_at,
+                        updated_at,
+                        count(<-contains<-content_block) as chunk_count
+                    FROM build
+                    WHERE build_id = $build_id
+                    LIMIT 1
+                "#;
+
+                match db
+                    .query(query)
+                    .bind(("build_id", build_id_str.clone()))
+                    .await
+                {
+                    Ok(mut response) => {
+                        let result: Result<Option<serde_json::Value>, _> = response.take(0);
+                        match result {
+                            Ok(Some(build_record)) => {
+                                debug!("Found build: {:?}", build_record);
+
+                                // Extract fields
+                                let status = build_record
+                                    .get("status")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("unknown")
+                                    .to_string();
+                                let created_at = build_record
+                                    .get("created_at")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("")
+                                    .to_string();
+                                let updated_at = build_record
+                                    .get("updated_at")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("")
+                                    .to_string();
+                                let chunk_count = build_record
+                                    .get("chunk_count")
+                                    .and_then(|v| v.as_i64())
+                                    .unwrap_or(0);
+
+                                // Broadcast successful response
+                                broker
+                                    .broadcast(crate::messages::BuildQueryResponse {
+                                        specifier: msg.specifier.clone(),
+                                        features: msg.features.clone(),
+                                        build_info: Some(crate::messages::BuildInfo {
+                                            build_id: build_id.clone(),
+                                            features: msg.features.clone(),
+                                            feature_hash: String::new(), // TODO: compute if needed
+                                            status,
+                                            created_at,
+                                            updated_at,
+                                            chunk_count,
+                                        }),
+                                    })
+                                    .await;
+                            }
+                            Ok(None) => {
+                                debug!("No build found for {}@{} with features {:?}",
+                                    name, version, msg.features);
+
+                                // Broadcast not-found response
+                                broker
+                                    .broadcast(crate::messages::BuildQueryResponse {
+                                        specifier: msg.specifier.clone(),
+                                        features: msg.features.clone(),
+                                        build_info: None,
+                                    })
+                                    .await;
+                            }
+                            Err(e) => {
+                                error!("Failed to parse build query result: {}", e);
+                                broker
+                                    .broadcast(DatabaseError {
+                                        operation: format!(
+                                            "query build for {}@{} with features {:?}",
+                                            name, version, msg.features
+                                        ),
+                                        error: e.to_string(),
+                                    })
+                                    .await;
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        error!("Failed to query build: {}", e);
+                        broker
+                            .broadcast(DatabaseError {
+                                operation: format!(
+                                    "query build for {}@{} with features {:?}",
+                                    name, version, msg.features
+                                ),
+                                error: e.to_string(),
+                            })
+                            .await;
+                    }
+                }
+            })
+        });
+
+        // Handle QueryBuildChunks - retrieve chunks for a specific build using graph traversal
+        builder.act_on::<crate::messages::QueryBuildChunks>(|agent, envelope| {
+            let msg = envelope.message().clone();
+            let db = agent.model.db.clone();
+            let broker = agent.broker().clone();
+
+            Box::pin(async move {
+                let build_id_str = msg.build_id.as_str().to_string();
+
+                debug!(
+                    build_id = %build_id_str,
+                    "Querying chunks for build using graph traversal"
+                );
+
+                // Single-query graph traversal: get content_block nodes with edge metadata
+                let query = r#"
+                    LET $build_record_id = (SELECT id FROM build WHERE build_id = $build_id LIMIT 1).id;
+                    SELECT
+                        out.content_hash as content_hash,
+                        out.content as content,
+                        out.content_type as content_type,
+                        out.char_count as char_count,
+                        out.token_count as token_count,
+                        chunk_index,
+                        source_file
+                    FROM contains
+                    WHERE in = $build_record_id
+                    ORDER BY chunk_index ASC
+                "#;
+
+                match db
+                    .query(query)
+                    .bind(("build_id", build_id_str.clone()))
+                    .await
+                {
+                    Ok(mut response) => {
+                        let chunks_result: Result<Vec<crate::messages::BuildChunkData>, _> = response.take(1);
+
+                        match chunks_result {
+                            Ok(chunks) => {
+                                debug!(
+                                    build_id = %build_id_str,
+                                    chunk_count = chunks.len(),
+                                    "Retrieved chunks for build"
+                                );
+
+                                broker
+                                    .broadcast(crate::messages::BuildChunksQueryResponse {
+                                        build_id: msg.build_id.clone(),
+                                        chunks,
+                                    })
+                                    .await;
+                            }
+                            Err(e) => {
+                                error!("Failed to parse chunk query results: {}", e);
+                                broker
+                                    .broadcast(crate::messages::BuildChunksQueryResponse {
+                                        build_id: msg.build_id.clone(),
+                                        chunks: vec![],
+                                    })
+                                    .await;
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        error!("Failed to query build chunks: {}", e);
+                        broker
+                            .broadcast(crate::messages::BuildChunksQueryResponse {
+                                build_id: msg.build_id.clone(),
+                                chunks: vec![],
+                            })
+                            .await;
                     }
                 }
             })

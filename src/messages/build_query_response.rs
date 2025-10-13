@@ -1,110 +1,86 @@
-//! BuildQueryResponse - Response broadcast with build query results
+//! BuildQueryResponse - Response containing build information for a specific feature configuration
 //!
 //! This message is broadcast by DatabaseActor in response to QueryBuild requests,
-//! containing complete build information based on the query parameters.
+//! providing complete information about a build including its unique identifier,
+//! feature set, processing status, and timestamps.
 
 use crate::crate_specifier::CrateSpecifier;
 use crate::types::BuildId;
 use acton_reactive::prelude::*;
 use serde::{Deserialize, Serialize};
 
-/// Response broadcast containing build query results
+/// Response containing build information for a specific feature configuration
 ///
-/// This message is broadcast by DatabaseActor after processing a QueryBuild request.
-/// Multiple actors can subscribe to handle the response for different purposes
-/// (display, caching, analytics, etc.).
+/// This response provides complete information about a build, including its
+/// unique identifier, feature set, processing status, and timestamps. If the
+/// requested build does not exist, `build_info` will be None.
 ///
-/// # Response Pattern
+/// # None Response
 ///
-/// Following the pub/sub pattern:
-/// 1. DatabaseActor receives QueryBuild
-/// 2. DatabaseActor performs query
-/// 3. DatabaseActor broadcasts BuildQueryResponse
-/// 4. Multiple subscribers can react to the response
-///
-/// # Fields
-///
-/// * `response_id` - Correlation ID matching the query (if provided)
-/// * `build_id` - ID of the queried build
-/// * `found` - Whether the build was found in the database
-/// * `build_info` - Optional complete build information
+/// If `build_info` is None, no build exists for the requested crate +
+/// feature combination. The crate may exist but not have been built with
+/// those features.
 ///
 /// # Example
 ///
 /// ```no_run
 /// use crately::messages::{BuildQueryResponse, BuildInfo};
-/// use crately::types::BuildId;
 /// use crately::crate_specifier::CrateSpecifier;
 /// use std::str::FromStr;
 ///
-/// let response = BuildQueryResponse {
-///     response_id: Some("req_12345".to_string()),
-///     build_id: BuildId::new(),
-///     found: true,
-///     build_info: Some(BuildInfo {
-///         specifier: CrateSpecifier::from_str("serde@1.0.0").unwrap(),
-///         features: Some(vec!["derive".to_string()]),
-///         timestamp: 1704067200,
-///         chunk_count: 42,
-///         unique_content_count: 38,
-///         deduplication_rate: 0.095,
-///     }),
-/// };
-/// // broker.broadcast(response).await;
+/// # /*
+/// builder.act_on::<BuildQueryResponse>(|agent, envelope| {
+///     let response = envelope.message();
+///     if let Some(build) = &response.build_info {
+///         println!(
+///             "Build {} with features {:?} is {}",
+///             build.build_id,
+///             build.features,
+///             build.status
+///         );
+///     }
+///     AgentReply::immediate()
+/// });
+/// # */
 /// ```
-///
-/// # Message Flow
-///
-/// 1. DatabaseActor receives QueryBuild
-/// 2. DatabaseActor queries build by ID
-/// 3. If found and `include_chunks`, fetch chunk associations
-/// 4. If found and `include_metrics`, compute statistics
-/// 5. DatabaseActor broadcasts BuildQueryResponse
-/// 6. Subscribers handle response (UI update, cache, etc.)
-///
-/// # Subscribers
-///
-/// - **QueryRequester**: Original requester receives correlated response
-/// - **CacheActor**: Caches build info for future queries
-/// - **Console**: Displays build information to user
 #[acton_message]
 pub struct BuildQueryResponse {
-    /// Correlation ID matching the QueryBuild request (if provided)
-    pub response_id: Option<String>,
+    /// The crate identifier that was queried
+    pub specifier: CrateSpecifier,
 
-    /// ID of the queried build
-    pub build_id: BuildId,
+    /// The feature set that was queried
+    pub features: Vec<String>,
 
-    /// Whether the build was found in the database
-    pub found: bool,
-
-    /// Complete build information (if found)
+    /// Build information if found, None if no matching build exists
     pub build_info: Option<BuildInfo>,
 }
 
 /// Complete information about a build
 ///
-/// Contains all metadata, statistics, and associations for a documentation build.
+/// Provides all metadata about a specific build including its processing
+/// state and feature configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BuildInfo {
-    /// Crate name and version for this build
-    pub specifier: CrateSpecifier,
+    /// Unique build identifier (e.g., "build:serde_1_0_200_derive")
+    pub build_id: BuildId,
 
-    /// Optional list of enabled cargo features
-    pub features: Option<Vec<String>>,
+    /// Features enabled for this build
+    pub features: Vec<String>,
 
-    /// Unix timestamp when build started
-    pub timestamp: i64,
+    /// Content hash of feature set (for deduplication)
+    pub feature_hash: String,
 
-    /// Total number of chunks in this build
-    pub chunk_count: usize,
+    /// Processing status (pending, chunked, vectorized, complete, failed)
+    pub status: String,
 
-    /// Number of unique content nodes (after deduplication)
-    pub unique_content_count: usize,
+    /// When this build was created
+    pub created_at: String,
 
-    /// Deduplication rate (0.0 = no deduplication, 1.0 = all duplicates)
-    /// Calculated as: (chunk_count - unique_content_count) / chunk_count
-    pub deduplication_rate: f64,
+    /// Last status update timestamp
+    pub updated_at: String,
+
+    /// Number of content blocks in this build
+    pub chunk_count: i64,
 }
 
 #[cfg(test)]
@@ -114,149 +90,106 @@ mod tests {
 
     fn create_test_build_info() -> BuildInfo {
         BuildInfo {
-            specifier: CrateSpecifier::from_str("serde@1.0.0").unwrap(),
-            features: Some(vec!["derive".to_string()]),
-            timestamp: 1704067200,
-            chunk_count: 100,
-            unique_content_count: 85,
-            deduplication_rate: 0.15,
+            build_id: BuildId::from_str("build_abc123def456abc123def456abc12345").unwrap(),
+            features: vec!["derive".to_string()],
+            feature_hash: "feature_hash_abc123".to_string(),
+            status: "complete".to_string(),
+            created_at: "2025-01-01T00:00:00Z".to_string(),
+            updated_at: "2025-01-01T01:00:00Z".to_string(),
+            chunk_count: 42,
         }
     }
 
     #[test]
     fn test_build_query_response_found() {
-        let build_id = BuildId::new();
+        let specifier = CrateSpecifier::from_str("serde@1.0.200").unwrap();
+        let features = vec!["derive".to_string()];
         let build_info = create_test_build_info();
 
         let response = BuildQueryResponse {
-            response_id: Some("req_001".to_string()),
-            build_id: build_id.clone(),
-            found: true,
+            specifier: specifier.clone(),
+            features: features.clone(),
             build_info: Some(build_info.clone()),
         };
 
-        assert_eq!(response.response_id, Some("req_001".to_string()));
-        assert_eq!(response.build_id, build_id);
-        assert!(response.found);
+        assert_eq!(response.specifier, specifier);
+        assert_eq!(response.features, features);
         assert!(response.build_info.is_some());
     }
 
     #[test]
     fn test_build_query_response_not_found() {
-        let build_id = BuildId::new();
+        let specifier = CrateSpecifier::from_str("tokio@1.35.0").unwrap();
+        let features = vec!["full".to_string()];
 
         let response = BuildQueryResponse {
-            response_id: Some("req_002".to_string()),
-            build_id: build_id.clone(),
-            found: false,
+            specifier: specifier.clone(),
+            features: features.clone(),
             build_info: None,
         };
 
-        assert!(!response.found);
         assert!(response.build_info.is_none());
     }
 
     #[test]
-    fn test_build_query_response_no_correlation_id() {
-        let response = BuildQueryResponse {
-            response_id: None,
-            build_id: BuildId::new(),
-            found: true,
-            build_info: Some(create_test_build_info()),
-        };
+    fn test_build_info_all_fields() {
+        let info = create_test_build_info();
 
-        assert!(response.response_id.is_none());
-    }
-
-    #[test]
-    fn test_build_info_deduplication_rate() {
-        let info = BuildInfo {
-            specifier: CrateSpecifier::from_str("tokio@1.35.0").unwrap(),
-            features: None,
-            timestamp: 1704067200,
-            chunk_count: 50,
-            unique_content_count: 40,
-            deduplication_rate: 0.20, // (50 - 40) / 50 = 0.20
-        };
-
-        assert_eq!(info.chunk_count, 50);
-        assert_eq!(info.unique_content_count, 40);
-        assert!((info.deduplication_rate - 0.20).abs() < 0.001);
-    }
-
-    #[test]
-    fn test_build_info_no_deduplication() {
-        let info = BuildInfo {
-            specifier: CrateSpecifier::from_str("axum@0.7.0").unwrap(),
-            features: Some(vec!["json".to_string()]),
-            timestamp: 1704067200,
-            chunk_count: 30,
-            unique_content_count: 30,
-            deduplication_rate: 0.0,
-        };
-
-        assert_eq!(info.chunk_count, info.unique_content_count);
-        assert_eq!(info.deduplication_rate, 0.0);
-    }
-
-    #[test]
-    fn test_build_info_high_deduplication() {
-        let info = BuildInfo {
-            specifier: CrateSpecifier::from_str("test@1.0.0").unwrap(),
-            features: None,
-            timestamp: 1704067200,
-            chunk_count: 100,
-            unique_content_count: 10,
-            deduplication_rate: 0.90,
-        };
-
-        assert_eq!(info.chunk_count, 100);
-        assert_eq!(info.unique_content_count, 10);
-        assert!((info.deduplication_rate - 0.90).abs() < 0.001);
-    }
-
-    #[test]
-    fn test_build_info_with_features() {
-        let features = vec!["tokio".to_string(), "json".to_string(), "macros".to_string()];
-        let info = BuildInfo {
-            specifier: CrateSpecifier::from_str("axum@0.7.0").unwrap(),
-            features: Some(features.clone()),
-            timestamp: 1704067200,
-            chunk_count: 75,
-            unique_content_count: 70,
-            deduplication_rate: 0.067,
-        };
-
-        assert_eq!(info.features, Some(features));
+        assert!(!info.build_id.as_str().is_empty());
+        assert_eq!(info.features, vec!["derive".to_string()]);
+        assert_eq!(info.feature_hash, "feature_hash_abc123");
+        assert_eq!(info.status, "complete");
+        assert_eq!(info.chunk_count, 42);
     }
 
     #[test]
     fn test_build_info_no_features() {
         let info = BuildInfo {
-            specifier: CrateSpecifier::from_str("anyhow@1.0.0").unwrap(),
-            features: None,
-            timestamp: 1704067200,
-            chunk_count: 20,
-            unique_content_count: 18,
-            deduplication_rate: 0.10,
+            build_id: BuildId::from_str("build_def456abc123def456abc123def45678").unwrap(),
+            features: vec![],
+            feature_hash: "empty_hash".to_string(),
+            status: "pending".to_string(),
+            created_at: "2025-01-01T00:00:00Z".to_string(),
+            updated_at: "2025-01-01T00:00:00Z".to_string(),
+            chunk_count: 0,
         };
 
-        assert!(info.features.is_none());
+        assert!(info.features.is_empty());
+        assert_eq!(info.chunk_count, 0);
+    }
+
+    #[test]
+    fn test_build_info_multiple_features() {
+        let features = vec![
+            "tokio".to_string(),
+            "json".to_string(),
+            "macros".to_string(),
+        ];
+        let info = BuildInfo {
+            build_id: BuildId::from_str("build_a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4").unwrap(),
+            features: features.clone(),
+            feature_hash: "multi_feature_hash".to_string(),
+            status: "complete".to_string(),
+            created_at: "2025-01-01T00:00:00Z".to_string(),
+            updated_at: "2025-01-01T01:30:00Z".to_string(),
+            chunk_count: 150,
+        };
+
+        assert_eq!(info.features, features);
+        assert_eq!(info.chunk_count, 150);
     }
 
     #[test]
     fn test_build_query_response_clone() {
         let original = BuildQueryResponse {
-            response_id: Some("req_clone".to_string()),
-            build_id: BuildId::new(),
-            found: true,
+            specifier: CrateSpecifier::from_str("axum@0.7.0").unwrap(),
+            features: vec!["json".to_string()],
             build_info: Some(create_test_build_info()),
         };
 
         let cloned = original.clone();
-        assert_eq!(original.response_id, cloned.response_id);
-        assert_eq!(original.build_id, cloned.build_id);
-        assert_eq!(original.found, cloned.found);
+        assert_eq!(original.specifier, cloned.specifier);
+        assert_eq!(original.features, cloned.features);
     }
 
     #[test]
@@ -270,9 +203,8 @@ mod tests {
     #[test]
     fn test_build_query_response_debug() {
         let response = BuildQueryResponse {
-            response_id: Some("req_debug".to_string()),
-            build_id: BuildId::new(),
-            found: true,
+            specifier: CrateSpecifier::from_str("test@1.0.0").unwrap(),
+            features: vec![],
             build_info: Some(create_test_build_info()),
         };
 
@@ -287,9 +219,9 @@ mod tests {
         let json = serde_json::to_string(&original).expect("Should serialize");
         let deserialized: BuildInfo = serde_json::from_str(&json).expect("Should deserialize");
 
-        assert_eq!(original.specifier, deserialized.specifier);
+        assert_eq!(original.build_id, deserialized.build_id);
+        assert_eq!(original.features, deserialized.features);
         assert_eq!(original.chunk_count, deserialized.chunk_count);
-        assert_eq!(original.unique_content_count, deserialized.unique_content_count);
     }
 
     #[test]
@@ -297,8 +229,8 @@ mod tests {
         let original = create_test_build_info();
         let cloned = original.clone();
 
-        assert_eq!(original.specifier, cloned.specifier);
+        assert_eq!(original.build_id, cloned.build_id);
+        assert_eq!(original.status, cloned.status);
         assert_eq!(original.chunk_count, cloned.chunk_count);
-        assert_eq!(original.deduplication_rate, cloned.deduplication_rate);
     }
 }

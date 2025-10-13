@@ -87,6 +87,7 @@
 //! pub use download::Download;
 //! ```
 
+mod build_chunks_query_response;
 mod build_created;
 mod build_query_response;
 mod check_processing_timeouts;
@@ -135,6 +136,7 @@ mod print_warning;
 mod stop_spinner;
 mod update_spinner;
 mod query_build;
+mod query_build_chunks;
 mod query_crate;
 mod query_doc_chunks;
 mod query_similar_docs;
@@ -147,6 +149,7 @@ mod start_server;
 mod stop_keyboard_handler;
 mod stop_server;
 
+pub use build_chunks_query_response::{BuildChunkData, BuildChunksQueryResponse};
 pub use build_created::BuildCreated;
 pub use build_query_response::{BuildInfo, BuildQueryResponse};
 pub use check_processing_timeouts::CheckProcessingTimeouts;
@@ -195,6 +198,7 @@ pub use print_warning::PrintWarning;
 pub use stop_spinner::StopSpinner;
 pub use update_spinner::UpdateSpinner;
 pub use query_build::QueryBuild;
+pub use query_build_chunks::QueryBuildChunks;
 pub use query_crate::QueryCrate;
 pub use query_doc_chunks::QueryDocChunks;
 pub use query_similar_docs::QuerySimilarDocs;
