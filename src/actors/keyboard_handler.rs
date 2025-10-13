@@ -31,7 +31,7 @@ use is_terminal::IsTerminal;
 use std::io::stdin;
 use std::sync::Arc;
 use tokio::sync::mpsc;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::messages::{KeyPressed, KeyboardHandlerStarted, SetRawMode, StopKeyboardHandler};
 
@@ -222,7 +222,7 @@ impl KeyboardHandler {
                     tokio::select! {
                         // Check for stop signal
                         _ = stop_rx.recv() => {
-                            info!("Stop received");
+                            debug!("Stop received");
                             break;
                         }
                         // Read keyboard events
@@ -236,7 +236,7 @@ impl KeyboardHandler {
                                             modifiers: key_event.modifiers,
                                         };
 
-                                        info!("Key pressed");
+                                        debug!("Key pressed");
                                         broker.broadcast(message).await;
                                     }
                                 }
