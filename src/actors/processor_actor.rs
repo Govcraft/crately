@@ -161,6 +161,7 @@ impl ProcessorActor {
                                     content,
                                     source_file,
                                     metadata,
+                                    features: Some(msg.features.clone()),
                                 })
                                 .await;
                         }

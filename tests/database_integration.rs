@@ -401,6 +401,7 @@ async fn test_persist_and_retrieve_documentation_chunks() {
                     content: format!("This is documentation chunk {} for serde", i),
                     source_file: format!("src/module{}.rs", i),
                     metadata,
+                    features: None,
                 })
                 .await;
 
@@ -461,6 +462,7 @@ async fn test_chunk_metadata_accuracy() {
                 content: "Runtime struct provides the async runtime environment".to_string(),
                 source_file: "src/runtime/mod.rs".to_string(),
                 metadata,
+                    features: None,
             })
             .await;
 
@@ -579,6 +581,7 @@ async fn test_vector_search_accuracy_and_ranking() {
                     content: format!("Async runtime documentation for {}", specifier.name()),
                     source_file: "src/lib.rs".to_string(),
                     metadata,
+                    features: None,
                 })
                 .await;
 
@@ -712,6 +715,7 @@ async fn test_vector_search_with_crate_filter() {
                     content: format!("Documentation for {}", specifier.name()),
                     source_file: "src/lib.rs".to_string(),
                     metadata,
+                    features: None,
                 })
                 .await;
 
@@ -836,6 +840,7 @@ async fn test_vector_search_limit_parameter() {
                     content: format!("Documentation chunk {}", i),
                     source_file: format!("src/module{}.rs", i),
                     metadata,
+                    features: None,
                 })
                 .await;
 
@@ -948,6 +953,7 @@ async fn test_error_handling_invalid_crate_reference() {
                 content: "Test content".to_string(),
                 source_file: "src/lib.rs".to_string(),
                 metadata,
+                    features: None,
             })
             .await;
 
@@ -1113,6 +1119,7 @@ async fn test_recovery_after_database_error() {
                 content: "Test".to_string(),
                 source_file: "src/lib.rs".to_string(),
                 metadata,
+                    features: None,
             })
             .await;
 

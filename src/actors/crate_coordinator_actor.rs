@@ -380,14 +380,14 @@ impl CrateCoordinatorActor {
             // Extract state data and update it, then drop the mutable borrow
             let broadcast_data = if let Some(state) = agent.model.processing_states.get_mut(specifier) {
                 // Track this chunk as persisted (idempotency via HashSet)
-                state.persisted_chunks.insert(msg.chunk_id.clone());
+                state.persisted_chunks.insert(msg.content_hash.clone());
 
                 let persisted_count = state.persisted_chunks.len() as u32;
                 let expected_count = state.expected_chunks.unwrap_or(0);
 
                 debug!(
                     specifier = %specifier,
-                    chunk_id = %msg.chunk_id,
+                    content_hash = %msg.content_hash,
                     source_file = %msg.source_file,
                     persisted = persisted_count,
                     expected = expected_count,
@@ -890,9 +890,9 @@ mod tests {
         for i in 0..3 {
             handle
                 .send(DocChunkPersisted {
-                    chunk_id: format!("test-crate_1_0_0_{:03}", i),
+                    content_hash: format!("test_hash_{:064x}", i),
                     specifier: specifier.clone(),
-                    chunk_index: i,
+                    chunk_index: i as usize,
                     source_file: "src/lib.rs".to_string(),
                 })
                 .await;
@@ -1000,11 +1000,11 @@ mod tests {
 
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
-        // Send duplicate chunk_id - should be idempotent
+        // Send duplicate content_hash - should be idempotent
         for _ in 0..3 {
             handle
                 .send(DocChunkPersisted {
-                    chunk_id: "test-crate_1_0_0_000".to_string(),
+                    content_hash: "test_hash_0000000000000000000000000000000000000000000000000000000000000000".to_string(),
                     specifier: specifier.clone(),
                     chunk_index: 0,
                     source_file: "src/lib.rs".to_string(),
@@ -1016,7 +1016,7 @@ mod tests {
         // Send second chunk
         handle
             .send(DocChunkPersisted {
-                chunk_id: "test-crate_1_0_0_001".to_string(),
+                content_hash: "test_hash_0000000000000000000000000000000000000000000000000000000000000001".to_string(),
                 specifier: specifier.clone(),
                 chunk_index: 1,
                 source_file: "src/module.rs".to_string(),

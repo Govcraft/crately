@@ -44,6 +44,7 @@ use acton_reactive::prelude::*;
 ///     content: "Serde is a framework for serializing and deserializing...".to_string(),
 ///     source_file: "src/lib.rs".to_string(),
 ///     metadata,
+///     features: None,
 /// };
 ///
 /// assert_eq!(msg.chunk_index, 0);
@@ -68,6 +69,9 @@ pub struct PersistDocChunk {
 
     /// Additional metadata about the chunk
     pub metadata: ChunkMetadata,
+
+    /// Optional feature flags enabled for this build
+    pub features: Option<Vec<String>>,
 }
 
 #[cfg(test)]
@@ -100,6 +104,7 @@ mod tests {
             content: "Tokio runtime documentation...".to_string(),
             source_file: "src/runtime/mod.rs".to_string(),
             metadata: metadata.clone(),
+            features: None,
         };
 
         assert_eq!(msg.specifier, specifier);
@@ -128,6 +133,7 @@ mod tests {
                 item_type: Some("crate".to_string()),
                 item_name: Some("axum".to_string()),
             },
+            features: None,
         };
 
         assert_eq!(msg.chunk_index, 0);
@@ -152,6 +158,7 @@ mod tests {
                 item_type: Some("impl".to_string()),
                 item_name: Some("Serializer".to_string()),
             },
+            features: None,
         };
 
         assert_eq!(msg.metadata.start_line, Some(42));
@@ -167,6 +174,7 @@ mod tests {
             content: "Tracing subscriber documentation...".to_string(),
             source_file: "src/subscriber.rs".to_string(),
             metadata: create_test_metadata(),
+            features: None,
         };
 
         let cloned = msg.clone();

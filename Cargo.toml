@@ -42,6 +42,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 xdg = { version = "3.0.0", features = ["serde"] }
 anyhow = "1.0.100"
 blake3 = "1.5"
+hex = "0.4"
 thiserror = "2.0.17"
 ulid = "1.1"
 is-terminal = "0.4"

@@ -1395,7 +1395,7 @@ impl DatabaseActor {
             })
         });
 
-        // Handle PersistDocChunk - upsert documentation chunk (idempotent)
+        // Handle PersistDocChunk - content-addressed chunk storage with deduplication
         builder.mutate_on::<PersistDocChunk>(|agent, envelope| {
             let msg = envelope.message().clone();
             let db = agent.model.db.clone();
@@ -1406,135 +1406,308 @@ impl DatabaseActor {
                 let name = msg.specifier.name().to_string();
                 let version = msg.specifier.version().to_string();
 
-                // First, get the crate record ID
-                let crate_query = "SELECT id FROM crate WHERE name = $name AND version = $version";
+                // ====================================================================
+                // Step 1: Compute Content Hash (BLAKE3)
+                // ====================================================================
 
-                match db
-                    .query(crate_query)
+                let mut hasher = blake3::Hasher::new();
+                hasher.update(msg.content.as_bytes());
+                let hash_bytes = hasher.finalize();
+                let content_hash = hex::encode(hash_bytes.as_bytes());
+
+                trace!(
+                    content_hash = %content_hash,
+                    content_len = msg.content.len(),
+                    specifier = %format!("{}@{}", name, version),
+                    "Computed BLAKE3 hash for doc chunk"
+                );
+
+                // Broadcast ChunkHashComputed event
+                broker
+                    .broadcast(ChunkHashComputed {
+                        specifier: msg.specifier.clone(),
+                        chunk_index: msg.chunk_index,
+                        content_hash: content_hash.clone(),
+                        source_file: msg.source_file.clone(),
+                    })
+                    .await;
+
+                // ====================================================================
+                // Step 2: Get Crate Record ID
+                // ====================================================================
+
+                let crate_db_id = match db
+                    .query("SELECT id FROM crate WHERE name = $name AND version = $version")
                     .bind(("name", name.clone()))
                     .bind(("version", version.clone()))
                     .await
                 {
+                    Ok(mut response) => match response.take::<Option<CrateIdRecord>>(0) {
+                        Ok(Some(record)) => record.thing().clone(),
+                        Ok(None) => {
+                            error!("Crate not found for chunk: {}@{}", name, version);
+                            broker
+                                .broadcast(DatabaseError {
+                                    operation: format!("persist doc chunk {}", content_hash),
+                                    error: format!(
+                                        "Crate {}@{} not found in database",
+                                        name, version
+                                    ),
+                                })
+                                .await;
+                            return;
+                        }
+                        Err(e) => {
+                            error!("Failed to parse crate lookup result: {}", e);
+                            broker
+                                .broadcast(DatabaseError {
+                                    operation: format!("persist doc chunk {}", content_hash),
+                                    error: e.to_string(),
+                                })
+                                .await;
+                            return;
+                        }
+                    },
+                    Err(e) => {
+                        error!("Failed to lookup crate for chunk persistence: {}", e);
+                        broker
+                            .broadcast(DatabaseError {
+                                operation: format!("persist doc chunk {}", content_hash),
+                                error: e.to_string(),
+                            })
+                            .await;
+                        return;
+                    }
+                };
+
+                // ====================================================================
+                // Step 3: Upsert Doc Chunk (Content-Addressed)
+                // ====================================================================
+
+                // Query for existing chunk by content_hash
+                let dedup_query =
+                    "SELECT id, reference_count FROM doc_chunk WHERE content_hash = $content_hash";
+
+                let (chunk_db_id, is_new_chunk) = match db
+                    .query(dedup_query)
+                    .bind(("content_hash", content_hash.clone()))
+                    .await
+                {
                     Ok(mut response) => {
-                        let crate_record: Result<Option<CrateIdRecord>, _> = response.take(0);
+                        match response.take::<Option<serde_json::Value>>(0) {
+                            Ok(Some(existing)) => {
+                                // Chunk exists - extract ID and increment reference count
+                                let chunk_id_str = existing
+                                    .get("id")
+                                    .and_then(|v| v.as_str())
+                                    .ok_or_else(|| {
+                                        anyhow::anyhow!("Missing id field in doc_chunk record")
+                                    });
 
-                        match crate_record {
-                            Ok(Some(record)) => {
-                                let id = record.thing();
-                                // Upsert pattern: Try UPDATE first, then INSERT if no rows affected
-                                let update_query = r#"
-                                        UPDATE doc_chunk SET
-                                            content = $content,
-                                            source_file = $source_file,
-                                            content_type = $content_type,
-                                            token_count = $token_count,
-                                            char_count = $char_count,
-                                            start_line = $start_line,
-                                            end_line = $end_line,
-                                            parent_module = $parent_module,
-                                            item_type = $item_type,
-                                            item_name = $item_name,
-                                            vectorized = false,
-                                            vectorized_at = NONE
-                                        WHERE chunk_id = $chunk_id
-                                        RETURN BEFORE
-                                    "#;
+                                let chunk_id_str = match chunk_id_str {
+                                    Ok(id) => id,
+                                    Err(e) => {
+                                        error!("Failed to extract chunk ID: {}", e);
+                                        broker
+                                            .broadcast(DatabaseError {
+                                                operation: format!(
+                                                    "persist doc chunk {}",
+                                                    content_hash
+                                                ),
+                                                error: e.to_string(),
+                                            })
+                                            .await;
+                                        return;
+                                    }
+                                };
 
-                                let update_result = db
-                                    .query(update_query)
-                                    .bind(("chunk_id", msg.chunk_id.clone()))
+                                let chunk_thing = match surrealdb::sql::thing(chunk_id_str) {
+                                    Ok(thing) => thing,
+                                    Err(e) => {
+                                        error!(
+                                            "Failed to parse chunk ID '{}': {}",
+                                            chunk_id_str, e
+                                        );
+                                        broker
+                                            .broadcast(DatabaseError {
+                                                operation: format!(
+                                                    "persist doc chunk {}",
+                                                    content_hash
+                                                ),
+                                                error: format!("Invalid chunk ID: {}", e),
+                                            })
+                                            .await;
+                                        return;
+                                    }
+                                };
+
+                                debug!(
+                                    "Reusing existing chunk {} for {}@{} (deduplication)",
+                                    content_hash, name, version
+                                );
+
+                                // Increment reference count atomically
+                                let increment_query = r#"
+                                    UPDATE doc_chunk SET
+                                        reference_count = reference_count + 1,
+                                        last_referenced_at = time::now()
+                                    WHERE id = $chunk_id
+                                "#;
+
+                                if let Err(e) = db
+                                    .query(increment_query)
+                                    .bind(("chunk_id", chunk_thing.clone()))
+                                    .await
+                                {
+                                    error!("Failed to increment reference count: {}", e);
+                                    // Non-fatal - continue with relationship creation
+                                }
+
+                                (chunk_thing, false)
+                            }
+                            Ok(None) => {
+                                // Chunk doesn't exist - insert new record
+                                trace!("Chunk {} does not exist, inserting new record", content_hash);
+
+                                let insert_query = r#"
+                                    CREATE doc_chunk CONTENT {
+                                        content_hash: $content_hash,
+                                        content: $content,
+                                        content_type: $content_type,
+                                        token_count: $token_count,
+                                        char_count: $char_count
+                                    } RETURN id
+                                "#;
+
+                                match db
+                                    .query(insert_query)
+                                    .bind(("content_hash", content_hash.clone()))
                                     .bind(("content", msg.content.clone()))
-                                    .bind(("source_file", msg.source_file.clone()))
                                     .bind(("content_type", msg.metadata.content_type.clone()))
                                     .bind(("token_count", msg.metadata.token_count as i64))
                                     .bind(("char_count", msg.metadata.char_count as i64))
-                                    .bind(("start_line", msg.metadata.start_line.map(|n| n as i64)))
-                                    .bind(("end_line", msg.metadata.end_line.map(|n| n as i64)))
-                                    .bind(("parent_module", msg.metadata.parent_module.clone()))
-                                    .bind(("item_type", msg.metadata.item_type.clone()))
-                                    .bind(("item_name", msg.metadata.item_name.clone()))
-                                    .await;
-
-                                // Check if update affected any rows
-                                let needs_insert = match update_result {
-                                    Ok(mut response) => {
-                                        // Check if any rows were returned (indicating update succeeded)
-                                        let rows: Result<Vec<serde_json::Value>, _> =
-                                            response.take(0);
-                                        match rows {
-                                            Ok(rows) if !rows.is_empty() => {
-                                                debug!(
-                                                    "Updated existing doc chunk {} for {}@{}",
-                                                    msg.chunk_id, name, version
-                                                );
-                                                trace!(
-                                                    chunk_id = %msg.chunk_id,
-                                                    specifier = %format!("{}@{}", name, version),
-                                                    source_file = %msg.source_file,
-                                                    chunk_index = msg.chunk_index,
-                                                    "Doc chunk updated in database"
-                                                );
-                                                false
-                                            }
-                                            _ => true, // No rows returned, need to insert
-                                        }
-                                    }
-                                    Err(_) => true, // Update failed, try insert
-                                };
-
-                                if needs_insert {
-                                    // No existing record, insert new one
-                                    let insert_query = r#"
-                                            CREATE doc_chunk CONTENT {
-                                                crate_id: $crate_id,
-                                                chunk_index: $chunk_index,
-                                                chunk_id: $chunk_id,
-                                                content: $content,
-                                                source_file: $source_file,
-                                                content_type: $content_type,
-                                                token_count: $token_count,
-                                                char_count: $char_count,
-                                                start_line: $start_line,
-                                                end_line: $end_line,
-                                                parent_module: $parent_module,
-                                                item_type: $item_type,
-                                                item_name: $item_name
-                                            }
-                                        "#;
-
-                                    match db
-                                        .query(insert_query)
-                                        .bind(("crate_id", id.clone()))
-                                        .bind(("chunk_index", msg.chunk_index as i64))
-                                        .bind(("chunk_id", msg.chunk_id.clone()))
-                                        .bind(("content", msg.content.clone()))
-                                        .bind(("source_file", msg.source_file.clone()))
-                                        .bind(("content_type", msg.metadata.content_type.clone()))
-                                        .bind(("token_count", msg.metadata.token_count as i64))
-                                        .bind(("char_count", msg.metadata.char_count as i64))
-                                        .bind((
-                                            "start_line",
-                                            msg.metadata.start_line.map(|n| n as i64),
-                                        ))
-                                        .bind(("end_line", msg.metadata.end_line.map(|n| n as i64)))
-                                        .bind(("parent_module", msg.metadata.parent_module.clone()))
-                                        .bind(("item_type", msg.metadata.item_type.clone()))
-                                        .bind(("item_name", msg.metadata.item_name.clone()))
-                                        .await
+                                    .await
+                                {
+                                    Ok(mut resp) => match resp.take::<Option<DocChunkIdRecord>>(0)
                                     {
-                                        Ok(_) => {
+                                        Ok(Some(rec)) => {
                                             debug!(
-                                                "Inserted new doc chunk {} for {}@{}",
-                                                msg.chunk_id, name, version
+                                                "Inserted new chunk {} for {}@{} ({} chars, {} tokens)",
+                                                content_hash,
+                                                name,
+                                                version,
+                                                msg.metadata.char_count,
+                                                msg.metadata.token_count
                                             );
+                                            (rec.thing().clone(), true)
                                         }
-                                        Err(e) => {
-                                            error!("Failed to insert doc chunk: {}", e);
+                                        Ok(None) => {
+                                            error!("Insert succeeded but no ID returned");
                                             broker
                                                 .broadcast(DatabaseError {
                                                     operation: format!(
-                                                        "persist doc chunk {}",
-                                                        msg.chunk_id
+                                                        "insert doc chunk {}",
+                                                        content_hash
+                                                    ),
+                                                    error: "Insert succeeded but no ID returned"
+                                                        .to_string(),
+                                                })
+                                                .await;
+                                            return;
+                                        }
+                                        Err(e) => {
+                                            error!("Failed to parse insert result: {}", e);
+                                            broker
+                                                .broadcast(DatabaseError {
+                                                    operation: format!(
+                                                        "insert doc chunk {}",
+                                                        content_hash
+                                                    ),
+                                                    error: e.to_string(),
+                                                })
+                                                .await;
+                                            return;
+                                        }
+                                    },
+                                    Err(e) => {
+                                        // Check for race condition (concurrent insert)
+                                        let error_str = e.to_string();
+                                        if error_str.contains("UNIQUE")
+                                            || error_str.contains("duplicate")
+                                        {
+                                            debug!(
+                                                "Concurrent insert detected for chunk {}, retrying query",
+                                                content_hash
+                                            );
+
+                                            // Another process inserted it - query for the ID
+                                            match db
+                                                .query(dedup_query)
+                                                .bind(("content_hash", content_hash.clone()))
+                                                .await
+                                            {
+                                                Ok(mut resp) => {
+                                                    match resp.take::<Option<serde_json::Value>>(0)
+                                                    {
+                                                        Ok(Some(existing)) => {
+                                                            let chunk_id_str = existing
+                                                                .get("id")
+                                                                .and_then(|v| v.as_str())
+                                                                .ok_or_else(|| {
+                                                                    anyhow::anyhow!(
+                                                                        "Missing id field"
+                                                                    )
+                                                                });
+
+                                                            let chunk_id_str = match chunk_id_str {
+                                                                Ok(id) => id,
+                                                                Err(e) => {
+                                                                    error!(
+                                                                        "Failed to extract chunk ID after retry: {}",
+                                                                        e
+                                                                    );
+                                                                    return;
+                                                                }
+                                                            };
+
+                                                            match surrealdb::sql::thing(
+                                                                chunk_id_str,
+                                                            ) {
+                                                                Ok(thing) => (thing, false),
+                                                                Err(e) => {
+                                                                    error!(
+                                                                        "Failed to parse chunk ID after retry: {}",
+                                                                        e
+                                                                    );
+                                                                    return;
+                                                                }
+                                                            }
+                                                        }
+                                                        Ok(None) => {
+                                                            error!("Chunk still not found after concurrent insert");
+                                                            return;
+                                                        }
+                                                        Err(e) => {
+                                                            error!("Failed to query after concurrent insert: {}", e);
+                                                            return;
+                                                        }
+                                                    }
+                                                }
+                                                Err(e) => {
+                                                    error!(
+                                                        "Failed to retry after concurrent insert: {}",
+                                                        e
+                                                    );
+                                                    return;
+                                                }
+                                            }
+                                        } else {
+                                            error!("Failed to insert chunk: {}", e);
+                                            broker
+                                                .broadcast(DatabaseError {
+                                                    operation: format!(
+                                                        "insert doc chunk {}",
+                                                        content_hash
                                                     ),
                                                     error: e.to_string(),
                                                 })
@@ -1543,50 +1716,295 @@ impl DatabaseActor {
                                         }
                                     }
                                 }
-
-                                // Broadcast acknowledgment for completion tracking
-                                broker
-                                    .broadcast(DocChunkPersisted {
-                                        chunk_id: msg.chunk_id.clone(),
-                                        specifier: msg.specifier.clone(),
-                                        chunk_index: msg.chunk_index,
-                                        source_file: msg.source_file.clone(),
-                                    })
-                                    .await;
-                            }
-                            Ok(None) => {
-                                error!("Crate not found for chunk: {}@{}", name, version);
-                                broker
-                                    .broadcast(DatabaseError {
-                                        operation: format!("persist doc chunk {}", msg.chunk_id),
-                                        error: format!(
-                                            "Crate {}@{} not found in database",
-                                            name, version
-                                        ),
-                                    })
-                                    .await;
                             }
                             Err(e) => {
-                                error!("Failed to parse crate lookup result: {}", e);
+                                error!("Failed to parse deduplication query result: {}", e);
                                 broker
                                     .broadcast(DatabaseError {
-                                        operation: format!("persist doc chunk {}", msg.chunk_id),
+                                        operation: format!("persist doc chunk {}", content_hash),
                                         error: e.to_string(),
                                     })
                                     .await;
+                                return;
                             }
                         }
                     }
                     Err(e) => {
-                        error!("Failed to lookup crate for chunk persistence: {}", e);
+                        error!("Failed to query for existing chunk: {}", e);
                         broker
                             .broadcast(DatabaseError {
-                                operation: format!("persist doc chunk {}", msg.chunk_id),
+                                operation: format!("persist doc chunk {}", content_hash),
                                 error: e.to_string(),
                             })
                             .await;
+                        return;
+                    }
+                };
+
+                // Broadcast ChunkDeduplicated if we reused an existing chunk
+                if !is_new_chunk {
+                    // Count how many builds reference this chunk
+                    let count_query =
+                        "SELECT count() FROM contains WHERE out = $chunk_id GROUP ALL";
+                    let reuse_count = match db
+                        .query(count_query)
+                        .bind(("chunk_id", chunk_db_id.clone()))
+                        .await
+                    {
+                        Ok(mut resp) => match resp.take::<Option<serde_json::Value>>(0) {
+                            Ok(Some(val)) => val
+                                .get("count")
+                                .and_then(|v| v.as_u64())
+                                .unwrap_or(1) as usize,
+                            _ => 1,
+                        },
+                        Err(_) => 1,
+                    };
+
+                    broker
+                        .broadcast(ChunkDeduplicated {
+                            specifier: msg.specifier.clone(),
+                            content_hash: content_hash.clone(),
+                            reuse_count,
+                        })
+                        .await;
+                }
+
+                // ====================================================================
+                // Step 4: Get or Create Build Record
+                // ====================================================================
+
+                // Compute features hash for deterministic build identification
+                let mut features_sorted = msg.features.clone().unwrap_or_default();
+                features_sorted.sort();
+                let features_json = serde_json::to_string(&features_sorted)
+                    .unwrap_or_else(|_| "[]".to_string());
+
+                let mut features_hasher = blake3::Hasher::new();
+                features_hasher.update(features_json.as_bytes());
+                let features_hash_bytes = features_hasher.finalize();
+                let build_hash = hex::encode(features_hash_bytes.as_bytes());
+
+                // Compute combined build hash: BLAKE3(crate_id + features_hash)
+                let crate_id_str = crate_db_id.to_string();
+                let combined_input = format!("{}{}", crate_id_str, build_hash);
+                let mut combined_hasher = blake3::Hasher::new();
+                combined_hasher.update(combined_input.as_bytes());
+                let combined_hash_bytes = combined_hasher.finalize();
+                let combined_build_hash = hex::encode(combined_hash_bytes.as_bytes());
+
+                // Try to get existing build first
+                let build_query = "SELECT id FROM build WHERE build_hash = $build_hash";
+
+                let build_db_id = match db
+                    .query(build_query)
+                    .bind(("build_hash", combined_build_hash.clone()))
+                    .await
+                {
+                    Ok(mut resp) => match resp.take::<Option<CrateIdRecord>>(0) {
+                        Ok(Some(rec)) => {
+                            trace!(
+                                "Found existing build record for {}@{} (hash: {})",
+                                name,
+                                version,
+                                combined_build_hash
+                            );
+                            rec.thing().clone()
+                        }
+                        Ok(None) => {
+                            // Build doesn't exist - create it
+                            let insert_build = r#"
+                                CREATE build CONTENT {
+                                    build_hash: $build_hash
+                                } RETURN id
+                            "#;
+
+                            match db
+                                .query(insert_build)
+                                .bind(("build_hash", combined_build_hash.clone()))
+                                .await
+                            {
+                                Ok(mut resp) => match resp.take::<Option<CrateIdRecord>>(0) {
+                                    Ok(Some(rec)) => {
+                                        debug!(
+                                            "Created new build record for {}@{} with {} features (hash: {})",
+                                            name,
+                                            version,
+                                            features_sorted.len(),
+                                            combined_build_hash
+                                        );
+                                        rec.thing().clone()
+                                    }
+                                    Ok(None) => {
+                                        error!("Build insert succeeded but no ID returned");
+                                        broker
+                                            .broadcast(DatabaseError {
+                                                operation: format!(
+                                                    "create build for {}@{}",
+                                                    name, version
+                                                ),
+                                                error: "Insert succeeded but no ID returned"
+                                                    .to_string(),
+                                            })
+                                            .await;
+                                        return;
+                                    }
+                                    Err(e) => {
+                                        error!("Failed to parse build insert result: {}", e);
+                                        broker
+                                            .broadcast(DatabaseError {
+                                                operation: format!(
+                                                    "create build for {}@{}",
+                                                    name, version
+                                                ),
+                                                error: e.to_string(),
+                                            })
+                                            .await;
+                                        return;
+                                    }
+                                },
+                                Err(e) => {
+                                    // Check for race condition
+                                    let error_str = e.to_string();
+                                    if error_str.contains("UNIQUE")
+                                        || error_str.contains("duplicate")
+                                    {
+                                        debug!("Concurrent build insert detected, retrying query");
+
+                                        match db
+                                            .query(build_query)
+                                            .bind(("build_hash", combined_build_hash.clone()))
+                                            .await
+                                        {
+                                            Ok(mut resp) => {
+                                                match resp.take::<Option<CrateIdRecord>>(0) {
+                                                    Ok(Some(rec)) => rec.thing().clone(),
+                                                    Ok(None) => {
+                                                        error!("Build still not found after concurrent insert");
+                                                        return;
+                                                    }
+                                                    Err(e) => {
+                                                        error!("Failed to query build after concurrent insert: {}", e);
+                                                        return;
+                                                    }
+                                                }
+                                            }
+                                            Err(e) => {
+                                                error!("Failed to retry build query: {}", e);
+                                                return;
+                                            }
+                                        }
+                                    } else {
+                                        error!("Failed to create build record: {}", e);
+                                        broker
+                                            .broadcast(DatabaseError {
+                                                operation: format!(
+                                                    "create build for {}@{}",
+                                                    name, version
+                                                ),
+                                                error: e.to_string(),
+                                            })
+                                            .await;
+                                        return;
+                                    }
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            error!("Failed to parse build query result: {}", e);
+                            broker
+                                .broadcast(DatabaseError {
+                                    operation: format!("query build for {}@{}", name, version),
+                                    error: e.to_string(),
+                                })
+                                .await;
+                            return;
+                        }
+                    },
+                    Err(e) => {
+                        error!("Failed to query build: {}", e);
+                        broker
+                            .broadcast(DatabaseError {
+                                operation: format!("query build for {}@{}", name, version),
+                                error: e.to_string(),
+                            })
+                            .await;
+                        return;
+                    }
+                };
+
+                // ====================================================================
+                // Step 5: Create build->chunk Relationship with Context on Edge
+                // ====================================================================
+
+                let relate_query = r#"
+                    RELATE $build_id->contains->$chunk_id CONTENT {
+                        chunk_index: $chunk_index,
+                        source_file: $source_file,
+                        start_line: $start_line,
+                        end_line: $end_line,
+                        parent_module: $parent_module,
+                        item_type: $item_type,
+                        item_name: $item_name
+                    }
+                "#;
+
+                match db
+                    .query(relate_query)
+                    .bind(("build_id", build_db_id.clone()))
+                    .bind(("chunk_id", chunk_db_id.clone()))
+                    .bind(("chunk_index", msg.chunk_index as i64))
+                    .bind(("source_file", msg.source_file.clone()))
+                    .bind(("start_line", msg.metadata.start_line.map(|n| n as i64)))
+                    .bind(("end_line", msg.metadata.end_line.map(|n| n as i64)))
+                    .bind(("parent_module", msg.metadata.parent_module.clone()))
+                    .bind(("item_type", msg.metadata.item_type.clone()))
+                    .bind(("item_name", msg.metadata.item_name.clone()))
+                    .await
+                {
+                    Ok(_) => {
+                        trace!(
+                            chunk_index = msg.chunk_index,
+                            content_hash = %content_hash,
+                            source_file = %msg.source_file,
+                            specifier = %format!("{}@{}", name, version),
+                            "Created build->chunk relationship with context metadata"
+                        );
+                    }
+                    Err(e) => {
+                        // Check if relationship already exists (idempotency)
+                        let error_str = e.to_string();
+                        if error_str.contains("UNIQUE") || error_str.contains("duplicate") {
+                            debug!(
+                                "Relationship already exists for build->chunk (chunk_index={}), skipping",
+                                msg.chunk_index
+                            );
+                            // Not an error - idempotent operation
+                        } else {
+                            error!("Failed to create build->chunk relationship: {}", e);
+                            broker
+                                .broadcast(DatabaseError {
+                                    operation: format!("relate build to chunk {}", content_hash),
+                                    error: e.to_string(),
+                                })
+                                .await;
+                            return;
+                        }
                     }
                 }
+
+                // ====================================================================
+                // Step 6: Broadcast DocChunkPersisted Event
+                // ====================================================================
+
+                broker
+                    .broadcast(DocChunkPersisted {
+                        specifier: msg.specifier.clone(),
+                        chunk_index: msg.chunk_index,
+                        content_hash,
+                        source_file: msg.source_file.clone(),
+                    })
+                    .await;
             })
         });
 
@@ -3572,6 +3990,7 @@ mod tests {
                     content: "Documentation for tokio::runtime::spawn function".to_string(),
                     source_file: "src/runtime/mod.rs".to_string(),
                     metadata: chunk_metadata,
+                    features: None,
                 })
                 .await;
 
@@ -3621,6 +4040,7 @@ mod tests {
                     content: "Some documentation".to_string(),
                     source_file: "src/lib.rs".to_string(),
                     metadata: chunk_metadata,
+                    features: None,
                 })
                 .await;
 
@@ -3680,6 +4100,7 @@ mod tests {
                         content: format!("Documentation chunk {} for serde", i),
                         source_file: format!("src/module_{}.rs", i),
                         metadata: chunk_metadata,
+                    features: None,
                     })
                     .await;
 
@@ -3740,6 +4161,7 @@ mod tests {
                     content: "General crate overview documentation".to_string(),
                     source_file: "README.md".to_string(),
                     metadata: chunk_metadata,
+                    features: None,
                 })
                 .await;
 
@@ -3800,6 +4222,7 @@ mod tests {
                         content: format!("Test chunk {}", i),
                         source_file: "test.rs".to_string(),
                         metadata: chunk_metadata,
+                    features: None,
                     })
                     .await;
                 tokio::time::sleep(Duration::from_millis(50)).await;
@@ -3930,6 +4353,7 @@ mod tests {
                         content: format!("Chunk {}", i),
                         source_file: "vec.rs".to_string(),
                         metadata: chunk_metadata,
+                    features: None,
                     })
                     .await;
                 tokio::time::sleep(Duration::from_millis(50)).await;
@@ -4064,6 +4488,7 @@ mod tests {
                         item_type: Some("struct".to_string()),
                         item_name: Some("TestStruct".to_string()),
                     },
+                    features: None,
                 })
                 .await;
             tokio::time::sleep(Duration::from_millis(200)).await;
@@ -4108,6 +4533,7 @@ mod tests {
                         item_type: Some("struct".to_string()),
                         item_name: Some("TestStruct".to_string()),
                     },
+                    features: None,
                 })
                 .await;
             tokio::time::sleep(Duration::from_millis(200)).await;
@@ -4193,6 +4619,7 @@ mod tests {
                         source_file: "README.md".to_string(),
                         content: chunk_content.to_string(),
                         metadata: chunk_metadata,
+                    features: None,
                     })
                     .await;
 

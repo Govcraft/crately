@@ -1,18 +1,18 @@
 //! ChunkDeduplicated - Event broadcast when duplicate content is detected
 //!
 //! This message is broadcast when the deduplication system detects that a chunk's
-//! content already exists in the database, allowing downstream actors to skip
-//! redundant persistence operations.
+//! content already exists in the database, allowing downstream actors to track
+//! storage efficiency metrics.
 
-use crate::types::{BuildId, ContentHash};
+use crate::crate_specifier::CrateSpecifier;
 use acton_reactive::prelude::*;
 
 /// Event broadcast when a documentation chunk is identified as duplicate content
 ///
 /// This message indicates that content with the same hash already exists in the
-/// database, eliminating the need for redundant storage. The system can create
-/// a reference edge from the build to the existing content node instead of
-/// creating a new content node.
+/// database. The system reuses the existing content node by creating a reference
+/// edge from the build to the existing content, rather than creating a duplicate
+/// content node.
 ///
 /// # Deduplication Benefits
 ///
@@ -22,164 +22,136 @@ use acton_reactive::prelude::*;
 ///
 /// # Fields
 ///
-/// * `build_id` - Build attempting to store this content
-/// * `chunk_id` - Chunk identifier within the build
-/// * `content_hash` - Hash matching existing content
-/// * `existing_content_id` - Database record ID of existing content node
+/// * `specifier` - Crate attempting to store this content
+/// * `content_hash` - Hash matching existing content (64-char BLAKE3 hex)
+/// * `reuse_count` - Number of builds that reference this content
 ///
 /// # Example
 ///
 /// ```no_run
 /// use crately::messages::ChunkDeduplicated;
-/// use crately::types::{BuildId, ContentHash};
+/// use crately::crate_specifier::CrateSpecifier;
+/// use std::str::FromStr;
 ///
 /// let event = ChunkDeduplicated {
-///     build_id: BuildId::new(),
-///     chunk_id: "chunk_005".to_string(),
-///     content_hash: ContentHash::from_content(b"duplicate content"),
-///     existing_content_id: "content:af1349b9".to_string(),
+///     specifier: CrateSpecifier::from_str("serde@1.0.0").unwrap(),
+///     content_hash: "af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262".to_string(),
+///     reuse_count: 3,
 /// };
 /// // broker.broadcast(event).await;
 /// ```
 ///
 /// # Message Flow
 ///
-/// 1. DatabaseActor receives ChunkHashComputed
-/// 2. DatabaseActor queries: `SELECT id FROM content WHERE hash = $hash`
-/// 3. If found, broadcast ChunkDeduplicated with existing_content_id
-/// 4. Create edge: `build -> existing_content_id` (skip content creation)
-/// 5. MetricsActor increments deduplication counter
-/// 6. Skip PersistDocChunk and vectorization for this chunk
+/// 1. DatabaseActor receives PersistDocChunk
+/// 2. Computes BLAKE3 hash and broadcasts ChunkHashComputed
+/// 3. Attempts UPDATE on doc_chunk table by content_hash
+/// 4. If rows returned, chunk existed - broadcast ChunkDeduplicated
+/// 5. Create edge: `build -> existing_chunk` (skip content creation)
+/// 6. MetricsActor increments deduplication counter
 ///
 /// # Subscribers
 ///
-/// - **CoordinatorActor**: Updates build progress, skips chunk persistence
 /// - **MetricsActor**: Tracks deduplication rates and storage savings
 /// - **Console**: Displays deduplication notification
 #[acton_message]
 pub struct ChunkDeduplicated {
-    /// Build that attempted to store this content
-    pub build_id: BuildId,
+    /// Crate that attempted to store this content
+    pub specifier: CrateSpecifier,
 
-    /// Chunk identifier within the build
-    pub chunk_id: String,
+    /// Content hash that matched existing content (64-char BLAKE3 hex)
+    pub content_hash: String,
 
-    /// Content hash that matched existing content
-    pub content_hash: ContentHash,
-
-    /// Database record ID of the existing content node
-    /// Format: "content:<hash>" or SurrealDB Thing ID
-    pub existing_content_id: String,
+    /// Number of builds that reference this content
+    pub reuse_count: usize,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::str::FromStr;
 
     #[test]
     fn test_chunk_deduplicated_new() {
-        let build_id = BuildId::new();
-        let content_hash = ContentHash::from_content(b"duplicate content");
+        let specifier = CrateSpecifier::from_str("tokio@1.35.0").unwrap();
+        let content_hash = "af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262".to_string();
 
         let event = ChunkDeduplicated {
-            build_id: build_id.clone(),
-            chunk_id: "chunk_005".to_string(),
+            specifier: specifier.clone(),
             content_hash: content_hash.clone(),
-            existing_content_id: "content:af1349b9".to_string(),
+            reuse_count: 2,
         };
 
-        assert_eq!(event.build_id, build_id);
-        assert_eq!(event.chunk_id, "chunk_005");
+        assert_eq!(event.specifier, specifier);
         assert_eq!(event.content_hash, content_hash);
-        assert_eq!(event.existing_content_id, "content:af1349b9");
+        assert_eq!(event.reuse_count, 2);
     }
 
     #[test]
-    fn test_chunk_deduplicated_various_content_ids() {
-        let build_id = BuildId::new();
-        let content_hash = ContentHash::from_content(b"test");
-
-        let id_formats = vec![
-            "content:abc123",
-            "content:af1349b9f5f9a1a6",
-            "doc_chunk:12345",
-        ];
-
-        for content_id in id_formats {
-            let event = ChunkDeduplicated {
-                build_id: build_id.clone(),
-                chunk_id: "chunk_000".to_string(),
-                content_hash: content_hash.clone(),
-                existing_content_id: content_id.to_string(),
-            };
-            assert_eq!(event.existing_content_id, content_id);
-        }
-    }
-
-    #[test]
-    fn test_chunk_deduplicated_different_chunks_same_content() {
-        let build_id = BuildId::new();
-        let content = b"common documentation pattern";
-        let content_hash = ContentHash::from_content(content);
-
-        let chunk1 = ChunkDeduplicated {
-            build_id: build_id.clone(),
-            chunk_id: "chunk_000".to_string(),
-            content_hash: content_hash.clone(),
-            existing_content_id: "content:xyz789".to_string(),
+    fn test_chunk_deduplicated_hash_length() {
+        let event = ChunkDeduplicated {
+            specifier: CrateSpecifier::from_str("serde@1.0.0").unwrap(),
+            content_hash: "d74981efa70a0c880b8d8c1985d075dbcbf679b99a5f9914e5aaf96b831a9e24".to_string(),
+            reuse_count: 5,
         };
 
-        let chunk2 = ChunkDeduplicated {
-            build_id: build_id.clone(),
-            chunk_id: "chunk_042".to_string(),
-            content_hash: content_hash.clone(),
-            existing_content_id: "content:xyz789".to_string(),
-        };
-
-        assert_eq!(chunk1.content_hash, chunk2.content_hash);
-        assert_eq!(chunk1.existing_content_id, chunk2.existing_content_id);
-        assert_ne!(chunk1.chunk_id, chunk2.chunk_id);
+        assert_eq!(event.content_hash.len(), 64, "BLAKE3 hash should be 64 hex characters");
     }
 
     #[test]
-    fn test_chunk_deduplicated_cross_build_deduplication() {
-        let build_id1 = BuildId::new();
-        let build_id2 = BuildId::new();
-        let content_hash = ContentHash::from_content(b"shared documentation");
+    fn test_chunk_deduplicated_reuse_count() {
+        let spec = CrateSpecifier::from_str("axum@0.7.0").unwrap();
 
         let event1 = ChunkDeduplicated {
-            build_id: build_id1.clone(),
-            chunk_id: "chunk_001".to_string(),
-            content_hash: content_hash.clone(),
-            existing_content_id: "content:shared123".to_string(),
+            specifier: spec.clone(),
+            content_hash: "a".repeat(64),
+            reuse_count: 1,
         };
 
         let event2 = ChunkDeduplicated {
-            build_id: build_id2.clone(),
-            chunk_id: "chunk_003".to_string(),
-            content_hash: content_hash.clone(),
-            existing_content_id: "content:shared123".to_string(),
+            specifier: spec.clone(),
+            content_hash: "a".repeat(64),
+            reuse_count: 10,
         };
 
-        assert_ne!(event1.build_id, event2.build_id);
+        assert_eq!(event1.reuse_count, 1);
+        assert_eq!(event2.reuse_count, 10);
         assert_eq!(event1.content_hash, event2.content_hash);
-        assert_eq!(event1.existing_content_id, event2.existing_content_id);
+    }
+
+    #[test]
+    fn test_chunk_deduplicated_cross_crate_deduplication() {
+        let hash = "d74981efa70a0c880b8d8c1985d075dbcbf679b99a5f9914e5aaf96b831a9e24".to_string();
+
+        let event1 = ChunkDeduplicated {
+            specifier: CrateSpecifier::from_str("crate_a@1.0.0").unwrap(),
+            content_hash: hash.clone(),
+            reuse_count: 2,
+        };
+
+        let event2 = ChunkDeduplicated {
+            specifier: CrateSpecifier::from_str("crate_b@2.0.0").unwrap(),
+            content_hash: hash.clone(),
+            reuse_count: 3,
+        };
+
+        // Different crates can deduplicate against same content
+        assert_ne!(event1.specifier, event2.specifier);
+        assert_eq!(event1.content_hash, event2.content_hash);
     }
 
     #[test]
     fn test_chunk_deduplicated_clone() {
         let original = ChunkDeduplicated {
-            build_id: BuildId::new(),
-            chunk_id: "chunk_010".to_string(),
-            content_hash: ContentHash::from_content(b"clone test"),
-            existing_content_id: "content:clone123".to_string(),
+            specifier: CrateSpecifier::from_str("tracing@0.1.0").unwrap(),
+            content_hash: "b".repeat(64),
+            reuse_count: 7,
         };
 
         let cloned = original.clone();
-        assert_eq!(original.build_id, cloned.build_id);
-        assert_eq!(original.chunk_id, cloned.chunk_id);
+        assert_eq!(original.specifier, cloned.specifier);
         assert_eq!(original.content_hash, cloned.content_hash);
-        assert_eq!(original.existing_content_id, cloned.existing_content_id);
+        assert_eq!(original.reuse_count, cloned.reuse_count);
     }
 
     #[test]
@@ -193,10 +165,9 @@ mod tests {
     #[test]
     fn test_chunk_deduplicated_debug() {
         let event = ChunkDeduplicated {
-            build_id: BuildId::new(),
-            chunk_id: "chunk_debug".to_string(),
-            content_hash: ContentHash::from_content(b"debug"),
-            existing_content_id: "content:debug456".to_string(),
+            specifier: CrateSpecifier::from_str("serde_json@1.0.0").unwrap(),
+            content_hash: "c".repeat(64),
+            reuse_count: 4,
         };
 
         let debug_str = format!("{:?}", event);
@@ -205,36 +176,26 @@ mod tests {
     }
 
     #[test]
-    fn test_chunk_deduplicated_empty_chunk_id() {
+    fn test_chunk_deduplicated_zero_reuse_count() {
+        // Edge case: first time seeing this content (reuse_count starts at 1 typically)
         let event = ChunkDeduplicated {
-            build_id: BuildId::new(),
-            chunk_id: String::new(),
-            content_hash: ContentHash::from_content(b"test"),
-            existing_content_id: "content:empty".to_string(),
+            specifier: CrateSpecifier::from_str("test@1.0.0").unwrap(),
+            content_hash: "d".repeat(64),
+            reuse_count: 1,
         };
 
-        assert!(event.chunk_id.is_empty());
+        assert_eq!(event.reuse_count, 1);
     }
 
     #[test]
-    fn test_chunk_deduplicated_hash_uniqueness() {
-        let build_id = BuildId::new();
-
-        let event1 = ChunkDeduplicated {
-            build_id: build_id.clone(),
-            chunk_id: "chunk_001".to_string(),
-            content_hash: ContentHash::from_content(b"content A"),
-            existing_content_id: "content:aaa".to_string(),
+    fn test_chunk_deduplicated_high_reuse_count() {
+        // Test with high reuse count (popular documentation pattern)
+        let event = ChunkDeduplicated {
+            specifier: CrateSpecifier::from_str("common@1.0.0").unwrap(),
+            content_hash: "e".repeat(64),
+            reuse_count: 1000,
         };
 
-        let event2 = ChunkDeduplicated {
-            build_id: build_id.clone(),
-            chunk_id: "chunk_002".to_string(),
-            content_hash: ContentHash::from_content(b"content B"),
-            existing_content_id: "content:bbb".to_string(),
-        };
-
-        assert_ne!(event1.content_hash, event2.content_hash);
-        assert_ne!(event1.existing_content_id, event2.existing_content_id);
+        assert_eq!(event.reuse_count, 1000);
     }
 }
