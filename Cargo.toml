@@ -41,7 +41,9 @@ tracing-appender = "0.2"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 xdg = { version = "3.0.0", features = ["serde"] }
 anyhow = "1.0.100"
+blake3 = "1.5"
 thiserror = "2.0.17"
+ulid = "1.1"
 is-terminal = "0.4"
 rand = "0.9.2"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }

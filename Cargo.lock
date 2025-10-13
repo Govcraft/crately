@@ -1051,6 +1051,7 @@ dependencies = [
  "acton-reactive",
  "anyhow",
  "axum",
+ "blake3",
  "cargo-util-schemas",
  "chrono",
  "clap",
@@ -1078,6 +1079,7 @@ dependencies = [
  "tracing-appender",
  "tracing-subscriber",
  "tree-sitter-rust",
+ "ulid",
  "walkdir",
  "xdg 3.0.0",
 ]

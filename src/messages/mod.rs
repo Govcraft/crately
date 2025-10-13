@@ -87,7 +87,11 @@
 //! pub use download::Download;
 //! ```
 
+mod build_created;
+mod build_query_response;
 mod check_processing_timeouts;
+mod chunk_deduplicated;
+mod chunk_hash_computed;
 mod chunk_persistence_progress;
 mod chunks_persistence_complete;
 mod config_reload_failed;
@@ -130,6 +134,7 @@ mod print_success;
 mod print_warning;
 mod stop_spinner;
 mod update_spinner;
+mod query_build;
 mod query_crate;
 mod query_doc_chunks;
 mod query_similar_docs;
@@ -142,7 +147,11 @@ mod start_server;
 mod stop_keyboard_handler;
 mod stop_server;
 
+pub use build_created::BuildCreated;
+pub use build_query_response::{BuildInfo, BuildQueryResponse};
 pub use check_processing_timeouts::CheckProcessingTimeouts;
+pub use chunk_deduplicated::ChunkDeduplicated;
+pub use chunk_hash_computed::ChunkHashComputed;
 pub use chunk_persistence_progress::ChunkPersistenceProgress;
 pub use chunks_persistence_complete::ChunksPersistenceComplete;
 pub use config_reload_failed::ConfigReloadFailed;
@@ -185,6 +194,7 @@ pub use print_success::PrintSuccess;
 pub use print_warning::PrintWarning;
 pub use stop_spinner::StopSpinner;
 pub use update_spinner::UpdateSpinner;
+pub use query_build::QueryBuild;
 pub use query_crate::QueryCrate;
 pub use query_doc_chunks::QueryDocChunks;
 pub use query_similar_docs::QuerySimilarDocs;

@@ -224,14 +224,14 @@ impl DatabaseActor {
         // Connect to database (in-memory for tests, RocksDB for production)
         #[cfg(not(feature = "rocksdb"))]
         {
-            info!(
+            debug!(
                 "Connecting to in-memory database for test: {}",
                 db_path.display()
             );
         }
         #[cfg(feature = "rocksdb")]
         {
-            info!("Connecting to RocksDB database: {}", db_path.display());
+            debug!("Connecting to RocksDB database: {}", db_path.display());
         }
 
         #[cfg(not(feature = "rocksdb"))]
@@ -1856,7 +1856,7 @@ impl DatabaseActor {
             let broker = agent.broker().clone();
 
             AgentReply::from_async(async move {
-                info!("Initializing database schema...");
+                debug!("Initializing database schema...");
 
                 let schema_sql = r#"
                     -- Core crate metadata and processing state
@@ -2003,7 +2003,7 @@ impl DatabaseActor {
 
                 match db.query(schema_sql).await {
                     Ok(_) => {
-                        info!("Database schema initialized successfully");
+                        debug!("Database schema initialized successfully");
 
                         // Broadcast DatabaseReady event
                         broker.broadcast(DatabaseReady).await;
@@ -2023,7 +2023,7 @@ impl DatabaseActor {
 
         // Add before_stop hook for graceful shutdown
         builder.before_stop(|_agent| {
-            info!("DatabaseActor shutting down");
+            debug!("DatabaseActor shutting down");
             AgentReply::immediate()
         });
 
