@@ -53,7 +53,7 @@ pub struct EmbeddingPersisted {
     /// The crate this embedding belongs to
     pub specifier: CrateSpecifier,
 
-    /// Name of the embedding model used (e.g., "text-embedding-3-small")
+    #[cfg(test)]
     pub model_name: String,
 }
 

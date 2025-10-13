@@ -267,6 +267,29 @@ fn default_read_timeout() -> u64 {
     10
 }
 
+/// Token encoding type for tokenization
+///
+/// Specifies which tiktoken encoding to use for token counting and text splitting.
+/// Different encodings match different model families and have different token vocabularies.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum TokenEncoding {
+    /// cl100k_base encoding used by GPT-3.5-turbo, GPT-4, text-embedding-ada-002, text-embedding-3-small, text-embedding-3-large
+    #[serde(rename = "cl100k_base")]
+    Cl100k,
+    /// o200k_base encoding used by newer models
+    #[serde(rename = "o200k_base")]
+    O200k,
+    /// p50k_base encoding used by earlier GPT-3 models (text-davinci-002, text-davinci-003, code-davinci-002)
+    #[serde(rename = "p50k_base")]
+    P50k,
+}
+
+impl Default for TokenEncoding {
+    fn default() -> Self {
+        Self::Cl100k
+    }
+}
+
 /// Configuration for the processing stage
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ProcessConfig {
@@ -282,13 +305,23 @@ pub struct ProcessConfig {
     #[serde(default = "default_docs_dir")]
     pub docs_dir: PathBuf,
 
-    /// Text chunking size in characters (default: 1000)
+    /// Text chunking size in tokens (default: 500)
+    ///
+    /// BREAKING CHANGE: This is now in tokens, not characters.
+    /// Previous default was 1000 characters (~250 tokens).
     #[serde(default = "default_chunk_size")]
     pub chunk_size: usize,
 
-    /// Chunk overlap in characters (default: 200)
+    /// Chunk overlap in tokens (default: 100)
+    ///
+    /// BREAKING CHANGE: This is now in tokens, not characters.
+    /// Previous default was 200 characters (~50 tokens).
     #[serde(default = "default_chunk_overlap")]
     pub chunk_overlap: usize,
+
+    /// Token encoding to use for chunking (default: Cl100kBase)
+    #[serde(default)]
+    pub token_encoding: TokenEncoding,
 
     /// Enable source code extraction (default: true)
     #[serde(default = "default_extract_source_code")]
@@ -303,6 +336,7 @@ impl Default for ProcessConfig {
             docs_dir: default_docs_dir(),
             chunk_size: default_chunk_size(),
             chunk_overlap: default_chunk_overlap(),
+            token_encoding: TokenEncoding::default(),
             extract_source_code: default_extract_source_code(),
         }
     }
@@ -350,11 +384,11 @@ fn default_docs_dir() -> PathBuf {
 }
 
 fn default_chunk_size() -> usize {
-    1000
+    500 // tokens (was 1000 characters ~250 tokens)
 }
 
 fn default_chunk_overlap() -> usize {
-    200
+    100 // tokens (was 200 characters ~50 tokens)
 }
 
 fn default_extract_source_code() -> bool {
@@ -1200,8 +1234,8 @@ mod tests {
         // Process config defaults
         assert_eq!(pipeline.process.compilation_timeout_secs, 300);
         assert_eq!(pipeline.process.max_concurrent_compilations, 2);
-        assert_eq!(pipeline.process.chunk_size, 1000);
-        assert_eq!(pipeline.process.chunk_overlap, 200);
+        assert_eq!(pipeline.process.chunk_size, 500); // BREAKING CHANGE: Now in tokens
+        assert_eq!(pipeline.process.chunk_overlap, 100); // BREAKING CHANGE: Now in tokens
         assert!(pipeline.process.extract_source_code);
 
         // Vectorize config defaults

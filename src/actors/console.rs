@@ -12,10 +12,10 @@ use crossterm::tty::IsTty;
 use std::io::stdout;
 
 use crate::actors::config::ConfigLoaded;
-use crate::colors::{format_error, format_progress, format_success, format_warning, ColorConfig};
+use crate::colors::{ColorConfig, format_error, format_progress, format_success, format_warning};
 use crate::messages::{
     ChunkPersistenceProgress, ChunksPersistenceComplete, ConfigReloadFailed, CrateListResponse,
-    CrateProcessingComplete, CratePersisted, CrateQueryResponse, DatabaseError, DatabaseWarning,
+    CratePersisted, CrateProcessingComplete, CrateQueryResponse, DatabaseError, DatabaseWarning,
     EmbeddingPersistenceProgress, EmbeddingsPersistenceComplete, Init, PrintError, PrintProgress,
     PrintSeparator, PrintSpinner, PrintSuccess, PrintWarning, ServerReloaded, ServerStarted,
     SetRawMode, StopSpinner, UpdateSpinner,
@@ -447,7 +447,8 @@ impl Console {
 
                 // Display progress with complete information
                 let progress_msg = format!(
-                    "Persisting chunk {}/{} for {}@{}",
+                    "Persisting chunk {} {}/{} for {}@{}",
+                    msg.chunk_index,
                     msg.persisted_count,
                     msg.total_chunks,
                     msg.specifier.name(),
@@ -467,7 +468,8 @@ impl Console {
 
                 // Display progress with complete information
                 let progress_msg = format!(
-                    "Vectorizing embedding {}/{} for {}@{} with {}",
+                    "Vectorizing embedding {} {}/{} for {}@{} with {}",
+                    msg.chunk_id,
                     msg.persisted_count,
                     msg.total_vectors,
                     msg.specifier.name(),
@@ -599,11 +601,7 @@ fn is_tty() -> bool {
 /// Returns `"\r\n"` when raw mode is active, `"\n"` otherwise
 #[inline]
 fn line_ending(raw_mode: bool) -> &'static str {
-    if raw_mode {
-        "\r\n"
-    } else {
-        "\n"
-    }
+    if raw_mode { "\r\n" } else { "\n" }
 }
 
 /// Prints a line with the appropriate line ending for the current mode.
@@ -734,7 +732,10 @@ fn print_warning(message: &str, raw_mode: bool, color_config: ColorConfig) {
 ///
 /// * `raw_mode` - Whether terminal raw mode is active
 fn print_separator(raw_mode: bool) {
-    print_line("───────────────────────────────────────────────────────────", raw_mode);
+    print_line(
+        "───────────────────────────────────────────────────────────",
+        raw_mode,
+    );
 }
 
 #[cfg(test)]
@@ -930,7 +931,9 @@ mod tests {
         let color_config = ColorConfig::new(ColorChoice::Never);
         let console = Console::spawn(&mut runtime, color_config).await.unwrap();
 
-        console.send(PrintProgress("Test progress".to_string())).await;
+        console
+            .send(PrintProgress("Test progress".to_string()))
+            .await;
 
         console.stop().await.unwrap();
         runtime.shutdown_all().await.unwrap();
@@ -976,7 +979,9 @@ mod tests {
         tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
 
         // Verify it doesn't panic and can still handle messages
-        console.send(PrintSuccess("Test after raw mode".to_string())).await;
+        console
+            .send(PrintSuccess("Test after raw mode".to_string()))
+            .await;
 
         console.stop().await.unwrap();
         runtime.shutdown_all().await.unwrap();
@@ -996,7 +1001,9 @@ mod tests {
         tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
 
         // Verify it doesn't panic and can still handle messages
-        console.send(PrintSuccess("Test after normal mode".to_string())).await;
+        console
+            .send(PrintSuccess("Test after normal mode".to_string()))
+            .await;
 
         console.stop().await.unwrap();
         runtime.shutdown_all().await.unwrap();
@@ -1010,7 +1017,9 @@ mod tests {
         let console = Console::spawn(&mut runtime, color_config).await.unwrap();
 
         // Start in normal mode
-        console.send(PrintSuccess("Normal mode 1".to_string())).await;
+        console
+            .send(PrintSuccess("Normal mode 1".to_string()))
+            .await;
 
         // Switch to raw mode
         console.send(SetRawMode(true)).await;
@@ -1020,7 +1029,9 @@ mod tests {
         // Switch back to normal mode
         console.send(SetRawMode(false)).await;
         tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
-        console.send(PrintSuccess("Normal mode 2".to_string())).await;
+        console
+            .send(PrintSuccess("Normal mode 2".to_string()))
+            .await;
 
         console.stop().await.unwrap();
         runtime.shutdown_all().await.unwrap();

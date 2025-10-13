@@ -348,21 +348,13 @@ impl DatabaseActor {
                     .await
                 {
                     Ok(_) => {
-                        debug!(
-                            "Persisted crate: {}@{}",
-                            name,
-                            version
-                        );
+                        debug!("Persisted crate: {}@{}", name, version);
                     }
                     Err(e) => {
                         error!("Failed to persist crate: {}", e);
                         broker
                             .broadcast(DatabaseError {
-                                operation: format!(
-                                    "persist crate {}@{}",
-                                    name,
-                                    version
-                                ),
+                                operation: format!("persist crate {}@{}", name, version),
                                 error: e.to_string(),
                             })
                             .await;
@@ -1069,7 +1061,7 @@ impl DatabaseActor {
                             Ok(Some(record)) => {
                                 let id = record.thing();
                                 // Upsert pattern: Try UPDATE first, then INSERT if no rows affected
-                                    let update_query = r#"
+                                let update_query = r#"
                                         UPDATE doc_chunk SET
                                             content = $content,
                                             source_file = $source_file,
@@ -1087,46 +1079,44 @@ impl DatabaseActor {
                                         RETURN BEFORE
                                     "#;
 
-                                    let update_result = db
-                                        .query(update_query)
-                                        .bind(("chunk_id", msg.chunk_id.clone()))
-                                        .bind(("content", msg.content.clone()))
-                                        .bind(("source_file", msg.source_file.clone()))
-                                        .bind(("content_type", msg.metadata.content_type.clone()))
-                                        .bind(("token_count", msg.metadata.token_count as i64))
-                                        .bind(("char_count", msg.metadata.char_count as i64))
-                                        .bind((
-                                            "start_line",
-                                            msg.metadata.start_line.map(|n| n as i64),
-                                        ))
-                                        .bind(("end_line", msg.metadata.end_line.map(|n| n as i64)))
-                                        .bind(("parent_module", msg.metadata.parent_module.clone()))
-                                        .bind(("item_type", msg.metadata.item_type.clone()))
-                                        .bind(("item_name", msg.metadata.item_name.clone()))
-                                        .await;
+                                let update_result = db
+                                    .query(update_query)
+                                    .bind(("chunk_id", msg.chunk_id.clone()))
+                                    .bind(("content", msg.content.clone()))
+                                    .bind(("source_file", msg.source_file.clone()))
+                                    .bind(("content_type", msg.metadata.content_type.clone()))
+                                    .bind(("token_count", msg.metadata.token_count as i64))
+                                    .bind(("char_count", msg.metadata.char_count as i64))
+                                    .bind(("start_line", msg.metadata.start_line.map(|n| n as i64)))
+                                    .bind(("end_line", msg.metadata.end_line.map(|n| n as i64)))
+                                    .bind(("parent_module", msg.metadata.parent_module.clone()))
+                                    .bind(("item_type", msg.metadata.item_type.clone()))
+                                    .bind(("item_name", msg.metadata.item_name.clone()))
+                                    .await;
 
-                                    // Check if update affected any rows
-                                    let needs_insert = match update_result {
-                                        Ok(mut response) => {
-                                            // Check if any rows were returned (indicating update succeeded)
-                                            let rows: Result<Vec<serde_json::Value>, _> = response.take(0);
-                                            match rows {
-                                                Ok(rows) if !rows.is_empty() => {
-                                                    debug!(
-                                                        "Updated existing doc chunk {} for {}@{}",
-                                                        msg.chunk_id, name, version
-                                                    );
-                                                    false
-                                                }
-                                                _ => true, // No rows returned, need to insert
+                                // Check if update affected any rows
+                                let needs_insert = match update_result {
+                                    Ok(mut response) => {
+                                        // Check if any rows were returned (indicating update succeeded)
+                                        let rows: Result<Vec<serde_json::Value>, _> =
+                                            response.take(0);
+                                        match rows {
+                                            Ok(rows) if !rows.is_empty() => {
+                                                debug!(
+                                                    "Updated existing doc chunk {} for {}@{}",
+                                                    msg.chunk_id, name, version
+                                                );
+                                                false
                                             }
+                                            _ => true, // No rows returned, need to insert
                                         }
-                                        Err(_) => true, // Update failed, try insert
-                                    };
+                                    }
+                                    Err(_) => true, // Update failed, try insert
+                                };
 
-                                    if needs_insert {
-                                        // No existing record, insert new one
-                                        let insert_query = r#"
+                                if needs_insert {
+                                    // No existing record, insert new one
+                                    let insert_query = r#"
                                             CREATE doc_chunk CONTENT {
                                                 crate_id: $crate_id,
                                                 chunk_index: $chunk_index,
@@ -1144,56 +1134,56 @@ impl DatabaseActor {
                                             }
                                         "#;
 
-                                        match db
-                                            .query(insert_query)
-                                            .bind(("crate_id", id.clone()))
-                                            .bind(("chunk_index", msg.chunk_index as i64))
-                                            .bind(("chunk_id", msg.chunk_id.clone()))
-                                            .bind(("content", msg.content.clone()))
-                                            .bind(("source_file", msg.source_file.clone()))
-                                            .bind(("content_type", msg.metadata.content_type.clone()))
-                                            .bind(("token_count", msg.metadata.token_count as i64))
-                                            .bind(("char_count", msg.metadata.char_count as i64))
-                                            .bind((
-                                                "start_line",
-                                                msg.metadata.start_line.map(|n| n as i64),
-                                            ))
-                                            .bind(("end_line", msg.metadata.end_line.map(|n| n as i64)))
-                                            .bind(("parent_module", msg.metadata.parent_module.clone()))
-                                            .bind(("item_type", msg.metadata.item_type.clone()))
-                                            .bind(("item_name", msg.metadata.item_name.clone()))
-                                            .await
-                                        {
-                                            Ok(_) => {
-                                                debug!(
-                                                    "Inserted new doc chunk {} for {}@{}",
-                                                    msg.chunk_id, name, version
-                                                );
-                                            }
-                                            Err(e) => {
-                                                error!("Failed to insert doc chunk: {}", e);
-                                                broker
-                                                    .broadcast(DatabaseError {
-                                                        operation: format!(
-                                                            "persist doc chunk {}",
-                                                            msg.chunk_id
-                                                        ),
-                                                        error: e.to_string(),
-                                                    })
-                                                    .await;
-                                                return;
-                                            }
+                                    match db
+                                        .query(insert_query)
+                                        .bind(("crate_id", id.clone()))
+                                        .bind(("chunk_index", msg.chunk_index as i64))
+                                        .bind(("chunk_id", msg.chunk_id.clone()))
+                                        .bind(("content", msg.content.clone()))
+                                        .bind(("source_file", msg.source_file.clone()))
+                                        .bind(("content_type", msg.metadata.content_type.clone()))
+                                        .bind(("token_count", msg.metadata.token_count as i64))
+                                        .bind(("char_count", msg.metadata.char_count as i64))
+                                        .bind((
+                                            "start_line",
+                                            msg.metadata.start_line.map(|n| n as i64),
+                                        ))
+                                        .bind(("end_line", msg.metadata.end_line.map(|n| n as i64)))
+                                        .bind(("parent_module", msg.metadata.parent_module.clone()))
+                                        .bind(("item_type", msg.metadata.item_type.clone()))
+                                        .bind(("item_name", msg.metadata.item_name.clone()))
+                                        .await
+                                    {
+                                        Ok(_) => {
+                                            debug!(
+                                                "Inserted new doc chunk {} for {}@{}",
+                                                msg.chunk_id, name, version
+                                            );
+                                        }
+                                        Err(e) => {
+                                            error!("Failed to insert doc chunk: {}", e);
+                                            broker
+                                                .broadcast(DatabaseError {
+                                                    operation: format!(
+                                                        "persist doc chunk {}",
+                                                        msg.chunk_id
+                                                    ),
+                                                    error: e.to_string(),
+                                                })
+                                                .await;
+                                            return;
                                         }
                                     }
+                                }
 
-                                    // Broadcast acknowledgment for completion tracking
-                                    broker
-                                        .broadcast(DocChunkPersisted {
-                                            chunk_id: msg.chunk_id.clone(),
-                                            specifier: msg.specifier.clone(),
-                                            chunk_index: msg.chunk_index,
-                                        })
-                                        .await;
+                                // Broadcast acknowledgment for completion tracking
+                                broker
+                                    .broadcast(DocChunkPersisted {
+                                        chunk_id: msg.chunk_id.clone(),
+                                        specifier: msg.specifier.clone(),
+                                        chunk_index: msg.chunk_index,
+                                    })
+                                    .await;
                             }
                             Ok(None) => {
                                 error!("Crate not found for chunk: {}@{}", name, version);
@@ -1523,6 +1513,7 @@ impl DatabaseActor {
                     .broadcast(EmbeddingPersisted {
                         chunk_id: msg.chunk_id.clone(),
                         specifier: msg.specifier.clone(),
+                        #[cfg(test)]
                         model_name: msg.model_name.clone(),
                     })
                     .await;
@@ -1570,39 +1561,39 @@ impl DatabaseActor {
                                         }
                                     "#;
 
-                                    match db
-                                        .query(insert_query)
-                                        .bind(("crate_id", id.clone()))
-                                        .bind(("sample_index", msg.sample_index as i64))
-                                        .bind(("code", msg.code.clone()))
-                                        .bind(("language", msg.metadata.language.clone()))
-                                        .bind(("source_file", msg.metadata.source_file.clone()))
-                                        .bind(("doc_context", msg.metadata.doc_context.clone()))
-                                        .bind(("parent_item", msg.metadata.parent_item.clone()))
-                                        .bind(("sample_type", msg.sample_type.clone()))
-                                        .bind(("tags", msg.metadata.tags.clone()))
-                                        .bind(("line_count", msg.metadata.line_count as i64))
-                                        .await
-                                    {
-                                        Ok(_) => {
-                                            debug!(
-                                                "Persisted code sample {} for {}@{} (type: {})",
-                                                msg.sample_index, name, version, msg.sample_type
-                                            );
-                                        }
-                                        Err(e) => {
-                                            error!("Failed to persist code sample: {}", e);
-                                            broker
-                                                .broadcast(DatabaseError {
-                                                    operation: format!(
-                                                        "persist code sample {} for {}@{}",
-                                                        msg.sample_index, name, version
-                                                    ),
-                                                    error: e.to_string(),
-                                                })
-                                                .await;
-                                        }
+                                match db
+                                    .query(insert_query)
+                                    .bind(("crate_id", id.clone()))
+                                    .bind(("sample_index", msg.sample_index as i64))
+                                    .bind(("code", msg.code.clone()))
+                                    .bind(("language", msg.metadata.language.clone()))
+                                    .bind(("source_file", msg.metadata.source_file.clone()))
+                                    .bind(("doc_context", msg.metadata.doc_context.clone()))
+                                    .bind(("parent_item", msg.metadata.parent_item.clone()))
+                                    .bind(("sample_type", msg.sample_type.clone()))
+                                    .bind(("tags", msg.metadata.tags.clone()))
+                                    .bind(("line_count", msg.metadata.line_count as i64))
+                                    .await
+                                {
+                                    Ok(_) => {
+                                        debug!(
+                                            "Persisted code sample {} for {}@{} (type: {})",
+                                            msg.sample_index, name, version, msg.sample_type
+                                        );
                                     }
+                                    Err(e) => {
+                                        error!("Failed to persist code sample: {}", e);
+                                        broker
+                                            .broadcast(DatabaseError {
+                                                operation: format!(
+                                                    "persist code sample {} for {}@{}",
+                                                    msg.sample_index, name, version
+                                                ),
+                                                error: e.to_string(),
+                                            })
+                                            .await;
+                                    }
+                                }
                             }
                             Ok(None) => {
                                 error!("Crate not found for code sample: {}@{}", name, version);
@@ -3580,7 +3571,6 @@ mod tests {
         .await
         .expect("Test should complete within timeout");
     }
-
 
     #[tokio::test(flavor = "multi_thread")]
     async fn test_idempotent_chunk_and_embedding_persistence() {

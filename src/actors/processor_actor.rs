@@ -2,14 +2,24 @@
 //!
 //! The `ProcessorActor` is a stateless worker that subscribes to `DocumentationExtracted` events
 //! and processes the extracted documentation into semantically meaningful chunks for vectorization.
-//! It implements intelligent text segmentation that preserves context while staying within token limits.
+//! It uses the text-splitter crate with tiktoken-rs for accurate token-based chunking.
+//!
+//! # Key Features
+//!
+//! - **Accurate Token Counting**: Uses tiktoken tokenization matching OpenAI models
+//! - **Semantic-Aware Splitting**: Leverages markdown and code-aware splitters
+//! - **Comprehensive Source Code Processing**: Processes ALL public-facing API code
+//! - **Multi-Content Type Support**: Handles README.md (markdown), Cargo.toml (markdown), and Rust source (code splitter)
 
 use acton_reactive::prelude::*;
 use anyhow::{Context, Result};
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use text_splitter::{ChunkConfig, MarkdownSplitter, TextSplitter};
+use tiktoken_rs::CoreBPE;
+use walkdir::WalkDir;
 
-use crate::actors::config::ProcessConfig;
+use crate::actors::config::{ProcessConfig, TokenEncoding};
 use crate::crate_specifier::CrateSpecifier;
 use crate::messages::{DocumentationChunked, DocumentationExtracted, PersistDocChunk};
 use crate::types::ChunkMetadata;
@@ -17,10 +27,12 @@ use crate::types::ChunkMetadata;
 /// Stateless actor for chunking documentation text
 ///
 /// This actor subscribes to `DocumentationExtracted` events and performs the following:
-/// 1. Re-reads documentation files from the extracted crate directory
-/// 2. Concatenates documentation content with logical separators
-/// 3. Splits text into semantic chunks (paragraphs, doc comment blocks)
-/// 4. Groups chunks to target configured chunk size with overlap
+/// 1. Discovers all Rust source files in the crate
+/// 2. Reads documentation files (README.md, Cargo.toml) and ALL Rust source files
+/// 3. Splits text using appropriate splitters:
+///    - Markdown splitter for README.md and Cargo.toml (respects headers, lists, code blocks)
+///    - Code splitter for Rust files (respects function boundaries, structs, impl blocks, modules)
+/// 4. Uses tiktoken for accurate token counting
 /// 5. Broadcasts `DocumentationChunked` on success
 ///
 /// # State
@@ -31,7 +43,7 @@ use crate::types::ChunkMetadata;
 /// # Message Flow
 ///
 /// - Subscribes to: `DocumentationExtracted`
-/// - Broadcasts: `DocumentationChunked`
+/// - Broadcasts: `DocumentationChunked`, `PersistDocChunk`
 #[acton_actor]
 pub struct ProcessorActor {
     /// Processing configuration (immutable)
@@ -46,7 +58,7 @@ impl ProcessorActor {
     ///
     /// # Arguments
     ///
-    /// * `config` - Processing configuration including chunk size and overlap
+    /// * `config` - Processing configuration including chunk size, overlap, and token encoding
     ///
     /// # Returns
     ///
@@ -59,7 +71,7 @@ impl ProcessorActor {
     ///
     /// This is the standard factory method for creating ProcessorActor actors.
     /// The ProcessorActor subscribes to `DocumentationExtracted` events and chunks
-    /// documentation text, broadcasting success events.
+    /// documentation text using text-splitter with tiktoken-rs for accurate token-based chunking.
     ///
     /// This follows the simple actor pattern where only the handle is returned,
     /// as the ProcessorActor has no startup data to provide to the application.
@@ -67,7 +79,7 @@ impl ProcessorActor {
     /// # Arguments
     ///
     /// * `runtime` - Mutable reference to the acton-reactive runtime
-    /// * `config` - Processing configuration including chunk size and overlap
+    /// * `config` - Processing configuration including chunk size, overlap, and token encoding
     ///
     /// # Returns
     ///
@@ -118,11 +130,11 @@ impl ProcessorActor {
 
             AgentReply::from_async(async move {
                 match chunk_documentation(&config, &msg.specifier, &msg.extracted_path).await {
-                    Ok((chunks, total_tokens_estimated)) => {
+                    Ok((chunks, total_tokens)) => {
                         let chunk_count = chunks.len() as u32;
 
                         // Persist all chunks to database before broadcasting event
-                        for (index, (content, source_file)) in chunks.into_iter().enumerate() {
+                        for (index, (content, source_file, content_type, token_count)) in chunks.into_iter().enumerate() {
                             let chunk_id = format!(
                                 "{}_{}_{:03}",
                                 msg.specifier.name().replace('-', "_"),
@@ -131,10 +143,10 @@ impl ProcessorActor {
                             );
 
                             let metadata = ChunkMetadata {
-                                content_type: "markdown".to_string(),
+                                content_type,
                                 start_line: None,
                                 end_line: None,
-                                token_count: estimate_tokens(content.len()) as usize,
+                                token_count,
                                 char_count: content.len(),
                                 parent_module: None,
                                 item_type: None,
@@ -159,13 +171,11 @@ impl ProcessorActor {
                                 specifier: msg.specifier,
                                 features: msg.features,
                                 chunk_count,
-                                total_tokens_estimated,
+                                total_tokens_estimated: total_tokens,
                             })
                             .await;
                     }
                     Err(e) => {
-                        // Log error - in a real implementation, you might want to broadcast
-                        // a DocumentationChunkingFailed message similar to FileReaderActor
                         tracing::error!(
                             "Failed to chunk documentation for {}: {:#}",
                             msg.specifier,
@@ -185,33 +195,230 @@ impl ProcessorActor {
     }
 }
 
-/// Chunks documentation from a crate directory
+/// Content type for a chunk of documentation
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ContentType {
+    Markdown,
+    Rust,
+    Toml,
+}
+
+impl ContentType {
+    fn as_str(&self) -> &str {
+        match self {
+            Self::Markdown => "markdown",
+            Self::Rust => "rust",
+            Self::Toml => "toml",
+        }
+    }
+}
+
+/// Recursively finds all Rust source files in the src/ directory
 ///
-/// This function re-reads documentation files, concatenates them, and chunks
-/// the text into semantically meaningful segments for vectorization.
+/// This discovers ALL .rs files including:
+/// - src/lib.rs or src/main.rs (entry points)
+/// - src/module.rs files
+/// - src/module/mod.rs files
+/// - src/module/submodule.rs files
+/// - Nested module hierarchies
 ///
 /// # Arguments
 ///
-/// * `config` - Processing configuration with chunk size and overlap settings
+/// * `crate_dir` - Path to the extracted crate directory
+///
+/// # Returns
+///
+/// Returns a vector of paths to all discovered Rust source files
+///
+/// # Errors
+///
+/// Returns an error if directory traversal fails
+fn find_rust_source_files(crate_dir: &Path) -> Result<Vec<PathBuf>> {
+    let src_dir = crate_dir.join("src");
+
+    if !src_dir.exists() {
+        tracing::warn!("src directory does not exist: {}", src_dir.display());
+        return Ok(Vec::new());
+    }
+
+    let mut rust_files = Vec::new();
+
+    for entry in WalkDir::new(&src_dir)
+        .follow_links(false)
+        .into_iter()
+        .filter_map(|e| e.ok())
+    {
+        let path = entry.path();
+
+        // Only include .rs files
+        if path.is_file() && path.extension().is_some_and(|ext| ext == "rs") {
+            // Skip test files and benchmark files
+            let path_str = path.to_string_lossy();
+            if !path_str.contains("/tests/") && !path_str.contains("/benches/") {
+                rust_files.push(path.to_path_buf());
+            }
+        }
+    }
+
+    // Sort for deterministic ordering
+    rust_files.sort();
+
+    tracing::debug!(
+        "Discovered {} Rust source files in {}",
+        rust_files.len(),
+        src_dir.display()
+    );
+
+    Ok(rust_files)
+}
+
+/// Creates a tokenizer from the configured encoding
+///
+/// # Arguments
+///
+/// * `encoding` - Token encoding type to use
+///
+/// # Returns
+///
+/// Returns a CoreBPE tokenizer for the specified encoding
+///
+/// # Errors
+///
+/// Returns an error if the tokenizer cannot be created
+fn create_tokenizer(encoding: TokenEncoding) -> Result<CoreBPE> {
+    let bpe = match encoding {
+        TokenEncoding::Cl100k => tiktoken_rs::cl100k_base()?,
+        TokenEncoding::O200k => tiktoken_rs::o200k_base()?,
+        TokenEncoding::P50k => tiktoken_rs::p50k_base()?,
+    };
+    Ok(bpe)
+}
+
+/// Creates a markdown splitter with the configured chunk size and overlap
+///
+/// # Arguments
+///
+/// * `config` - Processing configuration with chunk size and overlap
+/// * `tokenizer` - Tokenizer for accurate token counting
+///
+/// # Returns
+///
+/// Returns a configured MarkdownSplitter
+fn create_markdown_splitter(config: &ProcessConfig, tokenizer: CoreBPE) -> MarkdownSplitter<CoreBPE> {
+    let chunk_config = ChunkConfig::new(config.chunk_size)
+        .with_sizer(tokenizer)
+        .with_overlap(config.chunk_overlap)
+        .expect("chunk_size > chunk_overlap guaranteed by config validation");
+
+    MarkdownSplitter::new(chunk_config)
+}
+
+/// Creates a code splitter for Rust source with the configured chunk size and overlap
+///
+/// # Arguments
+///
+/// * `config` - Processing configuration with chunk size and overlap
+/// * `tokenizer` - Tokenizer for accurate token counting
+///
+/// # Returns
+///
+/// Returns a configured TextSplitter with Rust tree-sitter support
+fn create_code_splitter(config: &ProcessConfig, tokenizer: CoreBPE) -> TextSplitter<CoreBPE> {
+    let chunk_config = ChunkConfig::new(config.chunk_size)
+        .with_sizer(tokenizer)
+        .with_overlap(config.chunk_overlap)
+        .expect("chunk_size > chunk_overlap guaranteed by config validation");
+
+    TextSplitter::new(chunk_config)
+}
+
+/// Counts tokens in text using the tokenizer
+///
+/// # Arguments
+///
+/// * `tokenizer` - Tokenizer to use for counting
+/// * `text` - Text to count tokens in
+///
+/// # Returns
+///
+/// Returns the number of tokens in the text
+fn count_tokens(tokenizer: &CoreBPE, text: &str) -> usize {
+    tokenizer.encode_with_special_tokens(text).len()
+}
+
+/// Processes content with the appropriate splitter and returns chunks
+///
+/// # Arguments
+///
+/// * `splitter` - Splitter to use (can be markdown or code splitter via trait object)
+/// * `tokenizer` - Tokenizer for accurate token counting
+/// * `content` - Content to chunk
+/// * `source_file` - Source file name for tracking
+/// * `content_type` - Type of content being processed
+/// * `total_tokens` - Mutable reference to accumulate total token count
+///
+/// # Returns
+///
+/// Returns a vector of tuples: (content, source_file, content_type, token_count)
+///
+/// # Errors
+///
+/// Returns an error if chunking fails
+fn process_content(
+    chunks: Vec<&str>,
+    tokenizer: &CoreBPE,
+    source_file: &str,
+    content_type: ContentType,
+    total_tokens: &mut u32,
+) -> Vec<(String, String, String, usize)> {
+    let mut result = Vec::new();
+
+    for chunk in chunks {
+        let chunk_str = chunk.to_string();
+        let token_count = count_tokens(tokenizer, &chunk_str);
+
+        *total_tokens += token_count as u32;
+
+        result.push((
+            chunk_str,
+            source_file.to_string(),
+            content_type.as_str().to_string(),
+            token_count,
+        ));
+    }
+
+    result
+}
+
+/// Chunks documentation from a crate directory
+///
+/// This function discovers all documentation files and Rust source files,
+/// processes them with the appropriate splitters (markdown or code), and
+/// returns chunks ready for vectorization.
+///
+/// # Arguments
+///
+/// * `config` - Processing configuration with chunk size, overlap, and token encoding
 /// * `specifier` - Crate name and version for context
 /// * `extracted_path` - Path to the extracted crate directory
 ///
 /// # Returns
 ///
-/// Returns a tuple of (chunks, total_tokens_estimated) on success where chunks
-/// is a vector of (content, source_file) tuples
+/// Returns a tuple of (chunks, total_tokens) on success where chunks
+/// is a vector of (content, source_file, content_type, token_count) tuples
 ///
 /// # Errors
 ///
 /// Returns an error if:
 /// - Files cannot be read
-/// - Documentation is empty
+/// - Crate directory doesn't exist
+/// - Tokenizer creation fails
 /// - Chunking logic fails
 async fn chunk_documentation(
     config: &ProcessConfig,
     specifier: &CrateSpecifier,
     extracted_path: &Path,
-) -> Result<(Vec<(String, String)>, u32)> {
+) -> Result<(Vec<(String, String, String, usize)>, u32)> {
     // The extracted path is: download_dir/crate-version/
     // The tarball extracts to: download_dir/crate-version/crate-version/
     let crate_dir = extracted_path.join(format!(
@@ -228,157 +435,95 @@ async fn chunk_documentation(
         );
     }
 
-    // Read and concatenate all documentation files
-    let mut full_documentation = String::new();
-    let mut primary_source_file = String::from("combined");
+    // Create tokenizer and splitters
+    let tokenizer = create_tokenizer(config.token_encoding)
+        .with_context(|| format!("Failed to create tokenizer for {:?}", config.token_encoding))?;
 
-    // Read README.md if it exists
+    let markdown_splitter = create_markdown_splitter(config, tokenizer.clone());
+    let code_splitter = create_code_splitter(config, tokenizer.clone());
+
+    let mut all_chunks = Vec::new();
+    let mut total_tokens = 0u32;
+
+    // Process README.md with markdown splitter
     let readme_path = crate_dir.join("README.md");
     if readme_path.exists() {
-        let readme_content = fs::read_to_string(&readme_path)
+        let content = fs::read_to_string(&readme_path)
             .with_context(|| format!("Failed to read README.md from {}", readme_path.display()))?;
-        full_documentation.push_str("=== README.md ===\n\n");
-        full_documentation.push_str(&readme_content);
-        full_documentation.push_str("\n\n");
-        primary_source_file = String::from("README.md");
+
+        if !content.trim().is_empty() {
+            let chunks = markdown_splitter.chunks(&content).collect::<Vec<_>>();
+            let processed = process_content(
+                chunks,
+                &tokenizer,
+                "README.md",
+                ContentType::Markdown,
+                &mut total_tokens,
+            );
+            all_chunks.extend(processed);
+        }
     }
 
-    // Read Cargo.toml
+    // Process Cargo.toml with markdown splitter (TOML with comments is markdown-ish)
     let cargo_toml_path = crate_dir.join("Cargo.toml");
     if cargo_toml_path.exists() {
-        let cargo_content = fs::read_to_string(&cargo_toml_path).with_context(|| {
+        let content = fs::read_to_string(&cargo_toml_path).with_context(|| {
             format!("Failed to read Cargo.toml from {}", cargo_toml_path.display())
         })?;
-        full_documentation.push_str("=== Cargo.toml ===\n\n");
-        full_documentation.push_str(&cargo_content);
-        full_documentation.push_str("\n\n");
+
+        if !content.trim().is_empty() {
+            let chunks = markdown_splitter.chunks(&content).collect::<Vec<_>>();
+            let processed = process_content(
+                chunks,
+                &tokenizer,
+                "Cargo.toml",
+                ContentType::Toml,
+                &mut total_tokens,
+            );
+            all_chunks.extend(processed);
+        }
     }
 
-    // Read lib.rs or src/lib.rs or src/main.rs
-    let lib_paths = vec![
-        crate_dir.join("lib.rs"),
-        crate_dir.join("src").join("lib.rs"),
-        crate_dir.join("src").join("main.rs"),
-    ];
+    // Discover and process ALL Rust source files with code splitter
+    let rust_files = find_rust_source_files(&crate_dir)?;
 
-    for lib_path in lib_paths {
-        if lib_path.exists() {
-            let lib_content = fs::read_to_string(&lib_path)
-                .with_context(|| format!("Failed to read source from {}", lib_path.display()))?;
-            full_documentation.push_str(&format!("=== {} ===\n\n", lib_path.file_name().unwrap().to_string_lossy()));
-            full_documentation.push_str(&lib_content);
-            full_documentation.push_str("\n\n");
-            break;
+    for rust_file in rust_files {
+        let content = fs::read_to_string(&rust_file)
+            .with_context(|| format!("Failed to read Rust source from {}", rust_file.display()))?;
+
+        if !content.trim().is_empty() {
+            // Get relative path from crate_dir for better tracking
+            let source_file = rust_file
+                .strip_prefix(&crate_dir)
+                .unwrap_or(&rust_file)
+                .to_string_lossy()
+                .to_string();
+
+            let chunks = code_splitter.chunks(&content).collect::<Vec<_>>();
+            let processed = process_content(
+                chunks,
+                &tokenizer,
+                &source_file,
+                ContentType::Rust,
+                &mut total_tokens,
+            );
+            all_chunks.extend(processed);
         }
     }
 
     // Check if we have any documentation
-    if full_documentation.is_empty() {
+    if all_chunks.is_empty() {
         anyhow::bail!("No documentation content found for {}", specifier);
     }
 
-    // Chunk the documentation
-    let text_chunks = create_semantic_chunks(&full_documentation, config.chunk_size, config.chunk_overlap);
+    tracing::info!(
+        "Chunked {} total chunks ({} tokens) for {}",
+        all_chunks.len(),
+        total_tokens,
+        specifier
+    );
 
-    // Pair each chunk with its source file
-    let chunks: Vec<(String, String)> = text_chunks
-        .into_iter()
-        .map(|content| (content, primary_source_file.clone()))
-        .collect();
-
-    // Estimate total tokens
-    let total_chars: usize = chunks.iter().map(|(content, _)| content.len()).sum();
-    let total_tokens_estimated = estimate_tokens(total_chars);
-
-    Ok((chunks, total_tokens_estimated))
-}
-
-/// Creates semantic chunks from documentation text
-///
-/// This function splits documentation on natural boundaries (paragraphs, blank lines)
-/// and groups them into chunks targeting the specified size with overlap.
-///
-/// # Arguments
-///
-/// * `text` - Full documentation text to chunk
-/// * `target_chunk_size` - Target chunk size in characters
-/// * `overlap_size` - Overlap between chunks in characters
-///
-/// # Returns
-///
-/// Returns a vector of text chunks
-fn create_semantic_chunks(text: &str, target_chunk_size: usize, overlap_size: usize) -> Vec<String> {
-    let mut chunks = Vec::new();
-
-    // Split on double newlines (paragraph boundaries)
-    let paragraphs: Vec<&str> = text
-        .split("\n\n")
-        .filter(|p| !p.trim().is_empty())
-        .collect();
-
-    if paragraphs.is_empty() {
-        return chunks;
-    }
-
-    let mut current_chunk = String::new();
-    let mut overlap_buffer = String::new();
-
-    for paragraph in paragraphs {
-        let paragraph_with_newline = format!("{}\n\n", paragraph.trim());
-
-        // If adding this paragraph would exceed target size and we have content
-        if !current_chunk.is_empty() && current_chunk.len() + paragraph_with_newline.len() > target_chunk_size {
-            // Save the current chunk
-            chunks.push(current_chunk.clone());
-
-            // Start new chunk with overlap from previous chunk
-            if !overlap_buffer.is_empty() {
-                current_chunk = overlap_buffer.clone();
-            } else {
-                current_chunk.clear();
-            }
-        }
-
-        // Add the paragraph to current chunk
-        current_chunk.push_str(&paragraph_with_newline);
-
-        // Update overlap buffer (last N characters of current chunk)
-        if current_chunk.len() > overlap_size {
-            let start_idx = current_chunk.len() - overlap_size;
-            overlap_buffer = current_chunk[start_idx..].to_string();
-        } else {
-            overlap_buffer = current_chunk.clone();
-        }
-    }
-
-    // Add the final chunk if it has content
-    if !current_chunk.is_empty() {
-        chunks.push(current_chunk);
-    }
-
-    // If no chunks were created (text too small or no paragraphs), create a single chunk
-    if chunks.is_empty() && !text.trim().is_empty() {
-        chunks.push(text.to_string());
-    }
-
-    chunks
-}
-
-/// Estimates token count from character count
-///
-/// Uses a rough approximation of 4 characters per token (typical for English text).
-///
-/// # Arguments
-///
-/// * `char_count` - Number of characters
-///
-/// # Returns
-///
-/// Returns estimated number of tokens
-#[inline]
-fn estimate_tokens(char_count: usize) -> u32 {
-    // Rough approximation: 4 characters per token on average for English text
-    ((char_count as f64) / 4.0).ceil() as u32
+    Ok((all_chunks, total_tokens))
 }
 
 #[cfg(test)]
@@ -427,12 +572,25 @@ pub fn example() {
 pub fn another() {
     println!("another");
 }
+
+/// A struct to test code chunking
+pub struct TestStruct {
+    /// Field documentation
+    pub field: String,
+}
+
+impl TestStruct {
+    /// Constructor documentation
+    pub fn new(field: String) -> Self {
+        Self { field }
+    }
+}
 "#;
         fs::write(crate_dir.join("src").join("lib.rs"), lib_rs_content)
             .expect("Failed to write lib.rs");
 
         // Create README.md
-        let readme_content = "# Test Crate\n\nThis is a test crate.\n\nIt has multiple paragraphs.\n";
+        let readme_content = "# Test Crate\n\nThis is a test crate.\n\nIt has multiple paragraphs.\n\n## Features\n\n- Feature 1\n- Feature 2\n";
         fs::write(crate_dir.join("README.md"), readme_content).expect("Failed to write README.md");
 
         outer_dir
@@ -458,6 +616,8 @@ pub fn another() {
         let config = ProcessConfig::default();
         let actor = ProcessorActor::new(config.clone());
         assert_eq!(actor.config.chunk_size, config.chunk_size);
+        assert_eq!(actor.config.chunk_overlap, config.chunk_overlap);
+        assert_eq!(actor.config.token_encoding, config.token_encoding);
     }
 
     #[tokio::test]
@@ -474,12 +634,19 @@ pub fn another() {
 
         let (chunks, total_tokens) = result.unwrap();
         assert!(!chunks.is_empty(), "Should have created at least one chunk");
-        assert!(total_tokens > 0, "Should have estimated some tokens");
-        // Verify chunks have both content and source file
-        for (content, source_file) in &chunks {
+        assert!(total_tokens > 0, "Should have counted some tokens");
+
+        // Verify chunks have all required data
+        for (content, source_file, content_type, token_count) in &chunks {
             assert!(!content.is_empty(), "Chunk content should not be empty");
             assert!(!source_file.is_empty(), "Source file should not be empty");
+            assert!(!content_type.is_empty(), "Content type should not be empty");
+            assert!(*token_count > 0, "Token count should be > 0");
         }
+
+        // Verify we processed multiple file types
+        let content_types: std::collections::HashSet<_> = chunks.iter().map(|(_, _, ct, _)| ct.clone()).collect();
+        assert!(content_types.len() > 1, "Should have processed multiple content types");
 
         // Cleanup
         let _ = fs::remove_dir_all(&temp_dir);
@@ -499,77 +666,40 @@ pub fn another() {
     }
 
     #[test]
-    fn test_create_semantic_chunks_basic() {
-        let text = "First paragraph.\n\nSecond paragraph.\n\nThird paragraph.";
-        let chunks = create_semantic_chunks(text, 100, 20);
+    fn test_find_rust_source_files() {
+        let temp_dir = env::temp_dir().join(format!("crately_test_find_{}", rand::random::<u32>()));
+        let _ = fs::create_dir_all(&temp_dir);
 
-        assert!(!chunks.is_empty(), "Should create at least one chunk");
+        let crate_dir = create_test_crate_structure(&temp_dir, "test_find", "1.0.0")
+            .join("test_find-1.0.0");
+
+        let files = find_rust_source_files(&crate_dir).unwrap();
+        assert!(!files.is_empty(), "Should find at least one Rust file");
+        assert!(files.iter().any(|p| p.ends_with("lib.rs")), "Should find lib.rs");
+
+        // Cleanup
+        let _ = fs::remove_dir_all(&temp_dir);
     }
 
     #[test]
-    fn test_create_semantic_chunks_with_overlap() {
-        let text = "A".repeat(500) + "\n\n" + &"B".repeat(500);
-        let chunks = create_semantic_chunks(&text, 600, 100);
-
-        assert!(chunks.len() >= 2, "Should create multiple chunks");
-        // Check that chunks have some overlap (second chunk should start with end of first)
-        if chunks.len() >= 2 {
-            let first_end = &chunks[0][chunks[0].len() - 100..];
-            assert!(chunks[1].starts_with(first_end), "Chunks should have overlap");
-        }
+    fn test_create_tokenizer_cl100k_base() {
+        let result = create_tokenizer(TokenEncoding::Cl100k);
+        assert!(result.is_ok(), "Should create cl100k_base tokenizer");
     }
 
     #[test]
-    fn test_create_semantic_chunks_empty_text() {
-        let text = "";
-        let chunks = create_semantic_chunks(text, 100, 20);
-
-        assert!(chunks.is_empty(), "Should create no chunks for empty text");
+    fn test_count_tokens() {
+        let tokenizer = create_tokenizer(TokenEncoding::Cl100k).unwrap();
+        let text = "Hello world, this is a test.";
+        let count = count_tokens(&tokenizer, text);
+        assert!(count > 0, "Should count tokens");
+        assert!(count < 20, "Token count should be reasonable for short text");
     }
 
     #[test]
-    fn test_create_semantic_chunks_single_paragraph() {
-        let text = "Single paragraph with some content.";
-        let chunks = create_semantic_chunks(text, 100, 20);
-
-        assert_eq!(chunks.len(), 1, "Should create one chunk for single paragraph");
-    }
-
-    #[test]
-    fn test_create_semantic_chunks_respects_target_size() {
-        let paragraphs: Vec<String> = (0..10).map(|i| format!("Paragraph {}.", i)).collect();
-        let text = paragraphs.join("\n\n");
-        let chunks = create_semantic_chunks(&text, 50, 10);
-
-        // All chunks except possibly the last should be around target size
-        for (i, chunk) in chunks.iter().enumerate() {
-            if i < chunks.len() - 1 {
-                // Not the last chunk - should be close to or over target size
-                assert!(chunk.len() >= 30, "Chunk {} should have reasonable size", i);
-            }
-        }
-    }
-
-    #[test]
-    fn test_estimate_tokens_zero() {
-        assert_eq!(estimate_tokens(0), 0);
-    }
-
-    #[test]
-    fn test_estimate_tokens_small() {
-        let tokens = estimate_tokens(100);
-        assert_eq!(tokens, 25); // 100 / 4 = 25
-    }
-
-    #[test]
-    fn test_estimate_tokens_large() {
-        let tokens = estimate_tokens(10000);
-        assert_eq!(tokens, 2500); // 10000 / 4 = 2500
-    }
-
-    #[test]
-    fn test_estimate_tokens_rounding() {
-        let tokens = estimate_tokens(10); // 10 / 4 = 2.5, should ceil to 3
-        assert_eq!(tokens, 3);
+    fn test_content_type_as_str() {
+        assert_eq!(ContentType::Markdown.as_str(), "markdown");
+        assert_eq!(ContentType::Rust.as_str(), "rust");
+        assert_eq!(ContentType::Toml.as_str(), "toml");
     }
 }
