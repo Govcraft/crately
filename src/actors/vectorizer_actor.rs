@@ -1,12 +1,12 @@
 //! Actor responsible for generating vector embeddings from documentation chunks
 //!
-//! The `VectorizerActor` is a stateless worker that subscribes to `DocumentationChunked` events
+//! The `VectorizerActor` is a stateless worker that subscribes to `ChunksPersistenceComplete` events
 //! and generates vector embeddings for documentation chunks using batch processing.
 //!
 //! # Architecture Pattern
 //!
 //! This actor follows the **stateless event broadcaster** pattern:
-//! - Subscribes to `DocumentationChunked` events (trigger)
+//! - Subscribes to `ChunksPersistenceComplete` events (trigger after all chunks persisted)
 //! - Queries chunks from DatabaseActor via `QueryDocChunks` message
 //! - Receives `DocChunksQueryResponse` with actual chunk content
 //! - Batches chunks for efficient API calls (up to 2048 per batch)
@@ -18,21 +18,21 @@
 //! # Event Flow
 //!
 //! ```text
-//! DocumentationChunked → VectorizerActor
-//!                             ↓
-//!                      QueryDocChunks → DatabaseActor
-//!                             ↓
-//!                      DocChunksQueryResponse
-//!                             ↓
-//!                      Batch chunks (max 2048)
-//!                             ↓
-//!                      Call embedding API
-//!                             ↓
-//!         ┌───────────────────┴───────────────────┐
-//!         ↓                                       ↓
-//! EmbeddingGenerated (success)         EmbeddingFailed (error)
-//!         ↓                                       ↓
-//! DatabaseActor (persist)              RetryCoordinator (retry if retryable)
+//! ChunksPersistenceComplete → VectorizerActor
+//!                                  ↓
+//!                           QueryDocChunks → DatabaseActor
+//!                                  ↓
+//!                           DocChunksQueryResponse
+//!                                  ↓
+//!                           Batch chunks (max 2048)
+//!                                  ↓
+//!                           Call embedding API
+//!                                  ↓
+//!              ┌────────────────────┴────────────────────┐
+//!              ↓                                         ↓
+//!  EmbeddingGenerated (success)              EmbeddingFailed (error)
+//!              ↓                                         ↓
+//!  DatabaseActor (persist)                   RetryCoordinator (retry if retryable)
 //! ```
 
 use acton_reactive::prelude::*;
@@ -44,8 +44,8 @@ use thiserror::Error;
 
 use crate::actors::config::VectorizeConfig;
 use crate::messages::{
-    DocChunkData, DocChunksQueryResponse, DocumentationChunked, EmbeddingFailed, EmbeddingGenerated,
-    QueryDocChunks,
+    ChunksPersistenceComplete, DocChunkData, DocChunksQueryResponse, EmbeddingFailed,
+    EmbeddingGenerated, QueryDocChunks,
 };
 
 /// Errors that can occur during embedding generation
@@ -168,8 +168,8 @@ struct Usage {
 
 /// Stateless actor for generating vector embeddings with batch processing
 ///
-/// This actor subscribes to `DocumentationChunked` events and performs the following:
-/// 1. Receives notification that chunks have been created and persisted
+/// This actor subscribes to `ChunksPersistenceComplete` events and performs the following:
+/// 1. Receives notification that all chunks have been persisted to database
 /// 2. Sends QueryDocChunks to DatabaseActor to retrieve chunk content
 /// 3. Subscribes to DocChunksQueryResponse to receive chunk data
 /// 4. Batches chunks for API efficiency (up to 2048 per batch)
@@ -184,7 +184,7 @@ struct Usage {
 ///
 /// # Message Flow
 ///
-/// - Subscribes to: `DocumentationChunked`, `DocChunksQueryResponse`
+/// - Subscribes to: `ChunksPersistenceComplete`, `DocChunksQueryResponse`
 /// - Sends to: DatabaseActor via `QueryDocChunks`
 /// - Broadcasts: `EmbeddingGenerated` (per chunk), `EmbeddingFailed` (on error)
 #[acton_actor]
@@ -213,7 +213,7 @@ impl VectorizerActor {
     /// Spawns, configures, and starts a new VectorizerActor
     ///
     /// This is the standard factory method for creating VectorizerActor actors.
-    /// The VectorizerActor subscribes to `DocumentationChunked` and `DocChunksQueryResponse`
+    /// The VectorizerActor subscribes to `ChunksPersistenceComplete` and `DocChunksQueryResponse`
     /// events to generate embeddings for documentation chunks using batch processing.
     ///
     /// This follows the simple actor pattern where only the handle is returned,
@@ -265,9 +265,9 @@ impl VectorizerActor {
         // Initialize actor with configuration
         builder.model = VectorizerActor::new(config);
 
-        // Handler 1: DocumentationChunked - triggers chunk query
+        // Handler 1: ChunksPersistenceComplete - triggers chunk query
         // Uses act_on because it's stateless (just broadcasts QueryDocChunks)
-        builder.act_on::<DocumentationChunked>(|agent, envelope| {
+        builder.act_on::<ChunksPersistenceComplete>(|agent, envelope| {
             let msg = envelope.message().clone();
             let broker = agent.broker().clone();
 
@@ -275,7 +275,7 @@ impl VectorizerActor {
                 tracing::debug!(
                     specifier = %msg.specifier,
                     chunk_count = msg.chunk_count,
-                    "Received DocumentationChunked event, querying chunks from database"
+                    "Received ChunksPersistenceComplete event, querying chunks from database"
                 );
 
                 // Send QueryDocChunks to DatabaseActor
@@ -367,7 +367,7 @@ impl VectorizerActor {
         let handle = builder.start().await;
 
         // Subscribe to both events through the broker
-        handle.subscribe::<DocumentationChunked>().await;
+        handle.subscribe::<ChunksPersistenceComplete>().await;
         handle.subscribe::<DocChunksQueryResponse>().await;
 
         Ok(handle)
