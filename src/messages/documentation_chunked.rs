@@ -55,6 +55,7 @@ pub struct DocumentationChunked {
     /// The crate that was processed
     pub specifier: CrateSpecifier,
     /// Feature flags for this crate
+    #[allow(dead_code)]
     pub features: Vec<String>,
     /// Number of text chunks created
     pub chunk_count: u32,

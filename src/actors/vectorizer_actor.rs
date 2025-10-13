@@ -1,34 +1,72 @@
 //! Actor responsible for generating vector embeddings from documentation chunks
 //!
 //! The `VectorizerActor` is a stateless worker that subscribes to `DocumentationChunked` events
-//! and generates vector embeddings for each chunk. It reads chunks from the database, calls the
-//! embedding API, and persists the vectors.
+//! and generates vector embeddings for documentation chunks using batch processing.
+//!
+//! # Architecture Pattern
+//!
+//! This actor follows the **stateless event broadcaster** pattern:
+//! - Subscribes to `DocumentationChunked` events (trigger)
+//! - Queries chunks from DatabaseActor via `QueryDocChunks` message
+//! - Receives `DocChunksQueryResponse` with actual chunk content
+//! - Batches chunks for efficient API calls (up to 2048 per batch)
+//! - Calls embedding API with batched inputs
+//! - Broadcasts `EmbeddingGenerated` for each successful embedding
+//! - Broadcasts `EmbeddingFailed` for errors (with retryability classification)
+//! - NO retry logic - RetryCoordinator handles all retries
+//!
+//! # Event Flow
+//!
+//! ```text
+//! DocumentationChunked → VectorizerActor
+//!                             ↓
+//!                      QueryDocChunks → DatabaseActor
+//!                             ↓
+//!                      DocChunksQueryResponse
+//!                             ↓
+//!                      Batch chunks (max 2048)
+//!                             ↓
+//!                      Call embedding API
+//!                             ↓
+//!         ┌───────────────────┴───────────────────┐
+//!         ↓                                       ↓
+//! EmbeddingGenerated (success)         EmbeddingFailed (error)
+//!         ↓                                       ↓
+//! DatabaseActor (persist)              RetryCoordinator (retry if retryable)
+//! ```
 
 use acton_reactive::prelude::*;
 use anyhow::Result;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use thiserror::Error;
 
 use crate::actors::config::VectorizeConfig;
-use crate::crate_specifier::CrateSpecifier;
-use crate::messages::{DocumentationChunked, DocumentationVectorized, PersistEmbedding};
+use crate::messages::{
+    DocChunkData, DocChunksQueryResponse, DocumentationChunked, EmbeddingFailed, EmbeddingGenerated,
+    QueryDocChunks,
+};
 
 /// Errors that can occur during embedding generation
-#[derive(Debug, Error)]
+#[derive(Debug, Error, Clone)]
 pub enum EmbeddingError {
     /// API key not found in environment
     #[error("API key not found. Set OPENAI_API_KEY or EMBEDDING_API_KEY environment variable")]
     MissingApiKey,
 
-    /// HTTP request failed
+    /// HTTP request failed (transient - network issues)
     #[error("HTTP request failed: {0}")]
-    RequestFailed(#[from] reqwest::Error),
+    RequestFailed(String),
 
     /// API returned an error response
-    #[error("API error: {0}")]
-    ApiError(String),
+    #[error("API error (status {status}): {message}")]
+    ApiError {
+        /// HTTP status code
+        status: u16,
+        /// Error message from API
+        message: String,
+    },
 
     /// Response parsing failed
     #[error("Failed to parse API response: {0}")]
@@ -38,23 +76,61 @@ pub enum EmbeddingError {
     #[error("Invalid response format: {0}")]
     InvalidResponse(String),
 
-    /// Dimension mismatch
+    /// Dimension mismatch (permanent error)
     #[error("Vector dimension mismatch: expected {expected}, got {actual}")]
     DimensionMismatch { expected: usize, actual: usize },
+
+    /// Batch size exceeded
+    #[error("Batch size {actual} exceeds maximum {max}")]
+    BatchSizeExceeded { actual: usize, max: usize },
 }
 
-/// OpenAI API request format for embedding generation
+impl EmbeddingError {
+    /// Classify error as retryable or permanent
+    ///
+    /// Retryable errors:
+    /// - Network failures (timeouts, connection errors)
+    /// - Rate limits (429)
+    /// - Server errors (5xx)
+    ///
+    /// Permanent errors:
+    /// - Invalid API key (401, 403)
+    /// - Bad requests (4xx except 429)
+    /// - Dimension mismatches
+    /// - Batch size violations
+    pub fn is_retryable(&self) -> bool {
+        match self {
+            // Transient network errors
+            EmbeddingError::RequestFailed(_) => true,
+
+            // API errors classified by status code
+            EmbeddingError::ApiError { status, .. } => {
+                // Rate limits and server errors are retryable
+                *status == 429 || (500..600).contains(status)
+            }
+
+            // Permanent errors
+            EmbeddingError::MissingApiKey => false,
+            EmbeddingError::ParseError(_) => false,
+            EmbeddingError::InvalidResponse(_) => false,
+            EmbeddingError::DimensionMismatch { .. } => false,
+            EmbeddingError::BatchSizeExceeded { .. } => false,
+        }
+    }
+}
+
+/// OpenAI API request format for batch embedding generation
 #[derive(Debug, Serialize)]
 struct EmbeddingRequest {
-    /// Text to embed
-    input: String,
+    /// Array of texts to embed (up to 2048)
+    input: Vec<String>,
     /// Model name (e.g., "text-embedding-3-small")
     model: String,
     /// Encoding format (always "float" for f32 vectors)
     encoding_format: String,
 }
 
-/// OpenAI API response format for embedding generation
+/// OpenAI API response format for batch embedding generation
 #[derive(Debug, Deserialize)]
 struct EmbeddingResponse {
     /// Response object type (should be "list")
@@ -63,11 +139,9 @@ struct EmbeddingResponse {
     /// Array of embedding data
     data: Vec<EmbeddingData>,
     /// Model used for generation
-    #[serde(rename = "model")]
-    _model: String,
+    model: String,
     /// Token usage statistics
-    #[serde(rename = "usage")]
-    _usage: Option<Usage>,
+    usage: Usage,
 }
 
 /// Embedding data within the API response
@@ -76,9 +150,9 @@ struct EmbeddingData {
     /// Object type (should be "embedding")
     #[serde(rename = "object")]
     _object: String,
-    /// Index in the response array
-    #[serde(rename = "index")]
-    _index: usize,
+    /// Index in the request array
+    #[allow(dead_code)]
+    index: usize,
     /// The actual embedding vector
     embedding: Vec<f32>,
 }
@@ -87,21 +161,21 @@ struct EmbeddingData {
 #[derive(Debug, Deserialize)]
 struct Usage {
     /// Number of prompt tokens
-    #[serde(rename = "prompt_tokens")]
-    _prompt_tokens: usize,
+    prompt_tokens: usize,
     /// Total tokens used
-    #[serde(rename = "total_tokens")]
-    _total_tokens: usize,
+    total_tokens: usize,
 }
 
-/// Stateless actor for generating vector embeddings
+/// Stateless actor for generating vector embeddings with batch processing
 ///
 /// This actor subscribes to `DocumentationChunked` events and performs the following:
 /// 1. Receives notification that chunks have been created and persisted
-/// 2. Queries chunks from database using chunk IDs
-/// 3. Generates embeddings using configured embedding model (mock for now)
-/// 4. Persists embeddings to database via `PersistEmbedding` messages
-/// 5. Broadcasts `DocumentationVectorized` on success
+/// 2. Sends QueryDocChunks to DatabaseActor to retrieve chunk content
+/// 3. Subscribes to DocChunksQueryResponse to receive chunk data
+/// 4. Batches chunks for API efficiency (up to 2048 per batch)
+/// 5. Generates embeddings using configured embedding model
+/// 6. Broadcasts EmbeddingGenerated for each successful embedding
+/// 7. Broadcasts EmbeddingFailed for errors (NO retry logic in this actor)
 ///
 /// # State
 ///
@@ -110,8 +184,9 @@ struct Usage {
 ///
 /// # Message Flow
 ///
-/// - Subscribes to: `DocumentationChunked`
-/// - Broadcasts: `PersistEmbedding` (for each chunk), `DocumentationVectorized`
+/// - Subscribes to: `DocumentationChunked`, `DocChunksQueryResponse`
+/// - Sends to: DatabaseActor via `QueryDocChunks`
+/// - Broadcasts: `EmbeddingGenerated` (per chunk), `EmbeddingFailed` (on error)
 #[acton_actor]
 pub struct VectorizerActor {
     /// Vectorization configuration (immutable)
@@ -138,8 +213,8 @@ impl VectorizerActor {
     /// Spawns, configures, and starts a new VectorizerActor
     ///
     /// This is the standard factory method for creating VectorizerActor actors.
-    /// The VectorizerActor subscribes to `DocumentationChunked` events and generates
-    /// embeddings for documentation chunks, broadcasting success events.
+    /// The VectorizerActor subscribes to `DocumentationChunked` and `DocChunksQueryResponse`
+    /// events to generate embeddings for documentation chunks using batch processing.
     ///
     /// This follows the simple actor pattern where only the handle is returned,
     /// as the VectorizerActor has no startup data to provide to the application.
@@ -147,7 +222,7 @@ impl VectorizerActor {
     /// # Arguments
     ///
     /// * `runtime` - Mutable reference to the acton-reactive runtime
-    /// * `config` - Vectorization configuration including model and dimensions
+    /// * `config` - Vectorization configuration including model, dimensions, and batch size
     ///
     /// # Returns
     ///
@@ -190,36 +265,100 @@ impl VectorizerActor {
         // Initialize actor with configuration
         builder.model = VectorizerActor::new(config);
 
-        // Subscribe to DocumentationChunked events
+        // Handler 1: DocumentationChunked - triggers chunk query
+        // Uses act_on because it's stateless (just broadcasts QueryDocChunks)
         builder.act_on::<DocumentationChunked>(|agent, envelope| {
+            let msg = envelope.message().clone();
+            let broker = agent.broker().clone();
+
+            AgentReply::from_async(async move {
+                tracing::debug!(
+                    specifier = %msg.specifier,
+                    chunk_count = msg.chunk_count,
+                    "Received DocumentationChunked event, querying chunks from database"
+                );
+
+                // Send QueryDocChunks to DatabaseActor
+                broker
+                    .broadcast(QueryDocChunks {
+                        specifier: msg.specifier,
+                    })
+                    .await;
+            })
+        });
+
+        // Handler 2: DocChunksQueryResponse - processes chunks and generates embeddings
+        // Uses act_on because it's stateless (broadcasts events, no actor state mutation)
+        builder.act_on::<DocChunksQueryResponse>(|agent, envelope| {
             let msg = envelope.message().clone();
             let broker = agent.broker().clone();
             let config = agent.model.config.clone();
 
             AgentReply::from_async(async move {
-                let start_time = Instant::now();
+                if msg.chunks.is_empty() {
+                    tracing::warn!(
+                        specifier = %msg.specifier,
+                        "Received empty chunk list, skipping vectorization"
+                    );
+                    return;
+                }
 
-                match vectorize_chunks(&config, &broker, &msg.specifier, msg.chunk_count).await {
-                    Ok(vector_count) => {
-                        let duration_ms = start_time.elapsed().as_millis() as u64;
+                tracing::info!(
+                    specifier = %msg.specifier,
+                    chunk_count = msg.chunks.len(),
+                    batch_size = config.batch_size,
+                    "Processing chunks for vectorization"
+                );
 
-                        // Broadcast DocumentationVectorized event with statistics
-                        broker
-                            .broadcast(DocumentationVectorized {
-                                specifier: msg.specifier,
-                                features: msg.features,
-                                vector_count,
-                                embedding_model: config.model_name.clone(),
-                                vectorization_duration_ms: duration_ms,
-                            })
-                            .await;
-                    }
-                    Err(e) => {
-                        tracing::error!(
-                            "Failed to vectorize documentation for {}: {:#}",
-                            msg.specifier,
-                            e
-                        );
+                // Process chunks in batches
+                let batches = create_batches(&msg.chunks, config.batch_size);
+
+                for (batch_idx, batch) in batches.iter().enumerate() {
+                    tracing::debug!(
+                        specifier = %msg.specifier,
+                        batch_idx = batch_idx,
+                        batch_size = batch.len(),
+                        "Processing batch"
+                    );
+
+                    // Generate embeddings for this batch
+                    match generate_batch_embeddings(&config, batch).await {
+                        Ok(embeddings) => {
+                            // Broadcast EmbeddingGenerated for each successful embedding
+                            for (chunk, vector) in batch.iter().zip(embeddings.iter()) {
+                                broker
+                                    .broadcast(EmbeddingGenerated {
+                                        specifier: msg.specifier.clone(),
+                                        chunk_id: chunk.chunk_id.clone(),
+                                        vector: vector.clone(),
+                                        model_name: config.model_name.clone(),
+                                        model_version: config.model_version.clone(),
+                                    })
+                                    .await;
+                            }
+                        }
+                        Err(e) => {
+                            // Broadcast EmbeddingFailed for each chunk in the failed batch
+                            let retryable = e.is_retryable();
+                            for chunk in batch.iter() {
+                                tracing::error!(
+                                    specifier = %msg.specifier,
+                                    chunk_id = %chunk.chunk_id,
+                                    error = %e,
+                                    retryable = retryable,
+                                    "Failed to generate embedding"
+                                );
+
+                                broker
+                                    .broadcast(EmbeddingFailed {
+                                        specifier: msg.specifier.clone(),
+                                        chunk_id: chunk.chunk_id.clone(),
+                                        error: e.to_string(),
+                                        retryable,
+                                    })
+                                    .await;
+                            }
+                        }
                     }
                 }
             })
@@ -227,235 +366,301 @@ impl VectorizerActor {
 
         let handle = builder.start().await;
 
-        // Subscribe to DocumentationChunked events through the broker
+        // Subscribe to both events through the broker
         handle.subscribe::<DocumentationChunked>().await;
+        handle.subscribe::<DocChunksQueryResponse>().await;
 
         Ok(handle)
     }
 }
 
-/// Generates embeddings for documentation chunks
+/// Creates batches of chunks for efficient API processing
 ///
-/// This function generates real embeddings by calling an OpenAI-compatible API for each chunk
-/// and broadcasts `PersistEmbedding` messages to the DatabaseActor for persistence.
+/// Splits chunks into batches of the specified size, respecting the maximum
+/// batch size limit (2048 for OpenAI API).
 ///
 /// # Arguments
 ///
-/// * `config` - Vectorization configuration with API settings and model
-/// * `broker` - Message broker handle for broadcasting persistence messages
-/// * `specifier` - Crate name and version for context
-/// * `chunk_count` - Number of chunks to vectorize
+/// * `chunks` - All documentation chunks to batch
+/// * `batch_size` - Desired batch size (must be <= 2048)
 ///
 /// # Returns
 ///
-/// Returns the number of vectors created on success
-///
-/// # Errors
-///
-/// Returns an error if:
-/// - Database queries fail
-/// - Embedding generation fails
-/// - Vector persistence fails
-async fn vectorize_chunks(
-    config: &VectorizeConfig,
-    broker: &AgentHandle,
-    specifier: &CrateSpecifier,
-    chunk_count: u32,
-) -> Result<u32> {
-    // TODO(#58): In the future, we should:
-    // See: https://github.com/Govcraft/crately/issues/58
-    // 1. Query actual chunk text from database using chunk IDs
-    // 2. Batch chunks for API calls (OpenAI supports up to 2048 inputs per request)
-    // 3. Implement batching for efficiency
-    //
-    // For now, we'll generate mock text and call the API one chunk at a time
+/// Returns a vector of batches, where each batch is a slice of chunks
+fn create_batches(chunks: &[DocChunkData], batch_size: usize) -> Vec<Vec<DocChunkData>> {
+    let effective_batch_size = batch_size.min(2048);
 
-    // Simulate processing each chunk
-    for index in 0..chunk_count {
-        let chunk_id = format!(
-            "{}_{}_{:03}",
-            specifier.name().replace('-', "_"),
-            specifier.version().to_string().replace('.', "_"),
-            index
-        );
-
-        // TODO(#57, #58): Query actual chunk text from database
-        // See: https://github.com/Govcraft/crately/issues/57
-        // See: https://github.com/Govcraft/crately/issues/58
-        // For now, use a placeholder text
-        let chunk_text = format!(
-            "Documentation chunk {} for {} version {}",
-            index,
-            specifier.name(),
-            specifier.version()
-        );
-
-        // Generate real embedding vector by calling the API
-        let embedding_vector = generate_embedding(config, &chunk_text).await?;
-
-        // Broadcast PersistEmbedding message to DatabaseActor
-        broker
-            .broadcast(PersistEmbedding {
-                chunk_id: chunk_id.clone(),
-                specifier: specifier.clone(),
-                vector: embedding_vector,
-                model_name: config.model_name.clone(),
-                model_version: config.model_version.clone(),
-            })
-            .await;
-    }
-
-    Ok(chunk_count)
+    chunks
+        .chunks(effective_batch_size)
+        .map(|chunk_slice| chunk_slice.to_vec())
+        .collect()
 }
 
-/// Calls OpenAI-compatible embedding API to generate real vectors
+/// Generates embeddings for a batch of chunks using the embedding API
 ///
-/// Implements retry logic with exponential backoff and proper error handling.
-/// Supports any OpenAI-compatible embedding API endpoint.
+/// Calls the OpenAI-compatible embedding API with multiple inputs for efficient
+/// batch processing. Returns vectors in the same order as input chunks.
 ///
 /// # Arguments
 ///
 /// * `config` - Vectorization configuration with API settings
-/// * `text` - Text content to embed
+/// * `chunks` - Batch of chunks to embed (up to 2048)
 ///
 /// # Returns
 ///
-/// Returns a vector of f32 values representing the semantic embedding
+/// Returns a vector of embedding vectors, one per input chunk, in order
 ///
 /// # Errors
 ///
 /// Returns an error if:
-/// - API request fails after retries
+/// - Batch size exceeds 2048
+/// - API request fails
 /// - Response parsing fails
-/// - API returns error response
-/// - API key is missing
-/// - Vector dimension doesn't match configuration
-async fn generate_embedding(
+/// - Vector dimensions don't match configuration
+async fn generate_batch_embeddings(
     config: &VectorizeConfig,
-    text: &str,
-) -> Result<Vec<f32>, EmbeddingError> {
-    // Get API key from environment variable
+    chunks: &[DocChunkData],
+) -> Result<Vec<Vec<f32>>, EmbeddingError> {
+    // Validate batch size
+    if chunks.len() > 2048 {
+        return Err(EmbeddingError::BatchSizeExceeded {
+            actual: chunks.len(),
+            max: 2048,
+        });
+    }
+
+    if chunks.is_empty() {
+        return Ok(vec![]);
+    }
+
+    // Get API key from environment
     let api_key = std::env::var("OPENAI_API_KEY")
         .or_else(|_| std::env::var("EMBEDDING_API_KEY"))
         .map_err(|_| EmbeddingError::MissingApiKey)?;
 
     // Build HTTP client with timeout
     let timeout = Duration::from_secs(config.request_timeout_secs);
-    let client = Client::builder().timeout(timeout).build()?;
+    let client = Client::builder()
+        .timeout(timeout)
+        .build()
+        .map_err(|e| EmbeddingError::RequestFailed(e.to_string()))?;
 
-    // Create API request body
+    // Extract text from chunks for batch request
+    let texts: Vec<String> = chunks.iter().map(|chunk| chunk.content.clone()).collect();
+
+    // Create batch API request
     let request_body = EmbeddingRequest {
-        input: text.to_string(),
+        input: texts,
         model: config.model_name.clone(),
         encoding_format: "float".to_string(),
     };
 
-    // Implement retry logic with exponential backoff
-    let mut attempts = 0;
-    let mut retry_delay = Duration::from_secs(config.retry_delay_secs);
+    // Make API request (NO retry logic - RetryCoordinator handles retries)
+    let response = client
+        .post(&config.api_endpoint)
+        .header("Authorization", format!("Bearer {}", api_key))
+        .header("Content-Type", "application/json")
+        .json(&request_body)
+        .send()
+        .await
+        .map_err(|e| EmbeddingError::RequestFailed(e.to_string()))?;
 
-    loop {
-        attempts += 1;
-
-        match client
-            .post(&config.api_endpoint)
-            .header("Authorization", format!("Bearer {}", api_key))
-            .header("Content-Type", "application/json")
-            .json(&request_body)
-            .send()
+    // Check response status
+    let status = response.status();
+    if !status.is_success() {
+        let error_text = response
+            .text()
             .await
-        {
-            Ok(response) => {
-                // Check if response is successful
-                if !response.status().is_success() {
-                    let status = response.status();
-                    let error_text = response
-                        .text()
-                        .await
-                        .unwrap_or_else(|_| "Unknown error".to_string());
+            .unwrap_or_else(|_| "Unknown error".to_string());
 
-                    // Retry on rate limit (429) or server errors (5xx)
-                    if (status.as_u16() == 429 || status.is_server_error())
-                        && attempts <= config.max_retries
-                    {
-                        tracing::warn!(
-                            "API request failed with status {}, retrying in {:?} (attempt {}/{})",
-                            status,
-                            retry_delay,
-                            attempts,
-                            config.max_retries
-                        );
-                        tokio::time::sleep(retry_delay).await;
-                        retry_delay *= 2; // Exponential backoff
-                        continue;
-                    }
-
-                    return Err(EmbeddingError::ApiError(format!(
-                        "Status {}: {}",
-                        status, error_text
-                    )));
-                }
-
-                // Parse JSON response
-                let embedding_response: EmbeddingResponse = response
-                    .json()
-                    .await
-                    .map_err(|e| EmbeddingError::ParseError(e.to_string()))?;
-
-                // Extract embedding vector from first data element
-                if embedding_response.data.is_empty() {
-                    return Err(EmbeddingError::InvalidResponse(
-                        "No embedding data in response".to_string(),
-                    ));
-                }
-
-                let embedding = embedding_response.data[0].embedding.clone();
-
-                // Verify dimension matches configuration
-                if embedding.len() != config.vector_dimension {
-                    return Err(EmbeddingError::DimensionMismatch {
-                        expected: config.vector_dimension,
-                        actual: embedding.len(),
-                    });
-                }
-
-                return Ok(embedding);
-            }
-            Err(e) => {
-                // Retry on network errors
-                if attempts <= config.max_retries {
-                    tracing::warn!(
-                        "Network error: {}, retrying in {:?} (attempt {}/{})",
-                        e,
-                        retry_delay,
-                        attempts,
-                        config.max_retries
-                    );
-                    tokio::time::sleep(retry_delay).await;
-                    retry_delay *= 2; // Exponential backoff
-                    continue;
-                }
-
-                return Err(EmbeddingError::RequestFailed(e));
-            }
-        }
+        return Err(EmbeddingError::ApiError {
+            status: status.as_u16(),
+            message: error_text,
+        });
     }
+
+    // Parse JSON response
+    let embedding_response: EmbeddingResponse = response
+        .json()
+        .await
+        .map_err(|e| EmbeddingError::ParseError(e.to_string()))?;
+
+    // Validate response data
+    if embedding_response.data.is_empty() {
+        return Err(EmbeddingError::InvalidResponse(
+            "No embedding data in response".to_string(),
+        ));
+    }
+
+    if embedding_response.data.len() != chunks.len() {
+        return Err(EmbeddingError::InvalidResponse(format!(
+            "Expected {} embeddings, got {}",
+            chunks.len(),
+            embedding_response.data.len()
+        )));
+    }
+
+    // Extract and validate embeddings
+    let mut embeddings = Vec::with_capacity(embedding_response.data.len());
+
+    for embedding_data in &embedding_response.data {
+        // Verify dimension matches configuration
+        if embedding_data.embedding.len() != config.vector_dimension {
+            return Err(EmbeddingError::DimensionMismatch {
+                expected: config.vector_dimension,
+                actual: embedding_data.embedding.len(),
+            });
+        }
+
+        embeddings.push(embedding_data.embedding.clone());
+    }
+
+    // Log token usage
+    tracing::debug!(
+        batch_size = chunks.len(),
+        prompt_tokens = embedding_response.usage.prompt_tokens,
+        total_tokens = embedding_response.usage.total_tokens,
+        model = embedding_response.model,
+        "Successfully generated batch embeddings"
+    );
+
+    Ok(embeddings)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// Generate a mock embedding for testing purposes
-    ///
-    /// This function provides deterministic mock embeddings for testing when
-    /// an API key is not available. It should only be used in tests.
-    fn generate_mock_embedding(dimension: usize) -> Vec<f32> {
-        // Create a deterministic vector based on dimension
-        // Values in range [-0.5, 0.5] for reasonable mock data
-        (0..dimension)
-            .map(|i| ((i % 100) as f32 / 100.0) - 0.5)
-            .collect()
+    #[test]
+    fn test_create_batches_single_batch() {
+        let chunks: Vec<DocChunkData> = (0..50)
+            .map(|i| DocChunkData {
+                chunk_id: format!("chunk_{}", i),
+                chunk_index: i,
+                content: format!("Content {}", i),
+                content_type: "text".to_string(),
+                source_file: "test.md".to_string(),
+                token_count: 100,
+                char_count: 500,
+            })
+            .collect();
+
+        let batches = create_batches(&chunks, 100);
+        assert_eq!(batches.len(), 1);
+        assert_eq!(batches[0].len(), 50);
+    }
+
+    #[test]
+    fn test_create_batches_multiple_batches() {
+        let chunks: Vec<DocChunkData> = (0..250)
+            .map(|i| DocChunkData {
+                chunk_id: format!("chunk_{}", i),
+                chunk_index: i,
+                content: format!("Content {}", i),
+                content_type: "text".to_string(),
+                source_file: "test.md".to_string(),
+                token_count: 100,
+                char_count: 500,
+            })
+            .collect();
+
+        let batches = create_batches(&chunks, 100);
+        assert_eq!(batches.len(), 3);
+        assert_eq!(batches[0].len(), 100);
+        assert_eq!(batches[1].len(), 100);
+        assert_eq!(batches[2].len(), 50);
+    }
+
+    #[test]
+    fn test_create_batches_respects_max_size() {
+        let chunks: Vec<DocChunkData> = (0..3000)
+            .map(|i| DocChunkData {
+                chunk_id: format!("chunk_{}", i),
+                chunk_index: i,
+                content: format!("Content {}", i),
+                content_type: "text".to_string(),
+                source_file: "test.md".to_string(),
+                token_count: 100,
+                char_count: 500,
+            })
+            .collect();
+
+        // Request size larger than max - should be clamped to 2048
+        let batches = create_batches(&chunks, 3000);
+        assert_eq!(batches[0].len(), 2048);
+    }
+
+    #[test]
+    fn test_create_batches_empty() {
+        let chunks: Vec<DocChunkData> = vec![];
+        let batches = create_batches(&chunks, 100);
+        assert_eq!(batches.len(), 0);
+    }
+
+    #[test]
+    fn test_embedding_error_is_retryable_network() {
+        let error = EmbeddingError::RequestFailed("Connection timeout".to_string());
+        assert!(error.is_retryable());
+    }
+
+    #[test]
+    fn test_embedding_error_is_retryable_rate_limit() {
+        let error = EmbeddingError::ApiError {
+            status: 429,
+            message: "Rate limit exceeded".to_string(),
+        };
+        assert!(error.is_retryable());
+    }
+
+    #[test]
+    fn test_embedding_error_is_retryable_server_error() {
+        let error = EmbeddingError::ApiError {
+            status: 500,
+            message: "Internal server error".to_string(),
+        };
+        assert!(error.is_retryable());
+    }
+
+    #[test]
+    fn test_embedding_error_not_retryable_auth() {
+        let error = EmbeddingError::ApiError {
+            status: 401,
+            message: "Unauthorized".to_string(),
+        };
+        assert!(!error.is_retryable());
+    }
+
+    #[test]
+    fn test_embedding_error_not_retryable_bad_request() {
+        let error = EmbeddingError::ApiError {
+            status: 400,
+            message: "Bad request".to_string(),
+        };
+        assert!(!error.is_retryable());
+    }
+
+    #[test]
+    fn test_embedding_error_not_retryable_missing_key() {
+        let error = EmbeddingError::MissingApiKey;
+        assert!(!error.is_retryable());
+    }
+
+    #[test]
+    fn test_embedding_error_not_retryable_dimension_mismatch() {
+        let error = EmbeddingError::DimensionMismatch {
+            expected: 1536,
+            actual: 384,
+        };
+        assert!(!error.is_retryable());
+    }
+
+    #[test]
+    fn test_embedding_error_not_retryable_batch_size() {
+        let error = EmbeddingError::BatchSizeExceeded {
+            actual: 3000,
+            max: 2048,
+        };
+        assert!(!error.is_retryable());
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -478,100 +683,6 @@ mod tests {
         let config = VectorizeConfig::default();
         let actor = VectorizerActor::new(config.clone());
         assert_eq!(actor.config.model_name, config.model_name);
-    }
-
-    #[test]
-    fn test_generate_mock_embedding_dimension_384() {
-        let embedding = generate_mock_embedding(384);
-        assert_eq!(embedding.len(), 384, "Should generate 384-dimensional vector");
-    }
-
-    #[test]
-    fn test_generate_mock_embedding_dimension_1536() {
-        let embedding = generate_mock_embedding(1536);
-        assert_eq!(
-            embedding.len(),
-            1536,
-            "Should generate 1536-dimensional vector"
-        );
-    }
-
-    #[test]
-    fn test_generate_mock_embedding_values_in_range() {
-        let embedding = generate_mock_embedding(100);
-        for value in embedding {
-            assert!(
-                (-0.5..=0.5).contains(&value),
-                "Embedding values should be in range [-0.5, 0.5]"
-            );
-        }
-    }
-
-    #[test]
-    fn test_generate_mock_embedding_deterministic() {
-        let embedding1 = generate_mock_embedding(50);
-        let embedding2 = generate_mock_embedding(50);
-        assert_eq!(
-            embedding1, embedding2,
-            "Mock embeddings should be deterministic"
-        );
-    }
-
-    #[test]
-    fn test_generate_mock_embedding_zero_dimension() {
-        let embedding = generate_mock_embedding(0);
-        assert!(embedding.is_empty(), "Zero dimension should produce empty vector");
-    }
-
-    #[test]
-    fn test_embedding_error_display() {
-        let error = EmbeddingError::MissingApiKey;
-        assert!(error.to_string().contains("API key not found"));
-
-        let error = EmbeddingError::DimensionMismatch {
-            expected: 1536,
-            actual: 384,
-        };
-        assert!(error.to_string().contains("expected 1536"));
-        assert!(error.to_string().contains("got 384"));
-    }
-
-    #[test]
-    fn test_embedding_request_serialization() {
-        let request = EmbeddingRequest {
-            input: "test text".to_string(),
-            model: "text-embedding-3-small".to_string(),
-            encoding_format: "float".to_string(),
-        };
-
-        let json = serde_json::to_string(&request).unwrap();
-        assert!(json.contains("test text"));
-        assert!(json.contains("text-embedding-3-small"));
-        assert!(json.contains("float"));
-    }
-
-    #[test]
-    fn test_embedding_response_deserialization() {
-        let json = r#"{
-            "object": "list",
-            "data": [
-                {
-                    "object": "embedding",
-                    "index": 0,
-                    "embedding": [0.1, 0.2, 0.3]
-                }
-            ],
-            "model": "text-embedding-3-small",
-            "usage": {
-                "prompt_tokens": 5,
-                "total_tokens": 5
-            }
-        }"#;
-
-        let response: EmbeddingResponse = serde_json::from_str(json).unwrap();
-        assert_eq!(response._object, "list");
-        assert_eq!(response.data.len(), 1);
-        assert_eq!(response.data[0].embedding.len(), 3);
-        assert_eq!(response._model, "text-embedding-3-small");
+        assert_eq!(actor.config.batch_size, config.batch_size);
     }
 }
