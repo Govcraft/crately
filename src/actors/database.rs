@@ -21,10 +21,11 @@ use crate::crate_specifier::CrateSpecifier;
 use crate::messages::{
     ChunksPersistenceComplete, CrateDownloadFailed, CrateDownloaded, CrateListResponse,
     CrateProcessingFailed, CrateQueryResponse, CrateReceived, CrateSummary, DatabaseError,
-    DatabaseReady, DocChunkPersisted, DocumentationExtracted, DocumentationExtractionFailed,
-    EmbeddingPersisted, EmbeddingsPersistenceComplete, ListCrates, PersistCodeSample, PersistCrate,
-    PersistDocChunk, PersistEmbedding, PrintWarning, QueryCrate, QuerySimilarDocs,
-    SimilarDocsResponse,
+    DatabaseReady, DocChunkData, DocChunkPersisted, DocChunksQueryResponse,
+    DocumentationExtracted, DocumentationExtractionFailed, EmbeddingPersisted,
+    EmbeddingsPersistenceComplete, ListCrates, PersistCodeSample, PersistCrate,
+    PersistDocChunk, PersistEmbedding, PrintWarning, QueryCrate, QueryDocChunks,
+    QuerySimilarDocs, SimilarDocsResponse,
 };
 
 #[cfg(test)]
@@ -488,6 +489,62 @@ impl DatabaseActor {
                                 error: e.to_string(),
                             })
                             .await;
+                    }
+                }
+            })
+        });
+
+        // Handle QueryDocChunks - retrieve all chunks for a crate
+        builder.act_on::<QueryDocChunks>(|agent, envelope| {
+            let msg = envelope.message().clone();
+            let db = agent.model.db.clone();
+            let broker = agent.broker().clone();
+
+            Box::pin(async move {
+                let name = msg.specifier.name().to_string();
+                let version = msg.specifier.version().to_string();
+
+                // Query all chunks for this crate, ordered by chunk_index
+                let query = r#"
+                    SELECT chunk_id, chunk_index, content, content_type, source_file, token_count, char_count
+                    FROM doc_chunk
+                    WHERE crate_id = (SELECT id FROM crate WHERE name = $name AND version = $version LIMIT 1)
+                    ORDER BY chunk_index ASC
+                "#;
+
+                match db.query(query)
+                    .bind(("name", name.clone()))
+                    .bind(("version", version.clone()))
+                    .await
+                {
+                    Ok(mut response) => {
+                        let chunks: Result<Vec<DocChunkData>, _> = response.take(0);
+
+                        match chunks {
+                            Ok(chunks) => {
+                                debug!("Found {} chunks for {}@{}", chunks.len(), name, version);
+                                broker.broadcast(DocChunksQueryResponse {
+                                    specifier: msg.specifier,
+                                    chunks,
+                                }).await;
+                            }
+                            Err(e) => {
+                                error!("Failed to parse chunk query results for {}@{}: {}", name, version, e);
+                                // Broadcast empty response on parse error
+                                broker.broadcast(DocChunksQueryResponse {
+                                    specifier: msg.specifier,
+                                    chunks: vec![],
+                                }).await;
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        error!("Failed to query chunks for {}@{}: {}", name, version, e);
+                        // Broadcast empty response on query error
+                        broker.broadcast(DocChunksQueryResponse {
+                            specifier: msg.specifier,
+                            chunks: vec![],
+                        }).await;
                     }
                 }
             })
@@ -1967,6 +2024,9 @@ impl DatabaseActor {
         // Subscribe to persistence messages broadcasted from other actors
         handle.subscribe::<PersistDocChunk>().await;
         handle.subscribe::<PersistEmbedding>().await;
+
+        // Subscribe to query messages
+        handle.subscribe::<QueryDocChunks>().await;
 
         let db_info = DatabaseInfo {
             db_path,
@@ -3686,6 +3746,297 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(100)).await;
 
             // Clean shutdown
+            db_handle.stop().await.unwrap();
+            runtime.shutdown_all().await.unwrap();
+
+            cleanup_test_db(&test_db_path).await;
+        })
+        .await
+        .expect("Test should complete within timeout");
+    }
+
+    /// Test QueryDocChunks returns chunks in correct order
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_query_doc_chunks_returns_ordered_chunks() {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            let mut runtime = ActonApp::launch();
+            let test_db_path = create_test_db_path("query_doc_chunks_ordered");
+
+            let (db_handle, _db_info) = DatabaseActor::spawn(&mut runtime, test_db_path.clone())
+                .await
+                .expect("Failed to spawn DatabaseActor");
+
+            tokio::time::sleep(Duration::from_millis(200)).await;
+
+            // First persist a crate
+            let specifier = CrateSpecifier::from_str("test_crate@1.0.0").unwrap();
+            db_handle
+                .send(PersistCrate {
+                    specifier: specifier.clone(),
+                    features: vec!["test".to_string()],
+                })
+                .await;
+
+            tokio::time::sleep(Duration::from_millis(200)).await;
+
+            // Persist three doc chunks in non-sequential order to test ordering
+            for (chunk_index, chunk_content) in [
+                (2, "Third chunk content"),
+                (0, "First chunk content"),
+                (1, "Second chunk content"),
+            ] {
+                let chunk_metadata = ChunkMetadata {
+                    content_type: "markdown".to_string(),
+                    start_line: Some(chunk_index * 10),
+                    end_line: Some((chunk_index + 1) * 10),
+                    token_count: 50,
+                    char_count: 200,
+                    parent_module: None,
+                    item_type: None,
+                    item_name: None,
+                };
+
+                db_handle
+                    .send(PersistDocChunk {
+                        specifier: specifier.clone(),
+                        chunk_index,
+                        chunk_id: format!("test_chunk_{}", chunk_index),
+                        source_file: "README.md".to_string(),
+                        content: chunk_content.to_string(),
+                        metadata: chunk_metadata,
+                    })
+                    .await;
+
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+
+            // Create subscriber to receive the query response
+            #[acton_actor]
+            #[derive(Default)]
+            struct ChunkQuerySubscriber {
+                responses: Vec<DocChunksQueryResponse>,
+            }
+
+            let mut subscriber_builder = runtime.new_agent::<ChunkQuerySubscriber>().await;
+
+            subscriber_builder.mutate_on::<DocChunksQueryResponse>(|agent, envelope| {
+                let msg = envelope.message().clone();
+                agent.model.responses.push(msg);
+                AgentReply::immediate()
+            });
+
+            subscriber_builder.after_stop(|agent| {
+                assert_eq!(
+                    agent.model.responses.len(),
+                    1,
+                    "Should receive exactly one response"
+                );
+
+                let response = &agent.model.responses[0];
+                assert_eq!(
+                    response.chunks.len(),
+                    3,
+                    "Should have 3 chunks"
+                );
+
+                // Verify chunks are ordered by chunk_index
+                for (i, chunk) in response.chunks.iter().enumerate() {
+                    assert_eq!(
+                        chunk.chunk_index, i as u32,
+                        "Chunk at position {} should have index {}",
+                        i, i
+                    );
+                }
+
+                // Verify content order
+                assert_eq!(response.chunks[0].content, "First chunk content");
+                assert_eq!(response.chunks[1].content, "Second chunk content");
+                assert_eq!(response.chunks[2].content, "Third chunk content");
+
+                // Verify all metadata fields are populated correctly
+                assert_eq!(response.chunks[0].chunk_id, "test_chunk_0");
+                assert_eq!(response.chunks[0].content_type, "markdown");
+                assert_eq!(response.chunks[0].source_file, "README.md");
+                assert_eq!(response.chunks[0].token_count, 50);
+                assert_eq!(response.chunks[0].char_count, 200);
+
+                AgentReply::immediate()
+            });
+
+            subscriber_builder
+                .handle()
+                .subscribe::<DocChunksQueryResponse>()
+                .await;
+            let subscriber_handle = subscriber_builder.start().await;
+
+            // Query the chunks
+            db_handle
+                .send(QueryDocChunks {
+                    specifier: specifier.clone(),
+                })
+                .await;
+
+            tokio::time::sleep(Duration::from_millis(200)).await;
+
+            // Clean shutdown
+            subscriber_handle.stop().await.unwrap();
+            db_handle.stop().await.unwrap();
+            runtime.shutdown_all().await.unwrap();
+
+            cleanup_test_db(&test_db_path).await;
+        })
+        .await
+        .expect("Test should complete within timeout");
+    }
+
+    /// Test QueryDocChunks returns empty vector for crate with no chunks
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_query_doc_chunks_empty_for_crate_without_chunks() {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            let mut runtime = ActonApp::launch();
+            let test_db_path = create_test_db_path("query_doc_chunks_empty");
+
+            let (db_handle, _db_info) = DatabaseActor::spawn(&mut runtime, test_db_path.clone())
+                .await
+                .expect("Failed to spawn DatabaseActor");
+
+            tokio::time::sleep(Duration::from_millis(200)).await;
+
+            // Persist a crate but no chunks
+            let specifier = CrateSpecifier::from_str("empty_crate@1.0.0").unwrap();
+            db_handle
+                .send(PersistCrate {
+                    specifier: specifier.clone(),
+                    features: vec![],
+                })
+                .await;
+
+            tokio::time::sleep(Duration::from_millis(200)).await;
+
+            // Create subscriber
+            #[acton_actor]
+            #[derive(Default)]
+            struct EmptyChunkSubscriber {
+                responses: Vec<DocChunksQueryResponse>,
+            }
+
+            let mut subscriber_builder = runtime.new_agent::<EmptyChunkSubscriber>().await;
+
+            subscriber_builder.mutate_on::<DocChunksQueryResponse>(|agent, envelope| {
+                let msg = envelope.message().clone();
+                agent.model.responses.push(msg);
+                AgentReply::immediate()
+            });
+
+            subscriber_builder.after_stop(|agent| {
+                assert_eq!(
+                    agent.model.responses.len(),
+                    1,
+                    "Should receive exactly one response"
+                );
+
+                let response = &agent.model.responses[0];
+                assert_eq!(
+                    response.specifier.name(),
+                    "empty_crate",
+                    "Response should be for the correct crate"
+                );
+                assert_eq!(
+                    response.chunks.len(),
+                    0,
+                    "Should have no chunks for crate without chunks"
+                );
+
+                AgentReply::immediate()
+            });
+
+            subscriber_builder
+                .handle()
+                .subscribe::<DocChunksQueryResponse>()
+                .await;
+            let subscriber_handle = subscriber_builder.start().await;
+
+            // Query chunks for crate with no chunks
+            db_handle
+                .send(QueryDocChunks {
+                    specifier: specifier.clone(),
+                })
+                .await;
+
+            tokio::time::sleep(Duration::from_millis(200)).await;
+
+            // Clean shutdown
+            subscriber_handle.stop().await.unwrap();
+            db_handle.stop().await.unwrap();
+            runtime.shutdown_all().await.unwrap();
+
+            cleanup_test_db(&test_db_path).await;
+        })
+        .await
+        .expect("Test should complete within timeout");
+    }
+
+    /// Test QueryDocChunks returns empty vector for nonexistent crate
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_query_doc_chunks_empty_for_nonexistent_crate() {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            let mut runtime = ActonApp::launch();
+            let test_db_path = create_test_db_path("query_doc_chunks_nonexistent");
+
+            let (db_handle, _db_info) = DatabaseActor::spawn(&mut runtime, test_db_path.clone())
+                .await
+                .expect("Failed to spawn DatabaseActor");
+
+            tokio::time::sleep(Duration::from_millis(200)).await;
+
+            // Create subscriber
+            #[acton_actor]
+            #[derive(Default)]
+            struct NonexistentSubscriber {
+                responses: Vec<DocChunksQueryResponse>,
+            }
+
+            let mut subscriber_builder = runtime.new_agent::<NonexistentSubscriber>().await;
+
+            subscriber_builder.mutate_on::<DocChunksQueryResponse>(|agent, envelope| {
+                let msg = envelope.message().clone();
+                agent.model.responses.push(msg);
+                AgentReply::immediate()
+            });
+
+            subscriber_builder.after_stop(|agent| {
+                assert_eq!(
+                    agent.model.responses.len(),
+                    1,
+                    "Should receive exactly one response"
+                );
+
+                let response = &agent.model.responses[0];
+                assert_eq!(
+                    response.chunks.len(),
+                    0,
+                    "Should have no chunks for nonexistent crate"
+                );
+
+                AgentReply::immediate()
+            });
+
+            subscriber_builder
+                .handle()
+                .subscribe::<DocChunksQueryResponse>()
+                .await;
+            let subscriber_handle = subscriber_builder.start().await;
+
+            // Query chunks for nonexistent crate
+            let specifier = CrateSpecifier::from_str("nonexistent@1.0.0").unwrap();
+            db_handle
+                .send(QueryDocChunks { specifier })
+                .await;
+
+            tokio::time::sleep(Duration::from_millis(200)).await;
+
+            // Clean shutdown
+            subscriber_handle.stop().await.unwrap();
             db_handle.stop().await.unwrap();
             runtime.shutdown_all().await.unwrap();
 
