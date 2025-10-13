@@ -14,6 +14,7 @@ use std::io::stdout;
 use crate::actors::config::ConfigLoaded;
 use crate::colors::{ColorConfig, format_error, format_progress, format_success, format_warning};
 use crate::messages::{
+    BuildCompleted, BuildCreated, BuildFailed, ChunkDeduplicated, ChunkHashComputed,
     ChunkPersistenceProgress, ChunksPersistenceComplete, ConfigReloadFailed, CrateListResponse,
     CratePersisted, CrateProcessingComplete, CrateQueryResponse, DatabaseError, DatabaseWarning,
     EmbeddingPersistenceProgress, EmbeddingsPersistenceComplete, Init, PrintError, PrintProgress,
@@ -540,6 +541,101 @@ impl Console {
                 );
 
                 AgentReply::immediate()
+            })
+            .act_on::<BuildCreated>(|agent, envelope| {
+                let msg = envelope.message();
+                print_progress(
+                    &format!(
+                        "Starting graph build for {}@{} {} {} chunks",
+                        msg.specifier.name(),
+                        msg.specifier.version(),
+                        LOCATION,
+                        msg.total_chunks
+                    ),
+                    agent.model.raw_mode_active,
+                    agent.model.color_config,
+                );
+                AgentReply::immediate()
+            })
+            .act_on::<ChunkHashComputed>(|agent, envelope| {
+                let msg = envelope.message();
+
+                // Display progress every 10 chunks or at completion
+                if msg.hashed_count % 10 == 0 || msg.hashed_count == msg.total_chunks {
+                    print_progress(
+                        &format!(
+                            "Computing hashes {} {}/{} chunks for {}@{}",
+                            LOCATION,
+                            msg.hashed_count,
+                            msg.total_chunks,
+                            msg.specifier.name(),
+                            msg.specifier.version()
+                        ),
+                        agent.model.raw_mode_active,
+                        agent.model.color_config,
+                    );
+                }
+
+                AgentReply::immediate()
+            })
+            .act_on::<ChunkDeduplicated>(|agent, envelope| {
+                let msg = envelope.message();
+
+                // Display every 5 duplicates to avoid flooding console
+                if msg.total_duplicates % 5 == 0 {
+                    print_progress(
+                        &format!(
+                            "Deduplication {} {} duplicates found for {}@{}",
+                            LOCATION,
+                            msg.total_duplicates,
+                            msg.specifier.name(),
+                            msg.specifier.version()
+                        ),
+                        agent.model.raw_mode_active,
+                        agent.model.color_config,
+                    );
+                }
+
+                AgentReply::immediate()
+            })
+            .act_on::<BuildCompleted>(|agent, envelope| {
+                let msg = envelope.message();
+
+                let summary = format!(
+                    "Graph build complete: {}@{} {} {} unique/{} total chunks ({:.1}% savings, {}ms)",
+                    msg.specifier.name(),
+                    msg.specifier.version(),
+                    LOCATION,
+                    msg.unique_chunks,
+                    msg.total_chunks,
+                    msg.storage_savings_percent,
+                    msg.build_duration_ms
+                );
+
+                print_success(
+                    &summary,
+                    agent.model.raw_mode_active,
+                    agent.model.color_config,
+                );
+
+                AgentReply::immediate()
+            })
+            .act_on::<BuildFailed>(|agent, envelope| {
+                let msg = envelope.message();
+
+                print_error(
+                    &format!(
+                        "Graph build failed for {}@{} {} {}",
+                        msg.specifier.name(),
+                        msg.specifier.version(),
+                        LOCATION,
+                        msg.error
+                    ),
+                    agent.model.raw_mode_active,
+                    agent.model.color_config,
+                );
+
+                AgentReply::immediate()
             });
 
         // Subscribe to broadcast messages before starting
@@ -572,6 +668,11 @@ impl Console {
             .handle()
             .subscribe::<CrateProcessingComplete>()
             .await;
+        builder.handle().subscribe::<BuildCreated>().await;
+        builder.handle().subscribe::<ChunkHashComputed>().await;
+        builder.handle().subscribe::<ChunkDeduplicated>().await;
+        builder.handle().subscribe::<BuildCompleted>().await;
+        builder.handle().subscribe::<BuildFailed>().await;
 
         Ok(builder.start().await)
     }

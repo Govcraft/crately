@@ -26,6 +26,10 @@ pub enum PipelineError {
     /// Storage stage failed
     #[error("Storage stage failed: {0}")]
     Storage(#[from] StorageError),
+
+    /// Graph build failed
+    #[error("Graph build failed: {0}")]
+    GraphBuild(String),
 }
 
 impl PipelineError {
@@ -38,6 +42,7 @@ impl PipelineError {
             PipelineError::Processing(e) => Some(e.specifier()),
             PipelineError::Vectorization(e) => Some(e.specifier()),
             PipelineError::Storage(e) => e.specifier(),
+            PipelineError::GraphBuild(_) => None,
         }
     }
 
@@ -49,6 +54,7 @@ impl PipelineError {
             PipelineError::Processing(e) => e.is_retryable(),
             PipelineError::Vectorization(e) => e.is_retryable(),
             PipelineError::Storage(e) => e.is_retryable(),
+            PipelineError::GraphBuild(_) => true, // Graph build failures are retryable
         }
     }
 
@@ -60,6 +66,7 @@ impl PipelineError {
             PipelineError::Processing(_) => "processing",
             PipelineError::Vectorization(_) => "vectorization",
             PipelineError::Storage(_) => "storage",
+            PipelineError::GraphBuild(_) => "graph_build",
         }
     }
 }

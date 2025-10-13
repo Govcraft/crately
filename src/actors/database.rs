@@ -5,7 +5,10 @@
 
 use acton_reactive::prelude::*;
 use anyhow::Context;
+use dashmap::DashMap;
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::time::SystemTime;
 use surrealdb::Surreal;
 use surrealdb::engine::local::Db;
 #[cfg(not(feature = "rocksdb"))]
@@ -22,14 +25,14 @@ use crate::messages::{
     BuildCreated, ChunkDeduplicated, ChunkHashComputed, ChunksPersistenceComplete,
     CrateDownloadFailed, CrateDownloaded, CrateListResponse, CrateProcessingFailed,
     CrateQueryResponse, CrateReceived, CrateSummary, DatabaseError, DatabaseReady, DocChunkData,
-    DocChunkPersisted, DocChunksQueryResponse, DocumentationExtracted,
+    DocChunkPersisted, DocChunksQueryResponse, DocumentationChunked, DocumentationExtracted,
     DocumentationExtractionFailed, EmbeddingPersisted, EmbeddingsPersistenceComplete, ListCrates,
     PersistCodeSample, PersistCrate, PersistDocChunk, PersistEmbedding, PrintWarning, QueryBuild,
     QueryCrate, QueryDocChunks, QuerySimilarDocs, SimilarDocsResponse,
 };
 
 #[cfg(test)]
-use crate::messages::{DocumentationChunked, DocumentationVectorized};
+use crate::messages::DocumentationVectorized;
 use crate::types::{BuildId, SearchResult};
 
 /// Information about the database connection returned at spawn time.
@@ -138,6 +141,28 @@ struct RecordIdOnly {
     id: surrealdb::sql::Thing,
 }
 
+/// Tracks the state of an active graph build for Phase 7 event broadcasting.
+///
+/// This structure maintains per-build progress tracking to enable accurate
+/// event broadcasting with progress counts and deduplication statistics.
+#[derive(Debug, Clone)]
+struct BuildState {
+    /// The crate being processed
+    specifier: CrateSpecifier,
+    /// Unique build identifier
+    build_id: String,
+    /// Total chunks expected for this build
+    total_chunks: u32,
+    /// Number of chunks hashed so far
+    hashed_count: u32,
+    /// Number of duplicates found so far
+    duplicates_count: u32,
+    /// Whether BuildCreated event has been broadcast
+    build_created_sent: bool,
+    /// Timestamp when build tracking started
+    created_at: SystemTime,
+}
+
 /// DatabaseActor manages the embedded SurrealDB lifecycle and persistence operations.
 ///
 /// This actor handles:
@@ -146,6 +171,7 @@ struct RecordIdOnly {
 /// - Crate metadata persistence
 /// - Query operations
 /// - Error broadcasting to subscribers
+/// - Graph build state tracking for Phase 7 event broadcasting
 ///
 /// The actor uses the Service Actor Pattern, returning both a handle and database
 /// connection information at spawn time.
@@ -156,6 +182,9 @@ struct RecordIdOnly {
 #[derive(Clone, Debug)]
 pub struct DatabaseActor {
     db: Surreal<Db>,
+    /// Tracks active graph builds for Phase 7 event broadcasting
+    /// Key: build_id (content-addressable identifier)
+    builds: Arc<DashMap<String, BuildState>>,
 }
 
 impl Default for DatabaseActor {
@@ -174,6 +203,7 @@ impl Default for DatabaseActor {
         // This will be immediately replaced by spawn() before the actor starts
         Self {
             db: Surreal::init(),
+            builds: Arc::new(DashMap::new()),
         }
     }
 }
@@ -382,7 +412,10 @@ impl DatabaseActor {
             .context("Failed to create DatabaseActor agent configuration")?;
 
         // Create the DatabaseActor model with the established connection
-        let database_actor = DatabaseActor { db };
+        let database_actor = DatabaseActor {
+            db,
+            builds: Arc::new(DashMap::new()),
+        };
 
         // Create agent builder
         let mut builder = runtime
@@ -669,23 +702,12 @@ impl DatabaseActor {
                     );
                 }
 
-                // Step 8: Broadcast BuildCreated event
-                broker
-                    .broadcast(BuildCreated {
-                        build_id: build_id_str.clone(),
-                        crate_name: name.clone(),
-                        crate_version: version.clone(),
-                        features: msg.features.clone(),
-                        record_id: build_thing.to_string(),
-                    })
-                    .await;
-
                 debug!(
                     build_id = %build_id_str,
                     crate_name = %name,
                     crate_version = %version,
                     record_id = %build_thing,
-                    "Build creation complete, event broadcast"
+                    "Build record created in database"
                 );
             })
         });
@@ -1207,6 +1229,7 @@ impl DatabaseActor {
             .handle()
             .subscribe::<DocumentationExtractionFailed>()
             .await;
+        builder.handle().subscribe::<DocumentationChunked>().await;
         builder
             .handle()
             .subscribe::<ChunksPersistenceComplete>()
@@ -1472,6 +1495,35 @@ impl DatabaseActor {
             })
         });
 
+        // Handle DocumentationChunked - initialize build tracking for Phase 7 events
+        builder.act_on::<DocumentationChunked>(|agent, envelope| {
+            let msg = envelope.message().clone();
+            let builds = agent.model.builds.clone();
+
+            // Initialize build tracking state
+            let build_id = BuildId::generate(&msg.specifier, &msg.features).as_str().to_string();
+            let build_state = BuildState {
+                specifier: msg.specifier.clone(),
+                build_id: build_id.clone(),
+                total_chunks: msg.chunk_count,
+                hashed_count: 0,
+                duplicates_count: 0,
+                build_created_sent: false,
+                created_at: SystemTime::now(),
+            };
+
+            builds.insert(build_id.clone(), build_state);
+
+            debug!(
+                specifier = %msg.specifier,
+                build_id = %build_id,
+                total_chunks = msg.chunk_count,
+                "Initialized build tracking for Phase 7 events"
+            );
+
+            AgentReply::immediate()
+        });
+
         // Handle ChunksPersistenceComplete - update status to chunked after confirmed persistence
         builder.act_on::<ChunksPersistenceComplete>(|agent, envelope| {
             let msg = envelope.message().clone();
@@ -1626,11 +1678,40 @@ impl DatabaseActor {
             let msg = envelope.message().clone();
             let db = agent.model.db.clone();
             let broker = agent.broker().clone();
+            let builds = agent.model.builds.clone();
 
             Box::pin(async move {
                 // Clone strings before async block to satisfy lifetime requirements
                 let name = msg.specifier.name().to_string();
                 let version = msg.specifier.version().to_string();
+
+                // Get build_id for Phase 7 event tracking
+                let features = msg.features.as_deref().unwrap_or(&[]);
+                let build_id = BuildId::generate(&msg.specifier, features).as_str().to_string();
+
+                // Check if this is the first chunk for this build (broadcast BuildCreated if so)
+                if let Some(mut build_state) = builds.get_mut(&build_id) {
+                    if !build_state.build_created_sent {
+                        // Broadcast BuildCreated event on first chunk
+                        broker
+                            .broadcast(BuildCreated {
+                                specifier: msg.specifier.clone(),
+                                build_id: build_id.clone(),
+                                total_chunks: build_state.total_chunks,
+                                created_at: build_state.created_at,
+                            })
+                            .await;
+
+                        build_state.build_created_sent = true;
+
+                        debug!(
+                            specifier = %msg.specifier,
+                            build_id = %build_id,
+                            total_chunks = build_state.total_chunks,
+                            "Broadcast BuildCreated on first chunk"
+                        );
+                    }
+                }
 
                 // ====================================================================
                 // Step 1: Compute Content Hash (BLAKE3)
@@ -1648,15 +1729,29 @@ impl DatabaseActor {
                     "Computed BLAKE3 hash for doc chunk"
                 );
 
-                // Broadcast ChunkHashComputed event
-                broker
-                    .broadcast(ChunkHashComputed {
-                        specifier: msg.specifier.clone(),
-                        chunk_index: msg.chunk_index,
-                        content_hash: content_hash.clone(),
-                        source_file: msg.source_file.clone(),
-                    })
-                    .await;
+                // Update build state and broadcast ChunkHashComputed event (Phase 7)
+                if let Some(mut build_state) = builds.get_mut(&build_id) {
+                    build_state.hashed_count += 1;
+                    let hashed_count = build_state.hashed_count;
+                    let total_chunks = build_state.total_chunks;
+
+                    // Generate chunk_id from chunk_index for Phase 7 structure
+                    let chunk_id = format!("{}_chunk_{:03}",
+                        build_id.replace('-', "_"),
+                        msg.chunk_index
+                    );
+
+                    broker
+                        .broadcast(ChunkHashComputed {
+                            specifier: msg.specifier.clone(),
+                            build_id: build_id.clone(),
+                            chunk_id,
+                            content_hash: content_hash.clone(),
+                            hashed_count,
+                            total_chunks,
+                        })
+                        .await;
+                }
 
                 // ====================================================================
                 // Step 2: Get Crate Record ID
@@ -1967,33 +2062,39 @@ impl DatabaseActor {
                     }
                 };
 
-                // Broadcast ChunkDeduplicated if we reused an existing chunk
+                // Broadcast ChunkDeduplicated if we reused an existing chunk (Phase 7)
                 if !is_new_chunk {
-                    // Count how many builds reference this chunk
-                    let count_query =
-                        "SELECT count() FROM contains WHERE out = $chunk_id GROUP ALL";
-                    let reuse_count = match db
-                        .query(count_query)
-                        .bind(("chunk_id", chunk_db_id.clone()))
-                        .await
-                    {
-                        Ok(mut resp) => match resp.take::<Option<serde_json::Value>>(0) {
-                            Ok(Some(val)) => val
-                                .get("count")
-                                .and_then(|v| v.as_u64())
-                                .unwrap_or(1) as usize,
-                            _ => 1,
-                        },
-                        Err(_) => 1,
-                    };
+                    if let Some(mut build_state) = builds.get_mut(&build_id) {
+                        build_state.duplicates_count += 1;
+                        let total_duplicates = build_state.duplicates_count;
 
-                    broker
-                        .broadcast(ChunkDeduplicated {
-                            specifier: msg.specifier.clone(),
-                            content_hash: content_hash.clone(),
-                            reuse_count,
-                        })
-                        .await;
+                        // Generate duplicate_chunk_id and original_chunk_id
+                        let duplicate_chunk_id = format!("{}_chunk_{:03}",
+                            build_id.replace('-', "_"),
+                            msg.chunk_index
+                        );
+                        // Original chunk ID would be the first occurrence - use content hash as proxy
+                        let original_chunk_id = format!("chunk_{}", &content_hash[..12]);
+
+                        broker
+                            .broadcast(ChunkDeduplicated {
+                                specifier: msg.specifier.clone(),
+                                build_id: build_id.clone(),
+                                duplicate_chunk_id,
+                                content_hash: content_hash.clone(),
+                                original_chunk_id,
+                                total_duplicates,
+                            })
+                            .await;
+
+                        debug!(
+                            specifier = %msg.specifier,
+                            build_id = %build_id,
+                            content_hash = %content_hash,
+                            total_duplicates = total_duplicates,
+                            "Chunk deduplicated"
+                        );
+                    }
                 }
 
                 // ====================================================================

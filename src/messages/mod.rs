@@ -88,7 +88,9 @@
 //! ```
 
 mod build_chunks_query_response;
+mod build_completed;
 mod build_created;
+mod build_failed;
 mod build_query_response;
 mod check_processing_timeouts;
 mod chunk_deduplicated;
@@ -150,7 +152,9 @@ mod stop_keyboard_handler;
 mod stop_server;
 
 pub use build_chunks_query_response::{BuildChunkData, BuildChunksQueryResponse};
+pub use build_completed::BuildCompleted;
 pub use build_created::BuildCreated;
+pub use build_failed::BuildFailed;
 pub use build_query_response::{BuildInfo, BuildQueryResponse};
 pub use check_processing_timeouts::CheckProcessingTimeouts;
 pub use chunk_deduplicated::ChunkDeduplicated;

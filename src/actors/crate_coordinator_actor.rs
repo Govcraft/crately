@@ -9,7 +9,8 @@ use crate::actors::retry_coordinator::ScheduleRetry;
 use crate::crate_specifier::CrateSpecifier;
 use crate::errors::{DownloadError, ExtractionError, PipelineError};
 use crate::messages::{
-    CheckProcessingTimeouts, ChunkPersistenceProgress, ChunksPersistenceComplete,
+    BuildCompleted, BuildCreated, BuildFailed, CheckProcessingTimeouts,
+    ChunkDeduplicated, ChunkHashComputed, ChunkPersistenceProgress, ChunksPersistenceComplete,
     CrateDownloadFailed, CrateDownloaded, CrateProcessingComplete, CrateProcessingFailed,
     CrateReceived, DocChunkPersisted, DocumentationChunked, DocumentationExtracted,
     DocumentationExtractionFailed, DocumentationVectorized, EmbeddingPersisted,
@@ -94,6 +95,16 @@ pub struct CrateProcessingState {
     pub persisted_vectors: HashSet<String>,
     /// Embedding model name (captured from DocumentationVectorized)
     pub embedding_model: Option<String>,
+    /// Build tracking for graph-based deduplication
+    pub build_id: Option<String>,
+    /// Expected chunks for graph build
+    pub expected_build_chunks: Option<u32>,
+    /// Hashed chunks count
+    pub hashed_chunks: u32,
+    /// Deduplicated chunks count
+    pub deduplicated_chunks: u32,
+    /// Unique chunks after deduplication
+    pub unique_chunks: Option<u32>,
 }
 
 impl CrateProcessingState {
@@ -113,6 +124,11 @@ impl CrateProcessingState {
             expected_vectors: None,
             persisted_vectors: HashSet::new(),
             embedding_model: None,
+            build_id: None,
+            expected_build_chunks: None,
+            hashed_chunks: 0,
+            deduplicated_chunks: 0,
+            unique_chunks: None,
         }
     }
 
@@ -600,6 +616,132 @@ impl CrateCoordinatorActor {
             AgentReply::immediate()
         });
 
+        // Handle BuildCreated - track build initialization
+        builder.mutate_on::<BuildCreated>(|agent, envelope| {
+            let msg = envelope.message();
+            let specifier = &msg.specifier;
+
+            if let Some(state) = agent.model.processing_states.get_mut(specifier) {
+                state.build_id = Some(msg.build_id.clone());
+                state.expected_build_chunks = Some(msg.total_chunks);
+                state.hashed_chunks = 0;
+                state.deduplicated_chunks = 0;
+
+                debug!(
+                    specifier = %specifier,
+                    build_id = %msg.build_id,
+                    total_chunks = msg.total_chunks,
+                    "Build created for graph-based deduplication"
+                );
+            }
+
+            AgentReply::immediate()
+        });
+
+        // Handle ChunkHashComputed - track hashing progress
+        builder.mutate_on::<ChunkHashComputed>(|agent, envelope| {
+            let msg = envelope.message();
+            let specifier = &msg.specifier;
+
+            if let Some(state) = agent.model.processing_states.get_mut(specifier) {
+                state.hashed_chunks = msg.hashed_count;
+
+                // Log progress periodically (every 10 chunks)
+                if msg.hashed_count % 10 == 0 || msg.hashed_count == msg.total_chunks {
+                    debug!(
+                        specifier = %specifier,
+                        build_id = %msg.build_id,
+                        hashed = msg.hashed_count,
+                        total = msg.total_chunks,
+                        "Hash computation progress"
+                    );
+                }
+            }
+
+            AgentReply::immediate()
+        });
+
+        // Handle ChunkDeduplicated - track deduplication progress
+        builder.mutate_on::<ChunkDeduplicated>(|agent, envelope| {
+            let msg = envelope.message();
+            let specifier = &msg.specifier;
+
+            if let Some(state) = agent.model.processing_states.get_mut(specifier) {
+                state.deduplicated_chunks = msg.total_duplicates;
+
+                debug!(
+                    specifier = %specifier,
+                    build_id = %msg.build_id,
+                    duplicate_chunk = %msg.duplicate_chunk_id,
+                    original_chunk = %msg.original_chunk_id,
+                    total_duplicates = msg.total_duplicates,
+                    "Duplicate chunk detected and deduplicated"
+                );
+            }
+
+            AgentReply::immediate()
+        });
+
+        // Handle BuildCompleted - finalize build tracking
+        builder.mutate_on::<BuildCompleted>(|agent, envelope| {
+            let msg = envelope.message();
+            let specifier = &msg.specifier;
+
+            if let Some(state) = agent.model.processing_states.get_mut(specifier) {
+                state.unique_chunks = Some(msg.unique_chunks);
+
+                info!(
+                    specifier = %specifier,
+                    build_id = %msg.build_id,
+                    total_chunks = msg.total_chunks,
+                    unique_chunks = msg.unique_chunks,
+                    duplicates = msg.duplicates_found,
+                    savings_percent = msg.storage_savings_percent,
+                    duration_ms = msg.build_duration_ms,
+                    "Graph build completed successfully"
+                );
+            }
+
+            AgentReply::immediate()
+        });
+
+        // Handle BuildFailed - track build failures
+        builder.mutate_on::<BuildFailed>(|agent, envelope| {
+            let msg = envelope.message().clone();
+            let specifier = msg.specifier.clone();
+            let error = msg.error.clone();
+
+            if let Some(state) = agent.model.processing_states.get_mut(&specifier) {
+                // Clear build tracking on failure
+                state.build_id = None;
+                state.expected_build_chunks = None;
+
+                warn!(
+                    specifier = %specifier,
+                    build_id = %msg.build_id,
+                    error = %error,
+                    chunks_processed = msg.chunks_processed,
+                    "Graph build failed"
+                );
+
+                // Delegate retry to RetryCoordinator
+                let retry_coordinator = agent.model.retry_coordinator.clone();
+                let features = state.features.clone();
+
+                return AgentReply::from_async(async move {
+                    retry_coordinator
+                        .send(ScheduleRetry {
+                            specifier,
+                            features,
+                            error: PipelineError::GraphBuild(error),
+                        })
+                        .await;
+                });
+            }
+
+            AgentReply::immediate()
+        });
+
         // Add timeout monitoring message handler
         builder.mutate_on::<CheckProcessingTimeouts>(|agent, _envelope| {
             let timeout_secs = agent.model.config.timeout_secs;
@@ -688,6 +830,13 @@ impl CrateCoordinatorActor {
         handle.subscribe::<EmbeddingPersisted>().await;
         handle.subscribe::<DocumentationVectorized>().await;
         handle.subscribe::<CrateProcessingFailed>().await;
+
+        // Subscribe to graph-based deduplication events
+        handle.subscribe::<BuildCreated>().await;
+        handle.subscribe::<ChunkHashComputed>().await;
+        handle.subscribe::<ChunkDeduplicated>().await;
+        handle.subscribe::<BuildCompleted>().await;
+        handle.subscribe::<BuildFailed>().await;
 
         Ok(handle)
     }
